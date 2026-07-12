@@ -1,8 +1,8 @@
 ﻿# Launch-BitcoinCore.ps1
-# Launch Bitcoin Core (GUI or bitcoind) with datadir on Y:\ (your DS1821 24TB RAID0)
+# Launch Bitcoin Core (GUI or bitcoind) with datadir on A:\
 
-$datadir = "Y:\Bitcoin"
-Write-Host "=== Launching Bitcoin Core with data on Y:\Bitcoin ===" -ForegroundColor Cyan
+$datadir = "A:\Bitcoin"
+Write-Host "=== Launching Bitcoin Core with data on A:\Bitcoin ===" -ForegroundColor Cyan
 New-Item -ItemType Directory -Path $datadir -Force | Out-Null
 
 $conf = Join-Path $datadir "bitcoin.conf"

@@ -497,11 +497,15 @@ fn load_cookie_auth(path: &Path) -> Result<String> {
 }
 
 fn default_bitcoin_datadir() -> PathBuf {
-    // Windows: %APPDATA%\Bitcoin
+    // Prefer A:\Bitcoin if it exists (data sur A:, pas C:)
+    let a_datadir = PathBuf::from(r"A:\Bitcoin");
+    if a_datadir.join(".cookie").exists() || a_datadir.join("chainstate").exists() {
+        return a_datadir;
+    }
+    // Windows default: %APPDATA%\Bitcoin
     if let Ok(appdata) = std::env::var("APPDATA") {
         return PathBuf::from(appdata).join("Bitcoin");
     }
-    // Fallback (rare)
     PathBuf::from(r"C:\Users\Default\AppData\Roaming\Bitcoin")
 }
 
