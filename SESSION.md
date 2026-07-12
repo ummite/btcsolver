@@ -26,6 +26,10 @@
 - Le nœud doit être 100% sync pour que `btcsolver balance` fonctionne en mode RPC
 - Mode offline (`build-index`) possible avec un snapshot UTXO
 
+### Déplacement
+- Projet déplacé de `A:\BTCSolver` → `Y:\BTCSolver` (2026-07-12)
+- Travailler dorénavant depuis `Y:\BTCSolver`
+
 ### À faire / à discuter
 - Vérifier quand le nœud sera sync et tester btcsolver
 - Corriger la warning sur la ligne 665
