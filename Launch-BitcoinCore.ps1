@@ -20,7 +20,7 @@ dbcache=8192
 # Search for exe (GUI preferred for "wallet", or daemon)
 Write-Host "Searching for Bitcoin Core executable..."
 $exe = $null
-$roots = @("C:\Program Files", "C:\Program Files (x86)", $env:LOCALAPPDATA, "D:\", "E:\", "Y:\")
+$roots = @("Y:\bitcoin-31.1\bin", "C:\Program Files", "C:\Program Files (x86)", $env:LOCALAPPDATA)
 foreach ($r in $roots) {
     if (Test-Path $r) {
         $c = Get-ChildItem $r -Recurse -Include "bitcoin-qt.exe","bitcoind.exe" -ErrorAction SilentlyContinue -Depth 6 | Select-Object -First 1
