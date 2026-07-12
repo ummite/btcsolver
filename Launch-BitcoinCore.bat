@@ -1,6 +1,6 @@
 @echo off
-echo Launching Bitcoin Core with data on A:\Bitcoin ...
-set DATADIR=A:\Bitcoin
+echo Launching Bitcoin Core with data on Y:\Bitcoin ...
+set DATADIR=Y:\Bitcoin
 if not exist "%DATADIR%" mkdir "%DATADIR%"
 
 REM Try common locations for the GUI wallet
