@@ -8,6 +8,7 @@ btcsolver.exe
 
 # Build/check logs
 check.log
+*.log
 
 # IDE
 .idea/
@@ -18,6 +19,12 @@ check.log
 # OS
 Thumbs.db
 .DS_Store
+
+# Monitoring / utility scripts (generated during sync)
+check_*.ps1
+monitor_sync.ps1
+now_check.ps1
+quick_check.ps1
 
 # Bitcoin data (ne jamais committer !)
 *.cookie
