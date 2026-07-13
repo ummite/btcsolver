@@ -34,6 +34,10 @@ enum Commands {
     /// généré par `bitcoin-cli dumptxoutset ...`. 
     /// Une fois l'index construit, les requêtes de solde sont instantanées, sans nœud.
     BuildIndex(BuildIndexArgs),
+
+    /// Affiche l'historique complet des transactions d'une clé privée.
+    /// Nécessite un nœud Bitcoin Core avec addrindex=1 pour l'historique détaillé.
+    History(HistoryArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -114,6 +118,33 @@ struct BuildIndexArgs {
     verbose: bool,
 }
 
+#[derive(Parser, Debug)]
+struct HistoryArgs {
+    /// Une clé privée unique (format WIF comme "L1..." ou "5..." ou hex 64 caractères)
+    #[arg(short, long, value_name = "WIF|HEX")]
+    key: String,
+
+    /// Afficher les montants en satoshis au lieu de BTC
+    #[arg(long, default_value_t = false)]
+    sats: bool,
+
+    /// Réseau Bitcoin
+    #[arg(short, long, value_enum, default_value_t = NetworkArg::Main)]
+    network: NetworkArg,
+
+    /// Chemin vers le fichier .cookie (sinon auto-détection depuis datadir)
+    #[arg(long, value_name = "CHEMIN")]
+    cookie_file: Option<PathBuf>,
+
+    /// Répertoire de données Bitcoin Core
+    #[arg(long, value_name = "DIR")]
+    bitcoin_datadir: Option<PathBuf>,
+
+    /// Verbose: plus de détails
+    #[arg(short, long, default_value_t = false)]
+    verbose: bool,
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 enum NetworkArg {
     Main,
@@ -167,6 +198,24 @@ struct KeyResult {
     total_btc: f64,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+enum TxType {
+    Receive,
+    Send,
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct TxInfo {
+    txid: String,
+    block_height: Option<u64>,
+    block_time: u64,
+    confirmations: u64,
+    tx_type: TxType,
+    amount_btc: f64,
+    address: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct Unspent {
     #[serde(default)]
@@ -193,6 +242,7 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::Balance(ref args) => run_balance(args)?,
         Commands::BuildIndex(ref args) => run_build_index(args)?,
+        Commands::History(ref args) => run_history(args)?,
     }
 
     Ok(())
@@ -891,6 +941,501 @@ fn run_balance_offline(_args: &BalanceArgs, index_path: &std::path::Path, _netwo
     }
 
     Ok(())
+}
+
+// ============================================================================
+// Commande history — Historique des transactions d'une clé privée
+// ============================================================================
+
+fn build_rpc_url_for_network(net: &NetworkArg) -> String {
+    format!("http://127.0.0.1:{}", net.rpc_port())
+}
+
+fn get_auth_header_for_history(args: &HistoryArgs, net: &NetworkArg) -> Result<String> {
+    if let Some(cookie_path) = &args.cookie_file {
+        return load_cookie_auth(cookie_path);
+    }
+
+    let datadir = args.bitcoin_datadir.clone().unwrap_or_else(default_bitcoin_datadir);
+    let suffix = net.datadir_suffix();
+    let cookie_path = if suffix.is_empty() {
+        datadir.join(".cookie")
+    } else {
+        datadir.join(suffix).join(".cookie")
+    };
+
+    if cookie_path.exists() {
+        return load_cookie_auth(&cookie_path);
+    }
+
+    if net == &NetworkArg::Regtest {
+        return Ok("".to_string());
+    }
+
+    bail!(
+        "Aucun moyen d'authentification trouvé.\n\
+         Options:\n  • Lancez bitcoind et laissez-le créer le .cookie (recommandé)\n  \
+           • --cookie-file <chemin>\n  \
+           • --rpc-url http://user:pass@host:port"
+    );
+}
+
+fn call_getblockcount(rpc_url: &str, auth: &str) -> Result<u64> {
+    let payload = serde_json::json!({
+        "jsonrpc": "1.0",
+        "id": "btcsolver",
+        "method": "getblockcount",
+        "params": []
+    });
+
+    let mut req = ureq::post(rpc_url)
+        .set("Content-Type", "application/json");
+    if !auth.is_empty() {
+        req = req.set("Authorization", auth);
+    }
+
+    let resp = req.send_json(payload)
+        .context("Échec requête getblockcount")?;
+
+    let val: serde_json::Value = resp.into_json()?;
+    if let Some(err) = val.get("error") {
+        if !err.is_null() {
+            bail!("RPC error: {}", err);
+        }
+    }
+    val.get("result").and_then(|v| v.as_u64())
+        .context("Pas de résultat getblockcount")
+}
+
+fn call_searchrawtransactions(rpc_url: &str, auth: &str, address: &str) -> Result<Vec<serde_json::Value>> {
+    let payload = serde_json::json!({
+        "jsonrpc": "1.0",
+        "id": "btcsolver",
+        "method": "searchrawtransactions",
+        "params": [address, true]
+    });
+
+    let mut req = ureq::post(rpc_url)
+        .set("Content-Type", "application/json")
+        .timeout(std::time::Duration::from_secs(120));
+    if !auth.is_empty() {
+        req = req.set("Authorization", auth);
+    }
+
+    let resp = req.send_json(payload)
+        .context("Échec requête searchrawtransactions")?;
+
+    let val: serde_json::Value = resp.into_json().context("Réponse JSON invalide")?;
+
+    if let Some(err) = val.get("error") {
+        if !err.is_null() {
+            bail!("RPC error from bitcoind: {}", err);
+        }
+    }
+
+    let result = val.get("result").context("Pas de champ 'result' dans la réponse")?;
+
+    if let Some(arr) = result.as_array() {
+        Ok(arr.clone())
+    } else {
+        bail!("Réponse searchrawtransactions inattendue (pas un tableau)");
+    }
+}
+
+fn call_rpc_batch(rpc_url: &str, auth: &str, calls: Vec<(String, Vec<serde_json::Value>)>) -> Result<Vec<serde_json::Value>> {
+    let payloads: Vec<serde_json::Value> = calls.into_iter().enumerate().map(|(i, (method, params))| {
+        serde_json::json!({
+            "jsonrpc": "1.0",
+            "id": i,
+            "method": method,
+            "params": params
+        })
+    }).collect();
+
+    let mut req = ureq::post(rpc_url)
+        .set("Content-Type", "application/json")
+        .timeout(std::time::Duration::from_secs(120));
+    if !auth.is_empty() {
+        req = req.set("Authorization", auth);
+    }
+
+    let resp = req.send_json(serde_json::Value::Array(payloads))
+        .context("Échec requête RPC batch")?;
+
+    let results: Vec<serde_json::Value> = resp.into_json().context("Réponse JSON invalide")?;
+    Ok(results)
+}
+
+fn format_date(timestamp: u64) -> String {
+    if timestamp == 0 {
+        return "?".to_string();
+    }
+    chrono::DateTime::from_timestamp(timestamp as i64, 0)
+        .map(|dt| dt.format("%Y-%m-%d").to_string())
+        .unwrap_or_else(|| "?".to_string())
+}
+
+fn run_history(args: &HistoryArgs) -> Result<()> {
+    let network: Network = args.network.into();
+    let secp = Secp256k1::new();
+
+    // Parse key
+    let (privkey, input_kind) = parse_private_key(&args.key, network)?;
+
+    // Derive addresses
+    let derived = derive_all_addresses(&privkey, &secp, network)?;
+    let addresses: Vec<String> = derived.iter().map(|d| d.address.to_string()).collect();
+    let address_set: HashSet<String> = addresses.iter().cloned().collect();
+
+    println!("📜 Historique des transactions");
+    println!("   Réseau: {:?}", network);
+    println!("   Clé: {} ({})", mask_key(&args.key), input_kind);
+    println!("   Adresses dérivées:");
+    for d in &derived {
+        println!("     • {:<28} {}", d.kind, d.address);
+    }
+    println!();
+
+    // Connect to node
+    let rpc_url = build_rpc_url_for_network(&args.network);
+    let auth = get_auth_header_for_history(args, &args.network)?;
+
+    if args.verbose {
+        println!("   RPC: {}", rpc_url);
+    }
+
+    // Check node status
+    println!("📡 Connexion au nœud Bitcoin Core...");
+    let (blockcount, is_synced) = match call_getblockchaininfo(&rpc_url, &auth) {
+        Ok(info) => {
+            let blocks = info.get("blocks").and_then(|v| v.as_u64()).unwrap_or(0);
+            let progress = info.get("verificationprogress").and_then(|v| v.as_f64()).unwrap_or(1.0);
+            let chain = info.get("chain").and_then(|v| v.as_str()).unwrap_or("?");
+            println!("   Nœud: {} @ bloc {}, progrès: {:.2}%", chain, blocks, progress * 100.0);
+            (blocks, progress >= 0.999)
+        }
+        Err(e) => {
+            eprintln!("⚠️  Impossible de vérifier l'état du nœud: {}", e);
+            // Fallback to getblockcount
+            match call_getblockcount(&rpc_url, &auth) {
+                Ok(blocks) => {
+                    println!("   Nœud: bloc {} (état de sync inconnu)", blocks);
+                    (blocks, true)
+                }
+                Err(_) => {
+                    println!("   Tentative de continuation quand même...");
+                    (0, false)
+                }
+            }
+        }
+    };
+
+    if !is_synced {
+        eprintln!("⚠️  Attention: le nœud n'a pas terminé la synchronisation. L'historique peut être incomplet !");
+    }
+
+    // Try searchrawtransactions for each address
+    println!("\n🔍 Recherche de transactions (searchrawtransactions)...");
+    let mut all_txs: HashMap<String, serde_json::Value> = HashMap::new();
+    let mut addrindex_error = false;
+
+    for (i, addr) in addresses.iter().enumerate() {
+        if args.verbose {
+            println!("   Adresse {}: {}", i + 1, addr);
+        }
+        match call_searchrawtransactions(&rpc_url, &auth, addr) {
+            Ok(txs) => {
+                let count = txs.len();
+                for tx in txs {
+                    if let Some(txid) = tx.get("txid").and_then(|v| v.as_str()) {
+                        all_txs.insert(txid.to_string(), tx);
+                    }
+                }
+                if args.verbose {
+                    println!("     → {} transaction(s) trouvée(s)", count);
+                }
+            }
+            Err(e) => {
+                let err_msg = e.to_string();
+                if err_msg.contains("addrindex") || err_msg.contains("address index")
+                    || err_msg.contains("not available") || err_msg.contains("Method not found") {
+                    addrindex_error = true;
+                }
+                if args.verbose {
+                    eprintln!("     → Erreur: {}", err_msg);
+                }
+            }
+        }
+    }
+
+    if addrindex_error {
+        println!("\n⚠️  Votre nœud Bitcoin Core n'a pas l'index d'adresses activé (addrindex).");
+        println!("   Pour obtenir l'historique complet des transactions:");
+        println!("   1. Ajoutez 'addrindex=1' dans votre fichier bitcoin.conf");
+        println!("   2. Redémarrez bitcoind (réindexation automatique au démarrage)");
+        println!("   3. Attendez que le nœud termine la synchronisation");
+        println!();
+
+        // Fallback: show current balance via scantxoutset
+        println!("   Mode résumé (solde actuel uniquement):");
+        let scan_objects: Vec<String> = addresses.iter().map(|a| format!("addr({})", a)).collect();
+        match call_scantxoutset(&rpc_url, &auth, &scan_objects) {
+            Ok(scan_resp) => {
+                println!("   Solde actuel: {:.8} BTC", scan_resp.total_amount);
+                if args.sats {
+                    println!("   = {} sat", (scan_resp.total_amount * 100_000_000.0).round() as u64);
+                }
+            }
+            Err(e) => {
+                eprintln!("   ⚠️  Impossible d'obtenir le solde: {}", e);
+            }
+        }
+        return Ok(());
+    }
+
+    if all_txs.is_empty() {
+        println!("   Aucune transaction trouvée pour ces adresses.");
+        println!("\n💡 Astuce: utilisez 'balance' pour vérifier le solde actuel.");
+        return Ok(());
+    }
+
+    println!("   {} transaction(s) unique(s) trouvée(s). Analyse en cours...", all_txs.len());
+
+    // Collect all vin prevout txids for batch lookup (to determine sends)
+    let mut prevout_txids: Vec<(String, u64)> = Vec::new();
+    for tx in all_txs.values() {
+        if let Some(vin_array) = tx.get("vin").and_then(|v| v.as_array()) {
+            for vin in vin_array {
+                let vin_txid = vin.get("txid").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let vin_vout = vin.get("vout").and_then(|v| v.as_u64()).unwrap_or(0);
+                // Skip coinbase
+                if vin_txid != "0000000000000000000000000000000000000000000000000000000000000000" {
+                    prevout_txids.push((vin_txid, vin_vout));
+                }
+            }
+        }
+    }
+
+    // Deduplicate by txid
+    prevout_txids.sort_by(|a, b| a.0.cmp(&b.0));
+    prevout_txids.dedup_by(|a, b| a.0 == b.0);
+
+    if args.verbose {
+        println!("   {} prevout(s) à rechercher...", prevout_txids.len());
+    }
+
+    // Batch getrawtransaction calls to resolve vin prevouts
+    let mut prevout_tx_map: HashMap<String, serde_json::Value> = HashMap::new();
+
+    if !prevout_txids.is_empty() {
+        let batch_size = 100;
+        for chunk in prevout_txids.chunks(batch_size) {
+            let calls: Vec<(String, Vec<serde_json::Value>)> = chunk.iter().map(|(txid, _)| {
+                ("getrawtransaction".to_string(), vec![
+                    serde_json::json!(txid),
+                    serde_json::json!(1),
+                ])
+            }).collect();
+
+            match call_rpc_batch(&rpc_url, &auth, calls) {
+                Ok(results) => {
+                    for (i, result) in results.iter().enumerate() {
+                        if i < chunk.len() {
+                            let txid = &chunk[i].0;
+                            if let Some(result_val) = result.get("result") {
+                                if !result_val.is_null() {
+                                    prevout_tx_map.insert(txid.clone(), result_val.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    if args.verbose {
+                        eprintln!("   ⚠️  Erreur batch RPC: {}", e);
+                    }
+                }
+            }
+        }
+    }
+
+    // Process each transaction: determine type (send/receive) and amount
+    let mut tx_infos: Vec<TxInfo> = Vec::new();
+
+    for (txid, tx) in &all_txs {
+        let confirmations = tx.get("confirmations").and_then(|v| v.as_u64()).unwrap_or(0);
+        let block_time = tx.get("blocktime").and_then(|v| v.as_u64()).unwrap_or(0);
+        let block_height = if confirmations > 0 && blockcount > 0 {
+            Some(if blockcount >= confirmations {
+                blockcount - confirmations + 1
+            } else {
+                0
+            })
+        } else {
+            None
+        };
+
+        // Check vout — if our address receives, it's a Receive
+        if let Some(vout_array) = tx.get("vout").and_then(|v| v.as_array()) {
+            for vout in vout_array {
+                if let Some(addr) = vout.get("scriptPubKey")
+                    .and_then(|v| v.get("address"))
+                    .and_then(|v| v.as_str())
+                {
+                    if address_set.contains(addr) {
+                        let amount = vout.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                        tx_infos.push(TxInfo {
+                            txid: txid.clone(),
+                            block_height,
+                            block_time,
+                            confirmations,
+                            tx_type: TxType::Receive,
+                            amount_btc: amount,
+                            address: addr.to_string(),
+                        });
+                    }
+                }
+            }
+        }
+
+        // Check vin — if our address spent, it's a Send
+        if let Some(vin_array) = tx.get("vin").and_then(|v| v.as_array()) {
+            for vin in vin_array {
+                let vin_txid = vin.get("txid").and_then(|v| v.as_str()).unwrap_or("");
+                let vin_vout = vin.get("vout").and_then(|v| v.as_u64()).unwrap_or(0);
+
+                // Skip coinbase
+                if vin_txid == "0000000000000000000000000000000000000000000000000000000000000000" {
+                    continue;
+                }
+
+                if let Some(prev_tx) = prevout_tx_map.get(vin_txid) {
+                    if let Some(prev_vout_array) = prev_tx.get("vout").and_then(|v| v.as_array()) {
+                        if let Some(prev_vout) = prev_vout_array.get(vin_vout as usize) {
+                            if let Some(addr) = prev_vout.get("scriptPubKey")
+                                .and_then(|v| v.get("address"))
+                                .and_then(|v| v.as_str())
+                            {
+                                if address_set.contains(addr) {
+                                    let amount = prev_vout.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                                    tx_infos.push(TxInfo {
+                                        txid: txid.clone(),
+                                        block_height,
+                                        block_time,
+                                        confirmations,
+                                        tx_type: TxType::Send,
+                                        amount_btc: amount,
+                                        address: addr.to_string(),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Sort by block height (newest first), then by block time
+    tx_infos.sort_by(|a, b| {
+        b.block_height.cmp(&a.block_height)
+            .then(b.block_time.cmp(&a.block_time))
+    });
+
+    // Display results
+    if tx_infos.is_empty() {
+        println!("   Aucune transaction d'envoi/réception trouvée pour ces adresses.");
+        println!("\n💡 Les transactions trouvées ne semblent pas impliquer vos adresses directement.");
+    } else {
+        print_history_table(&tx_infos, args.sats);
+    }
+
+    println!("\n✅ Terminé. Vos clés privées n'ont jamais quitté votre machine.");
+
+    Ok(())
+}
+
+fn print_history_table(txs: &[TxInfo], sats: bool) {
+    // Calculate net balance
+    let mut net_btc = 0.0;
+    for tx in txs {
+        match tx.tx_type {
+            TxType::Receive => net_btc += tx.amount_btc,
+            TxType::Send => net_btc -= tx.amount_btc,
+        }
+    }
+
+    // Column widths
+    let col1 = 22; // Bloc / Date
+    let col2 = 14; // Type
+    let col3 = if sats { 18 } else { 14 }; // Montant
+    let col4 = 10; // Confirm
+
+    let sep1 = "─".repeat(col1);
+    let sep2 = "─".repeat(col2);
+    let sep3 = "─".repeat(col3);
+    let sep4 = "─".repeat(col4);
+
+    println!();
+    println!("┌{}┬{}┬{}┬{}┐", sep1, sep2, sep3, sep4);
+    println!(
+        "│ {:<col1$} │ {:<col2$} │ {:<col3$} │ {:<col4$} │",
+        "Bloc / Date", "Type", "Montant", "Confirm"
+    );
+    println!("├{}┼{}┼{}┼{}┤", sep1, sep2, sep3, sep4);
+
+    for tx in txs {
+        let block_str = match tx.block_height {
+            Some(h) => {
+                let date = format_date(tx.block_time);
+                format!("{}/{}", h, date)
+            }
+            None => {
+                let date = format_date(tx.block_time);
+                format!("Mempool/{}", date)
+            }
+        };
+
+        let type_str = match tx.tx_type {
+            TxType::Receive => "↙ Réception",
+            TxType::Send => "↗ Envoi",
+        };
+
+        let amount_str = if sats {
+            let sats = (tx.amount_btc * 100_000_000.0).round() as i64;
+            match tx.tx_type {
+                TxType::Receive => format!("+{} sat", sats),
+                TxType::Send => format!("-{} sat", sats),
+            }
+        } else {
+            match tx.tx_type {
+                TxType::Receive => format!("+{:.8}", tx.amount_btc),
+                TxType::Send => format!("-{:.8}", tx.amount_btc),
+            }
+        };
+
+        let confirm_str = if tx.confirmations > 0 {
+            tx.confirmations.to_string()
+        } else {
+            "mempool".to_string()
+        };
+
+        println!(
+            "│ {:<col1$} │ {:<col2$} │ {:<col3$} │ {:<col4$} │",
+            block_str, type_str, amount_str, confirm_str
+        );
+    }
+
+    println!("└{}┴{}┴{}┴{}┘", sep1, sep2, sep3, sep4);
+
+    println!();
+    if sats {
+        let net_sats = (net_btc * 100_000_000.0).round() as i64;
+        println!("💰 Solde net: {} sat", net_sats);
+    } else {
+        println!("💰 Solde net: {:.8} BTC", net_btc);
+    }
+    println!("   ({} transaction(s) au total)", txs.len());
 }
 
 
