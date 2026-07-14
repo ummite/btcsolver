@@ -190,7 +190,7 @@ fn save_checkpoint(
             val.extend_from_slice(script);
             val.extend_from_slice(&value.to_le_bytes());
 
-            table.insert(&key, &val)?;
+            table.insert(&*key, &*val)?;
         }
     }
 
@@ -204,7 +204,7 @@ fn save_checkpoint(
                 val.extend_from_slice(&vout.to_le_bytes());
                 val.extend_from_slice(&value.to_le_bytes());
             }
-            table.insert(script, &val)?;
+            table.insert(script.as_slice(), &*val)?;
         }
     }
 
@@ -358,7 +358,7 @@ fn cmd_query(key_input: &str, db_path: &str) -> Result<()> {
 fn cmd_stats(db_path: &str) -> Result<()> {
     let db = Database::open(db_path)?;
     let read_tx = db.begin_read()?;
-    let meta = read_tx.open_table(&META_TABLE)?;
+    let meta = read_tx.open_table(META_TABLE)?;
     let last_file = meta.get("last_file")?.map(|v| v.value());
     let utxo_count = meta.get("utxo_count")?.map(|v| v.value());
 
