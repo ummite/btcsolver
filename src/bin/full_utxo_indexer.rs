@@ -117,8 +117,9 @@ impl UtxoTracker {
         self.utxo_set.len()
     }
 
-    /// Save checkpoint — only filter dirty scripts, write all to DB
-    fn save_checkpoint(&mut self, db: &Database, last_file: u32) -> Result<()> {
+    /// Save checkpoint — opens DB, writes, then releases lock immediately
+    fn save_checkpoint(&mut self, db_path: &str, last_file: u32) -> Result<()> {
+        let db = Database::create(db_path)?;
         // Filter dirty scripts — remove spent entries (single pass per dirty script)
         for script in &self.dirty_scripts {
             if let Some(entries) = self.script_index.get_mut(script) {
@@ -179,9 +180,10 @@ impl UtxoTracker {
         Ok(())
     }
 
-    /// Load from database for resume
-    fn load_from_db(db: &Database) -> Result<Self> {
+    /// Load from database for resume (opens and closes DB)
+    fn load_from_db(db_path: &str) -> Result<Self> {
         let mut tracker = Self::new();
+        let db = Database::open(db_path)?;
         let read_tx = db.begin_read()?;
 
         if let Ok(table) = read_tx.open_table(UTXO_TABLE) {
@@ -211,36 +213,45 @@ fn cmd_build(blocks_dir: &str, db_path: &str, obf_key_hex: &str, start_file: u32
     let block_files = collect_block_files(blocks_dir)?;
     let total_files = block_files.len();
 
-    let db = Database::create(db_path)?;
-
-    // Check existing progress
-    let existing_progress = {
-        let read_tx = db.begin_read()?;
-        if let Ok(meta) = read_tx.open_table(META_TABLE) {
-            meta.get("last_file").ok().map(|v| v.map(|x| x.value() as u32).unwrap_or(0))
+    // Check existing progress (open DB briefly, then release lock)
+    let existing_progress = if std::path::Path::new(db_path).exists() {
+        if let Ok(db) = Database::open(db_path) {
+            if let Ok(read_tx) = db.begin_read() {
+                if let Ok(meta) = read_tx.open_table(META_TABLE) {
+                    meta.get("last_file").ok().map(|v| v.map(|x| x.value() as u32).unwrap_or(0))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
         } else {
             None
         }
+    } else {
+        None
     };
+    // DB handle dropped here — lock released!
 
     let skip_until = existing_progress.unwrap_or(0).max(start_file);
     let files_to_process = total_files.saturating_sub(skip_until as usize);
 
-    println!("UTXO Indexer - Build (v3 - incremental script_index)");
+    println!("UTXO Indexer - Build (v4 - lock-free between checkpoints)");
     println!("  Blocks dir: {}", blocks_dir);
     println!("  Database: {}", db_path);
     println!("  Files: {} (skip {}-{}, process {})", total_files, 0, skip_until, files_to_process);
     println!("  Checkpoint interval: {} files", checkpoint_interval);
+    println!("  DB lock: released between checkpoints (brute-force can run in parallel)");
 
     if files_to_process <= 0 {
         println!("  Already up to date!");
         return Ok(());
     }
 
-    // Load or create tracker
+    // Load or create tracker (opens DB briefly, then releases)
     let mut tracker = if existing_progress.is_some() {
         println!("  Reloading existing UTXO set...");
-        let t = UtxoTracker::load_from_db(&db)?;
+        let t = UtxoTracker::load_from_db(db_path)?;
         println!("  Loaded {} UTXOs, {} scripts", t.len(), t.script_index.len());
         t
     } else {
@@ -283,18 +294,18 @@ fn cmd_build(blocks_dir: &str, db_path: &str, obf_key_hex: &str, start_file: u32
                 tracker.script_index.len(), file_elapsed, start.elapsed(), eta);
         }
 
-        // Checkpoint
+        // Checkpoint (opens DB, writes, releases lock)
         if file_idx > skip_until as usize && (file_idx - skip_until as usize) % checkpoint_interval as usize == 0 {
             eprintln!("  >>> CHECKPOINT (file {})...", file_idx);
             let cp_start = Instant::now();
-            tracker.save_checkpoint(&db, file_idx as u32)?;
-            eprintln!("  >>> CHECKPOINT done in {:?} ({} scripts)", cp_start.elapsed(), tracker.script_index.len());
+            tracker.save_checkpoint(db_path, file_idx as u32)?;
+            eprintln!("  >>> CHECKPOINT done in {:?} ({} scripts) | LOCK RELEASED", cp_start.elapsed(), tracker.script_index.len());
         }
     }
 
     eprintln!("  >>> FINAL CHECKPOINT...");
     let cp_start = Instant::now();
-    tracker.save_checkpoint(&db, total_files as u32)?;
+    tracker.save_checkpoint(db_path, total_files as u32)?;
     eprintln!("  >>> FINAL CHECKPOINT done in {:?}", cp_start.elapsed());
 
     let elapsed = start.elapsed();
