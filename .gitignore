@@ -1,10 +1,13 @@
 # Rust build artifacts
 /target
-**/*.pdb
-**/*.dSYM
 
-# Built binaries at root
-btcsolver.exe
+# Compiled binaries
+*.exe
+*.pdb
+*.dSYM
+
+# Cargo lock
+Cargo.lock
 
 # Build/check logs
 check.log
@@ -30,3 +33,6 @@ quick_check.ps1
 *.cookie
 bitcoin.conf
 *.redb
+
+# UTXO cache / index (générés localement)
+utxo-cache.bin
