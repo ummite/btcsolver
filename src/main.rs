@@ -1,7 +1,10 @@
 use anyhow::{Context, Result, bail};
 use base64::Engine;
+use bitcoin::bip32::{DerivationPath, Xpriv};
+use std::str::FromStr;
 use bitcoin::key::{CompressedPublicKey, UntweakedPublicKey};
 use bitcoin::{Address, Network, NetworkKind, PrivateKey, secp256k1::Secp256k1};
+use bip39::Mnemonic;
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -421,9 +424,18 @@ fn run_balance(args: &BalanceArgs) -> Result<()> {
     Ok(())
 }
 
-/// Parse WIF or hex private key. Returns (PrivateKey, kind_description)
+/// Parse WIF, hex private key, or BIP39 mnemonic phrase. Returns (PrivateKey, kind_description)
 fn parse_private_key(s: &str, network: Network) -> Result<(PrivateKey, &'static str)> {
     let s = s.trim();
+
+    // Check if it's a mnemonic phrase (space-separated words)
+    if s.contains(' ') {
+        let words: Vec<&str> = s.split_whitespace().collect();
+        if words.len() >= 12 && words.len() <= 24 && words.len() % 3 == 0 {
+            return parse_mnemonic(s, network);
+        }
+    }
+
     if s.len() > 50 && (s.starts_with('5') || s.starts_with('K') || s.starts_with('L') || s.starts_with('9') || s.starts_with('c')) {
         // Likely WIF
         let pk = PrivateKey::from_wif(s).context("WIF invalide ou corrompu (checksum?)")?;
@@ -448,6 +460,50 @@ fn parse_private_key(s: &str, network: Network) -> Result<(PrivateKey, &'static 
             .context("Impossible de créer la clé privée depuis les octets")?;
         Ok((pk, "HEX (32 octets)"))
     }
+}
+
+/// Parse a BIP39 mnemonic phrase and derive the default account key (m/44'/0'/0'/0/0)
+fn parse_mnemonic(s: &str, network: Network) -> Result<(PrivateKey, &'static str)> {
+    let mnemonic = Mnemonic::parse(s)
+        .context("Phrase mnémonique invalide (vérifiez les mots, l'ordre et la langue anglaise)")?;
+
+    let words_count = mnemonic.words().count();
+    eprintln!("🔑 Phrase mnémonique détectée : {words_count} mots (BIP39)");
+
+    // Derive seed using PBKDF2 (BIP39 standard: 2048 iterations, HMAC-SHA512)
+    let passphrase = "";
+    let seed: [u8; 64] = {
+        let phrase: String = mnemonic.words().collect::<Vec<_>>().join(" ");
+        let salt = format!("mnemonic{}", passphrase);
+        let mut out = [0u8; 64];
+        pbkdf2::pbkdf2_hmac::<sha2::Sha512>(
+            phrase.as_bytes(),
+            salt.as_bytes(),
+            2048,
+            &mut out,
+        );
+        out
+    };
+
+    // Derive master key (BIP32)
+    let secp = Secp256k1::new();
+    let xpriv = Xpriv::new_master(network, &seed)
+        .context("Impossible de créer la clé maître depuis la seed")?;
+
+    // Derive default BIP44 path: m/44'/0'/0'/0/0 (legacy)
+    let path = DerivationPath::from_str("m/44'/0'/0'/0/0")
+        .context("Chemin de dérivation invalide")?;
+    let derived = xpriv.derive_priv(&secp, &path)
+        .context("Impossible de dériver la clé depuis le chemin m/44'/0'/0'/0/0")?;
+
+    let pk = PrivateKey {
+        inner: derived.private_key,
+        network: network.into(),
+        compressed: true,
+    };
+
+    eprintln!("   Chemin : m/44'/0'/0'/0/0 (BIP44 legacy)");
+    Ok((pk, "BIP39 mnemonic → m/44'/0'/0'/0/0"))
 }
 
 fn mask_key(raw: &str) -> String {
@@ -716,7 +772,7 @@ fn decompress_amount(x: u64) -> u64 {
     let mut x = x - 1;
     let e = x % 10;
     x /= 10;
-    let mut n: u64 = 0;
+    let mut n;
     if e < 9 {
         let d = (x % 9) + 1;
         x /= 9;
