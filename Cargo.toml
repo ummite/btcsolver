@@ -25,6 +25,8 @@ getrandom = "0.2"
 ureq = { version = "2.12", features = ["json"] }
 zstd = "0.13"
 libloading = "0.9.0"
+crossbeam-channel = "0.5"
+crossbeam-queue = "0.3"
 
 [[bin]]
 name = "brute_force"
