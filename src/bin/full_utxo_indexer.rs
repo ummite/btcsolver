@@ -75,11 +75,14 @@ fn cmd_build(blocks_dir: &str, db_path: &str, obf_key_hex: &str, start_file: u32
 
     let db = Database::create(db_path)?;
 
-    // Check existing progress
+    // Check existing progress (only if database already had data)
     let existing_progress = {
         let read_tx = db.begin_read()?;
-        let meta = read_tx.open_table(META_TABLE)?;
-        meta.get("last_file")?.map(|v| v.value() as u32)
+        if let Ok(meta) = read_tx.open_table(META_TABLE) {
+            meta.get("last_file").ok().map(|v| v.map(|x| x.value() as u32).unwrap_or(0))
+        } else {
+            None // Fresh database, no prior progress
+        }
     };
 
     let skip_until = existing_progress.unwrap_or(0).max(start_file);
