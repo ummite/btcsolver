@@ -7,7 +7,7 @@ use bitcoin::{Address, Network, ScriptBuf, Txid};
 use bip39::Mnemonic;
 use bitcoin_hashes::Hash;
 use clap::{Parser, Subcommand};
-use redb::{Database, ReadableTable, TableHandle};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, Read};
@@ -15,7 +15,13 @@ use std::path::Path;
 use std::str::FromStr;
 use std::time::Instant;
 
-/// BTCSolver - Indexeur UTXO complet pour requêtes instantanées
+type OutPoint = ([u8; 32], u32);
+
+// redb table definitions
+const META_TABLE: TableDefinition<&str, u64> = TableDefinition::new("meta");
+const UTXO_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("utxos");
+const SCRIPT_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("by_script");
+
 #[derive(Parser)]
 struct Cli {
     #[command(subcommand)]
@@ -67,21 +73,17 @@ fn cmd_build(blocks_dir: &str, db_path: &str, obf_key_hex: &str, start_file: u32
     let block_files = collect_block_files(blocks_dir)?;
     let total_files = block_files.len();
 
-    // Open or create redb database
     let db = Database::create(db_path)?;
 
     // Check existing progress
     let existing_progress = {
         let read_tx = db.begin_read()?;
-        if let Ok(meta_table) = read_tx.open_table::<&str, u64>(TableHandle::new("meta")) {
-            meta_table.get("last_file")?.map(|v| v.value() as u32)
-        } else {
-            None
-        }
+        let meta = read_tx.open_table(META_TABLE)?;
+        meta.get("last_file")?.map(|v| v.value() as u32)
     };
 
     let skip_until = existing_progress.unwrap_or(0).max(start_file);
-    let files_to_process = total_files - skip_until as usize;
+    let files_to_process = total_files.saturating_sub(skip_until as usize);
 
     println!("UTXO Indexer - Build");
     println!("  Blocks dir: {}", blocks_dir);
@@ -93,18 +95,14 @@ fn cmd_build(blocks_dir: &str, db_path: &str, obf_key_hex: &str, start_file: u32
         return Ok(());
     }
 
-    // In-memory UTXO set
-    // Primary: outpoint -> (script, value)  — for spend detection
-    // Secondary: script -> list of (txid, vout, value) — for instant queries
-    type OutPoint = ([u8; 32], u32);
     let mut utxo_set: HashMap<OutPoint, (Vec<u8>, u64)> = HashMap::new();
     let mut script_index: HashMap<Vec<u8>, Vec<([u8; 32], u32, u64)>> = HashMap::new();
 
-    // If resuming, reload existing UTXO set from DB
+    // Reload from DB if resuming
     if existing_progress.is_some() {
         println!("  Reloading existing UTXO set...");
         let read_tx = db.begin_read()?;
-        let table = read_tx.open_table::<&[u8], &[u8]>(TableHandle::new("utxos"))?;
+        let table = read_tx.open_table(UTXO_TABLE)?;
         for entry in table.iter()? {
             let (k, v) = entry?;
             let kbuf = k.value();
@@ -119,7 +117,7 @@ fn cmd_build(blocks_dir: &str, db_path: &str, obf_key_hex: &str, start_file: u32
                 script_index.entry(script).or_default().push((txid, vout, value));
             }
         }
-        println!("  Loaded {} UTXOs from cache", utxo_set.len());
+        println!("  Loaded {} UTXOs", utxo_set.len());
     }
 
     let start = Instant::now();
@@ -133,8 +131,8 @@ fn cmd_build(blocks_dir: &str, db_path: &str, obf_key_hex: &str, start_file: u32
 
         if file_idx % 50 == 0 {
             let elapsed = start.elapsed();
-            let eta = if file_idx > skip_until as usize {
-                let processed = file_idx - skip_until as usize;
+            let processed = file_idx.saturating_sub(skip_until as usize);
+            let eta = if processed > 0 {
                 let per_file = elapsed.as_secs_f64() / processed as f64;
                 let remaining = (total_files - file_idx) as f64 * per_file;
                 format!("{:.0}s remaining", remaining)
@@ -146,23 +144,22 @@ fn cmd_build(blocks_dir: &str, db_path: &str, obf_key_hex: &str, start_file: u32
                 start.elapsed(), eta);
         }
 
-        // Save checkpoint every 100 files
         if file_idx > skip_until as usize && (file_idx - skip_until as usize) % 100 == 0 {
-            save_checkpoint(&db, file_idx as u32, &utxo_set)?;
+            eprintln!("  Saving checkpoint...");
+            save_checkpoint(&db, file_idx as u32, &utxo_set, &script_index)?;
         }
 
-        scan_block_file_full(&block_file, obf_key, &mut utxo_set,
+        scan_block_file_full(&block_file, obf_key, &mut utxo_set, &mut script_index,
             &mut total_blocks, &mut total_txs)?;
     }
 
-    // Final save
-    save_checkpoint(&db, total_files as u32, &utxo_set)?;
+    eprintln!("  Saving final index...");
+    save_checkpoint(&db, total_files as u32, &utxo_set, &script_index)?;
 
     let elapsed = start.elapsed();
     println!("\nDone in {:?}!", elapsed);
     println!("  Blocks: {} | Transactions: {} | UTXOs: {}",
         total_blocks, total_txs, utxo_set.len());
-    println!("  Database: {}", db_path);
 
     Ok(())
 }
@@ -175,18 +172,14 @@ fn save_checkpoint(
 ) -> Result<()> {
     let write_tx = db.begin_write()?;
 
-    // Save metadata
     {
-        let mut meta = write_tx.open_table::<&str, u64>(TableHandle::new("meta"))?;
+        let mut meta = write_tx.open_table(META_TABLE)?;
         meta.insert("last_file", last_file as u64)?;
         meta.insert("utxo_count", utxo_set.len() as u64)?;
     }
 
-    // Save UTXO set (outpoint -> script+value)
     {
-        let mut table = write_tx.open_table::<&[u8], &[u8]>(TableHandle::new("utxos"))?;
-        table.clear()?;
-
+        let mut table = write_tx.open_table(UTXO_TABLE)?;
         for ((txid, vout), (script, value)) in utxo_set {
             let mut key = Vec::with_capacity(36);
             key.extend_from_slice(txid);
@@ -201,13 +194,9 @@ fn save_checkpoint(
         }
     }
 
-    // Save script index (script -> list of txid+vout+value)
     {
-        let mut table = write_tx.open_table::<&[u8], &[u8]>(TableHandle::new("by_script"))?;
-        table.clear()?;
-
+        let mut table = write_tx.open_table(SCRIPT_TABLE)?;
         for (script, entries) in script_index {
-            // Value: count[4] + (txid[32] + vout[4] + value[8]) * count
             let mut val = Vec::with_capacity(4 + 44 * entries.len());
             val.extend_from_slice(&(entries.len() as u32).to_le_bytes());
             for (txid, vout, value) in entries {
@@ -227,6 +216,7 @@ fn scan_block_file_full(
     path: &Path,
     obf_key: [u8; 8],
     utxo_set: &mut HashMap<OutPoint, (Vec<u8>, u64)>,
+    script_index: &mut HashMap<Vec<u8>, Vec<([u8; 32], u32, u64)>>,
     total_blocks: &mut u64,
     total_txs: &mut u64,
 ) -> Result<()> {
@@ -269,18 +259,24 @@ fn scan_block_file_full(
                 let txid = tx.compute_txid();
                 let txid_bytes = txid.to_byte_array();
 
-                // 1. Mark inputs as spent
                 for input in tx.input.iter() {
                     let prev_txid: [u8; 32] = input.previous_output.txid.to_byte_array();
                     let prev_vout = input.previous_output.vout;
-                    utxo_set.remove(&(prev_txid, prev_vout));
+                    if let Some((script, _value)) = utxo_set.remove(&(prev_txid, prev_vout)) {
+                        if let Some(entries) = script_index.get_mut(&script) {
+                            entries.retain(|(t, v, _)| (*t, *v) != (prev_txid, prev_vout));
+                            if entries.is_empty() {
+                                script_index.remove(&script);
+                            }
+                        }
+                    }
                 }
 
-                // 2. Add new outputs as UTXOs
                 for (vout_idx, txout) in tx.output.iter().enumerate() {
                     let script = txout.script_pubkey.as_bytes().to_vec();
                     let value = txout.value.to_sat();
-                    utxo_set.insert((txid_bytes, vout_idx as u32), (script, value));
+                    utxo_set.insert((txid_bytes, vout_idx as u32), (script.clone(), value));
+                    script_index.entry(script).or_default().push((txid_bytes, vout_idx as u32, value));
                 }
             }
         }
@@ -298,16 +294,11 @@ fn cmd_query(key_input: &str, db_path: &str) -> Result<()> {
 
     let db = Database::open(db_path)?;
     let read_tx = db.begin_read()?;
-    let table = read_tx.open_table::<&[u8], &[u8]>(TableHandle::new("utxos"))?;
+    let by_script = read_tx.open_table(SCRIPT_TABLE)?;
 
-    // Also get metadata
     let last_file = {
-        let meta = read_tx.open_table::<&str, u64>(TableHandle::new("meta"));
-        if let Ok(mt) = meta {
-            mt.get("last_file").ok().flatten().map(|v| v.value())
-        } else {
-            None
-        }
+        let meta = read_tx.open_table(META_TABLE)?;
+        meta.get("last_file")?.map(|v| v.value())
     };
 
     println!("UTXO Query");
@@ -317,29 +308,27 @@ fn cmd_query(key_input: &str, db_path: &str) -> Result<()> {
     let mut any_balance = false;
 
     for (script, addr_str, addr_type) in &scripts {
-        let script_bytes = script.as_bytes();
+        let script_bytes = script.as_bytes().to_vec();
         let mut total_sats = 0u64;
         let mut utxo_count = 0u32;
         let mut details: Vec<(String, u32, u64)> = Vec::new();
 
-        // Linear scan through the table looking for matching scripts
-        for entry in table.iter()? {
-            let (k, v) = entry?;
-            let vbuf = v.value();
-            if vbuf.len() < 10 { continue; } // min: script_len(2) + script(2) + value(8)
+        if let Ok(Some(val)) = by_script.get(script_bytes.as_slice()) {
+            let vbuf = val.value();
+            if vbuf.len() >= 4 {
+                let count = u32::from_le_bytes(vbuf[..4].try_into().unwrap());
+                let mut pos = 4usize;
+                for _ in 0..count {
+                    if pos + 44 > vbuf.len() { break; }
+                    let txid_bytes: [u8; 32] = vbuf[pos..pos+32].try_into().unwrap();
+                    let vout = u32::from_le_bytes(vbuf[pos+32..pos+36].try_into().unwrap());
+                    let value = u64::from_le_bytes(vbuf[pos+36..pos+44].try_into().unwrap());
+                    pos += 44;
 
-            let script_len = u16::from_le_bytes(vbuf[..2].try_into().unwrap()) as usize;
-            let stored_script = &vbuf[2..2 + script_len];
-
-            if stored_script == script_bytes {
-                let kbuf = k.value();
-                let txid_bytes: [u8; 32] = kbuf[..32].try_into().unwrap();
-                let vout = u32::from_le_bytes(kbuf[32..36].try_into().unwrap());
-                let value = u64::from_le_bytes(vbuf[2 + script_len..2 + script_len + 8].try_into().unwrap());
-
-                total_sats += value;
-                utxo_count += 1;
-                details.push((Txid::from_byte_array(txid_bytes).to_string(), vout, value));
+                    total_sats += value;
+                    utxo_count += 1;
+                    details.push((Txid::from_byte_array(txid_bytes).to_string(), vout, value));
+                }
             }
         }
 
@@ -369,8 +358,7 @@ fn cmd_query(key_input: &str, db_path: &str) -> Result<()> {
 fn cmd_stats(db_path: &str) -> Result<()> {
     let db = Database::open(db_path)?;
     let read_tx = db.begin_read()?;
-
-    let meta = read_tx.open_table::<&str, u64>(TableHandle::new("meta"))?;
+    let meta = read_tx.open_table(&META_TABLE)?;
     let last_file = meta.get("last_file")?.map(|v| v.value());
     let utxo_count = meta.get("utxo_count")?.map(|v| v.value());
 
@@ -378,7 +366,9 @@ fn cmd_stats(db_path: &str) -> Result<()> {
     println!("  Database: {}", db_path);
     println!("  Last file indexed: {:?}", last_file);
     println!("  UTXOs in index: {:?}", utxo_count);
-    println!("  DB size: {:.1} MB", std::fs::metadata(db_path)?.len() as f64 / 1_048_576.0);
+    if let Ok(m) = std::fs::metadata(db_path) {
+        println!("  DB size: {:.1} MB", m.len() as f64 / 1_048_576.0);
+    }
 
     Ok(())
 }
@@ -427,7 +417,6 @@ fn parse_key(input: &str, network: Network, secp: &Secp256k1<All>) -> Result<(Pr
         let pk = PrivateKey { inner: pk.inner, network: network.into(), compressed: true };
         return Ok((pk, pk.public_key(secp)));
     }
-
     if let Ok(bytes) = hex::decode(input) {
         if bytes.len() == 32 {
             let inner = bitcoin::secp256k1::SecretKey::from_slice(&bytes)?;
@@ -435,7 +424,6 @@ fn parse_key(input: &str, network: Network, secp: &Secp256k1<All>) -> Result<(Pr
             return Ok((pk, pk.public_key(secp)));
         }
     }
-
     let words: Vec<&str> = input.split_whitespace().collect();
     if words.len() >= 12 {
         let phrase = input.trim();
@@ -443,9 +431,7 @@ fn parse_key(input: &str, network: Network, secp: &Secp256k1<All>) -> Result<(Pr
             if mnemonic.words().count() >= 12 {
                 let seed: [u8; 64] = {
                     let mut out = [0u8; 64];
-                    pbkdf2::pbkdf2_hmac::<sha2::Sha512>(
-                        phrase.as_bytes(), b"mnemonic", 2048, &mut out,
-                    );
+                    pbkdf2::pbkdf2_hmac::<sha2::Sha512>(phrase.as_bytes(), b"mnemonic", 2048, &mut out);
                     out
                 };
                 let xpriv = Xpriv::new_master(network, &seed)?;
@@ -456,7 +442,6 @@ fn parse_key(input: &str, network: Network, secp: &Secp256k1<All>) -> Result<(Pr
             }
         }
     }
-
     anyhow::bail!("Cannot parse key. Use WIF, hex (32 bytes), or BIP39 (12+ words)");
 }
 
