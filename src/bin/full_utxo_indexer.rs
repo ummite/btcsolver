@@ -171,6 +171,7 @@ fn save_checkpoint(
     db: &Database,
     last_file: u32,
     utxo_set: &HashMap<OutPoint, (Vec<u8>, u64)>,
+    script_index: &HashMap<Vec<u8>, Vec<([u8; 32], u32, u64)>>,
 ) -> Result<()> {
     let write_tx = db.begin_write()?;
 
@@ -181,25 +182,40 @@ fn save_checkpoint(
         meta.insert("utxo_count", utxo_set.len() as u64)?;
     }
 
-    // Save UTXO set
+    // Save UTXO set (outpoint -> script+value)
     {
         let mut table = write_tx.open_table::<&[u8], &[u8]>(TableHandle::new("utxos"))?;
-        // Clear and rebuild
         table.clear()?;
 
         for ((txid, vout), (script, value)) in utxo_set {
-            // Key: txid[32] + vout[4] = 36 bytes
             let mut key = Vec::with_capacity(36);
             key.extend_from_slice(txid);
             key.extend_from_slice(&vout.to_le_bytes());
 
-            // Value: script_len[2] + script + value[8]
             let mut val = Vec::with_capacity(2 + script.len() + 8);
             val.extend_from_slice(&(script.len() as u16).to_le_bytes());
             val.extend_from_slice(script);
             val.extend_from_slice(&value.to_le_bytes());
 
             table.insert(&key, &val)?;
+        }
+    }
+
+    // Save script index (script -> list of txid+vout+value)
+    {
+        let mut table = write_tx.open_table::<&[u8], &[u8]>(TableHandle::new("by_script"))?;
+        table.clear()?;
+
+        for (script, entries) in script_index {
+            // Value: count[4] + (txid[32] + vout[4] + value[8]) * count
+            let mut val = Vec::with_capacity(4 + 44 * entries.len());
+            val.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+            for (txid, vout, value) in entries {
+                val.extend_from_slice(txid);
+                val.extend_from_slice(&vout.to_le_bytes());
+                val.extend_from_slice(&value.to_le_bytes());
+            }
+            table.insert(script, &val)?;
         }
     }
 
