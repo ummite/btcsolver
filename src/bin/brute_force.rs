@@ -4,6 +4,8 @@ use bitcoin::secp256k1::{All, Secp256k1};
 use bitcoin::{Network, Txid};
 use bitcoin_hashes::Hash;
 use clap::Parser;
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -31,6 +33,10 @@ struct Cli {
     /// Number of keys to test
     #[arg(short, long, default_value = "0")]
     count: u64, // 0 = unlimited
+
+    /// Generate random keys instead of sequential
+    #[arg(long)]
+    random: bool,
 
     /// Use GPU (CUDA) for key derivation (requires NVIDIA GPU)
     #[arg(long)]
@@ -99,7 +105,11 @@ fn main() -> Result<()> {
     let batch_size = cli.batch_size;
 
     println!("Starting brute-force...");
-    println!("  Start key: {}", hex::encode(&start_key));
+    if cli.random {
+        println!("  Mode: RANDOM keys (cryptographic RNG)");
+    } else {
+        println!("  Mode: SEQUENTIAL keys from {}", hex::encode(&start_key));
+    }
     if cli.count > 0 {
         println!("  Keys to test: {}", cli.count);
     }
@@ -116,25 +126,25 @@ fn main() -> Result<()> {
         run_cpu_bruteforce(
             utxo_index.clone(),
             addr_types.clone(),
-            start_key,
             cli.count,
             num_threads,
             batch_size,
             &results,
             &keys_tested,
             &start,
+            cli.random,
         );
     } else {
         run_cpu_bruteforce(
             utxo_index.clone(),
             addr_types.clone(),
-            start_key,
             cli.count,
             num_threads,
             batch_size,
             &results,
             &keys_tested,
             &start,
+            cli.random,
         );
     }
 
@@ -166,13 +176,13 @@ fn main() -> Result<()> {
 fn run_cpu_bruteforce(
     utxo_index: HashMap<Vec<u8>, Vec<(Txid, u32, u64)>>,
     addr_types: Vec<String>,
-    start_key: [u8; 32],
     max_keys: u64,
     num_threads: usize,
     batch_size: usize,
     results: &Arc<Mutex<Vec<BalanceResult>>>,
     keys_tested: &Arc<Mutex<u64>>,
     start: &Instant,
+    random: bool,
 ) {
     let mut handles = Vec::new();
 
@@ -183,27 +193,33 @@ fn run_cpu_bruteforce(
         let keys_tested = Arc::clone(keys_tested);
         let start_time = *start;
 
-        let start_for_thread = {
-            let mut k = start_key;
-            // Offset by thread_id * some_stride
-            let offset = (thread_id as u64).to_be_bytes();
-            for (i, b) in offset.iter().enumerate() {
-                if 32 - 8 + i < 32 {
-                    k[32 - 8 + i] = k[32 - 8 + i].wrapping_add(*b);
-                }
+        // Seed each thread's RNG differently using thread_id + current time
+        let seed = {
+            let mut s = [0u8; 32];
+            let tid_bytes = (thread_id as u64).to_le_bytes();
+            s[..8].copy_from_slice(&tid_bytes);
+            let time_bytes = (start.elapsed().as_nanos() as u64).to_le_bytes();
+            s[8..16].copy_from_slice(&time_bytes);
+            // Fill remaining with thread-specific pattern
+            for (i, b) in s[16..].iter_mut().enumerate() {
+                *b = ((thread_id as u8).wrapping_add(i as u8)).wrapping_mul(0x5Fu8);
             }
-            // Add thread_id to the key
-            let tid = thread_id as u32;
-            for i in 0..4 {
-                k[31 - i] = k[31 - i].wrapping_add((tid >> (i * 8)) as u8);
-            }
-            k
+            s
         };
 
         let handle = thread::spawn(move || {
             let secp = Secp256k1::<All>::new();
             let network = Network::Bitcoin;
-            let mut key = start_for_thread;
+
+            // Each thread gets its own RNG instance
+            let mut rng = if random {
+                Some(StdRng::from_seed(seed))
+            } else {
+                None
+            };
+
+            let mut key = [0u8; 32];
+            key[31] = 1; // Sequential start
             let mut local_count = 0u64;
 
             loop {
@@ -212,8 +228,15 @@ fn run_cpu_bruteforce(
                         return;
                     }
 
-                    // Increment key (simple sequential)
-                    increment_key(&mut key);
+                    // Generate next key: random or sequential
+                    if random {
+                        let r = rng.as_mut().unwrap();
+                        let mut candidate = [0u8; 32];
+                        r.fill(&mut candidate);
+                        key = candidate;
+                    } else {
+                        increment_key(&mut key);
+                    }
 
                     // Skip invalid keys (must be < secp256k1 order)
                     if !is_valid_private_key(&key) {
