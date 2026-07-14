@@ -1,24 +1,28 @@
 use anyhow::Result;
 use bitcoin::key::{CompressedPublicKey, PrivateKey, UntweakedPublicKey};
 use bitcoin::secp256k1::{All, Secp256k1};
-use bitcoin::{Network, Txid};
-use bitcoin_hashes::Hash;
+use bitcoin::Network;
 use clap::Parser;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use serde::Serialize;
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Instant;
 
-/// BTCSolver - Brute-force de cl^es priv^ees (CPU multi-core + GPU CUDA)
+use btcsolver::flat_index::FlatIndex;
+
+/// BTCSolver - Brute-force de cl^es priv^ees (CPU multi-core + FlatIndex)
 #[derive(Parser)]
 struct Cli {
-    /// Path to UTXO index database
+    /// Path to UTXO index database (for .redb fallback)
     #[arg(short, long, default_value = "utxo-index.redb")]
     db_path: String,
+
+    /// Path to snapshot file (overrides db_path derivation)
+    #[arg(long)]
+    snapshot_path: Option<String>,
 
     /// Number of CPU threads (0 = auto-detect)
     #[arg(short, long, default_value = "0")]
@@ -29,7 +33,7 @@ struct Cli {
     start: Option<String>,
 
     /// Number of keys to test
-    #[arg(short, long, default_value = "0")]
+    #[arg(long, default_value = "0")]
     count: u64, // 0 = unlimited
 
     /// Generate random keys instead of sequential
@@ -63,6 +67,18 @@ struct Cli {
     /// Max retries when DB is locked (0 = infinite). Default: 120
     #[arg(long, default_value = "120")]
     db_retries: u32,
+
+    /// Write live stats to a JSON file every N seconds (0 = disabled). Default: 30
+    #[arg(long, default_value = "30")]
+    stats_interval: u64,
+
+    /// Stats output file. Default: brute-force-stats.json
+    #[arg(long, default_value = "brute-force-stats.json")]
+    stats_file: String,
+
+    /// Minimum UTXO value in sats to include (filter dust). Default: 0 (all)
+    #[arg(long, default_value = "0")]
+    min_value: u64,
 }
 
 fn main() -> Result<()> {
@@ -71,15 +87,21 @@ fn main() -> Result<()> {
     // Parse address types
     let addr_types: Vec<String> = cli.addr_types.split(',').map(|s| s.trim().to_string()).collect();
 
-    // Load UTXO index into RAM (with retry if indexer holds lock)
-    println!("Loading UTXO index from {}...", cli.db_path);
+    // Determine snapshot path
+    let snapshot_path = cli
+        .snapshot_path
+        .clone()
+        .unwrap_or_else(|| cli.db_path.replace(".redb", ".snapshot"));
+
+    // Load UTXO index into RAM using FlatIndex
+    println!("Loading UTXO index from {}...", snapshot_path);
     let load_start = Instant::now();
-    let (utxo_index, last_file) = load_index_with_retry(&cli.db_path, cli.db_retries, 10)?;
+    let flat_index = load_snapshot(&snapshot_path, cli.db_retries, cli.min_value)?;
     let load_time = load_start.elapsed();
 
     println!("Index loaded in {:?}!", load_time);
-    println!("  Scripts indexed: {}", utxo_index.len());
-    println!("  Blockchain coverage: file {}", last_file.unwrap_or(0));
+    flat_index.print_stats();
+    println!("  Blockchain coverage: snapshot file");
     println!("  CPU threads: {}", if cli.threads == 0 {
         num_cpus::get()
     } else {
@@ -128,16 +150,59 @@ fn main() -> Result<()> {
         println!("  Auto-stop: ENABLED on first balance");
         println!("  Output file: {}", cli.output_file);
     }
+    if cli.stats_interval > 0 {
+        println!("  Live stats: {} (every {}s)", cli.stats_file, cli.stats_interval);
+    }
+    if cli.min_value > 0 {
+        println!("  Dust filter: >= {} sats", cli.min_value);
+    }
     println!();
+
+    // Launch live stats writer thread
+    let stats_handle = if cli.stats_interval > 0 {
+        let stats_file = cli.stats_file.clone();
+        let keys_tested = Arc::clone(&keys_tested);
+        let stop_flag = Arc::clone(&stop_flag);
+        let results = Arc::clone(&results);
+        let start_instant = Instant::now();
+        Some(thread::spawn(move || {
+            loop {
+                if stop_flag.load(Ordering::Relaxed) {
+                    break;
+                }
+                thread::sleep(std::time::Duration::from_secs(cli.stats_interval));
+                let total = keys_tested.load(Ordering::Relaxed);
+                let elapsed = start_instant.elapsed();
+                let rate = if elapsed.as_secs_f64() > 0.0 {
+                    total as f64 / elapsed.as_secs_f64()
+                } else {
+                    0.0
+                };
+                let found = results.lock().unwrap().len();
+                let stats = serde_json::json!({
+                    "keys_tested": total,
+                    "keys_per_sec": rate as u64,
+                    "matches_found": found,
+                    "elapsed_seconds": elapsed.as_secs(),
+                    "elapsed_human": format!("{:?}", elapsed),
+                    "timestamp": chrono::Local::now().to_rfc3339(),
+                });
+                if let Ok(json) = serde_json::to_string_pretty(&stats) {
+                    std::fs::write(&stats_file, &json).ok();
+                }
+            }
+        }))
+    } else {
+        None
+    };
 
     let start = Instant::now();
 
     if cli.use_gpu {
         // TODO: GPU path - CUDA kernel launch
-        // For now, fall back to CPU with a warning
         eprintln!("WARNING: GPU mode not yet implemented. Using CPU only.");
         run_cpu_bruteforce(
-            utxo_index.clone(),
+            Arc::new(flat_index),
             addr_types.clone(),
             cli.count,
             num_threads,
@@ -152,7 +217,7 @@ fn main() -> Result<()> {
         );
     } else {
         run_cpu_bruteforce(
-            utxo_index.clone(),
+            Arc::new(flat_index),
             addr_types.clone(),
             cli.count,
             num_threads,
@@ -165,6 +230,11 @@ fn main() -> Result<()> {
             cli.random,
             cli.stop_on_match,
         );
+    }
+
+    // Wait for stats writer to finish
+    if let Some(handle) = stats_handle {
+        let _ = handle.join();
     }
 
     let elapsed = start.elapsed();
@@ -193,7 +263,7 @@ fn main() -> Result<()> {
 }
 
 fn run_cpu_bruteforce(
-    utxo_index: HashMap<Vec<u8>, Vec<(Txid, u32, u64)>>,
+    flat_index: Arc<FlatIndex>,
     addr_types: Vec<String>,
     max_keys: u64,
     num_threads: usize,
@@ -209,7 +279,7 @@ fn run_cpu_bruteforce(
     let mut handles = Vec::new();
 
     for thread_id in 0..num_threads {
-        let utxo_index = utxo_index.clone();
+        let flat_index = Arc::clone(&flat_index);
         let addr_types = addr_types.to_vec();
         let results = Arc::clone(results);
         let keys_tested = Arc::clone(keys_tested);
@@ -265,12 +335,7 @@ fn run_cpu_bruteforce(
                         increment_key(&mut key);
                     }
 
-                    // Skip invalid keys (must be < secp256k1 order)
-                    if !is_valid_private_key(&key) {
-                        continue;
-                    }
-
-                    // Derive private key
+                    // Derive private key (from_slice validates range internally)
                     let secp_key = match bitcoin::secp256k1::SecretKey::from_slice(&key) {
                         Ok(k) => k,
                         Err(_) => continue,
@@ -288,53 +353,54 @@ fn run_cpu_bruteforce(
                         Err(_) => continue,
                     };
                     let xonly: UntweakedPublicKey = compressed.into();
-                    let key_hex = hex::encode(&key);
 
-                    // Derive addresses based on requested types
+                    // Derive addresses and lookup in FlatIndex — no allocations in hot path!
                     let mut total_sats = 0u64;
                     let mut matched_addrs: Vec<String> = Vec::new();
 
                     if addr_types.contains(&"legacy".to_string()) {
                         let addr = bitcoin::Address::p2pkh(pubkey, network);
-                        if let Some(utxos) = utxo_index.get(addr.script_pubkey().as_bytes()) {
-                            for (_, _, val) in utxos {
-                                total_sats += val;
-                            }
+                        let script = addr.script_pubkey();
+                        let val = flat_index.lookup(script.as_bytes());
+                        if val > 0 {
+                            total_sats += val;
                             matched_addrs.push(format!("{} [legacy]", addr));
                         }
                     }
 
                     if addr_types.contains(&"segwit".to_string()) {
                         let addr = bitcoin::Address::p2wpkh(&compressed, network);
-                        if let Some(utxos) = utxo_index.get(addr.script_pubkey().as_bytes()) {
-                            for (_, _, val) in utxos {
-                                total_sats += val;
-                            }
+                        let script = addr.script_pubkey();
+                        let val = flat_index.lookup(script.as_bytes());
+                        if val > 0 {
+                            total_sats += val;
                             matched_addrs.push(format!("{} [segwit]", addr));
                         }
                     }
 
                     if addr_types.contains(&"wrapped".to_string()) {
                         let addr = bitcoin::Address::p2shwpkh(&compressed, network);
-                        if let Some(utxos) = utxo_index.get(addr.script_pubkey().as_bytes()) {
-                            for (_, _, val) in utxos {
-                                total_sats += val;
-                            }
+                        let script = addr.script_pubkey();
+                        let val = flat_index.lookup(script.as_bytes());
+                        if val > 0 {
+                            total_sats += val;
                             matched_addrs.push(format!("{} [wrapped]", addr));
                         }
                     }
 
                     if addr_types.contains(&"taproot".to_string()) {
                         let addr = bitcoin::Address::p2tr(&secp, xonly, None, network);
-                        if let Some(utxos) = utxo_index.get(addr.script_pubkey().as_bytes()) {
-                            for (_, _, val) in utxos {
-                                total_sats += val;
-                            }
+                        let script = addr.script_pubkey();
+                        let val = flat_index.lookup(script.as_bytes());
+                        if val > 0 {
+                            total_sats += val;
                             matched_addrs.push(format!("{} [taproot]", addr));
                         }
                     }
 
+                    // Only hex-encode and WIF-encode on actual match (1 in 2^256 chance)
                     if total_sats > 0 {
+                        let key_hex = hex::encode(&key);
                         let wif = {
                             let wif_key = PrivateKey {
                                 inner: secp_key,
@@ -359,7 +425,7 @@ fn run_cpu_bruteforce(
                         save_found_keys(&output_file, &vec![result]).ok();
 
                         if stop_on_match {
-                            eprintln!("\n\n🎯 BALANCE FOUND! Stopping all threads...");
+                            eprintln!("\n\n BALANCE FOUND! Stopping all threads...");
                             eprintln!("  Key: {}", key_hex);
                             eprintln!("  Balance: {} sats ({:.8} BTC)", total_sats, total_sats as f64 / 100_000_000.0);
                             for addr in &matched_addrs {
@@ -415,7 +481,6 @@ struct BalanceResult {
 
 /// Save found keys to a JSON file (appends to existing results)
 fn save_found_keys(output_file: &str, new_results: &[BalanceResult]) -> Result<()> {
-    // Load existing results if file exists
     let mut all_results: Vec<BalanceResult> = if std::path::Path::new(output_file).exists() {
         let content = std::fs::read_to_string(output_file)?;
         serde_json::from_str(&content).unwrap_or_default()
@@ -423,34 +488,28 @@ fn save_found_keys(output_file: &str, new_results: &[BalanceResult]) -> Result<(
         Vec::new()
     };
 
-    // Append new results
     all_results.extend_from_slice(new_results);
-
-    // Write back
     let json = serde_json::to_string_pretty(&all_results)?;
     std::fs::write(output_file, &json)?;
     Ok(())
 }
 
-// ─── UTXO Index Loading ─────────────────────────────────────────────────
+// ─── Snapshot Loading ───────────────────────────────────────────────────
 
-/// Load index from binary snapshot (lock-free) or fall back to redb.
-/// Returns: (script_bytes -> Vec<(txid, vout, value)>, last_file)
-fn load_index_with_retry(
-    db_path: &str,
+/// Load FlatIndex from snapshot file (with retry if needed).
+fn load_snapshot(
+    snapshot_path: &str,
     max_retries: u32,
-    retry_delay_secs: u64,
-) -> Result<(HashMap<Vec<u8>, Vec<(Txid, u32, u64)>>, Option<u64>)> {
-    // Wait for snapshot file (lock-free read - no DB lock conflicts!)
-    let snapshot_path = db_path.replace(".redb", ".snapshot");
+    min_value: u64,
+) -> Result<FlatIndex> {
     let mut attempt = 0u32;
     let infinite = max_retries == 0;
 
     loop {
-        if std::path::Path::new(&snapshot_path).exists() {
-            match load_snapshot_to_ram(&snapshot_path) {
+        if std::path::Path::new(snapshot_path).exists() {
+            match FlatIndex::load_from_snapshot(snapshot_path, min_value) {
                 Ok(result) => {
-                    println!("  Loaded from snapshot (lock-free)!");
+                    println!("  Loaded from snapshot (FlatIndex)!");
                     return Ok(result);
                 }
                 Err(e) => {
@@ -461,65 +520,13 @@ fn load_index_with_retry(
 
         attempt += 1;
         let retry_label = if infinite { "∞" } else { &format!("{}", max_retries) };
-        eprintln!("  Waiting for snapshot (indexer creates at checkpoint). Retry {}/{} in {}s...",
-            attempt, retry_label, retry_delay_secs);
-        std::thread::sleep(std::time::Duration::from_secs(retry_delay_secs));
+        eprintln!("  Waiting for snapshot. Retry {}/{} in 10s...",
+            attempt, retry_label);
+        std::thread::sleep(std::time::Duration::from_secs(10));
         if !infinite && attempt >= max_retries {
-            anyhow::bail!("No snapshot after {} retries. Run indexer to create a checkpoint.", max_retries);
+            anyhow::bail!("No snapshot after {} retries.", max_retries);
         }
     }
-}
-
-/// Load binary snapshot into RAM (no locks needed)
-fn load_snapshot_to_ram(snapshot_path: &str) -> Result<(HashMap<Vec<u8>, Vec<(Txid, u32, u64)>>, Option<u64>)> {
-    use std::io::Read;
-    let mut f = std::io::BufReader::new(std::fs::File::open(snapshot_path)?);
-    let file_len = f.get_ref().metadata()?.len();
-
-    let mut header = [0u8; 4];
-    f.read_exact(&mut header)?;
-    let num_scripts = u32::from_le_bytes(header);
-
-    let mut index: HashMap<Vec<u8>, Vec<(Txid, u32, u64)>> = HashMap::new();
-    let mut total_scripts = 0u64;
-
-    for _ in 0..num_scripts {
-        let mut slen_buf = [0u8; 2];
-        f.read_exact(&mut slen_buf)?;
-        let script_len = u16::from_le_bytes(slen_buf) as usize;
-
-        let mut script = vec![0u8; script_len];
-        f.read_exact(&mut script)?;
-
-        let mut count_buf = [0u8; 4];
-        f.read_exact(&mut count_buf)?;
-        let count = u32::from_le_bytes(count_buf);
-
-        let mut entries = Vec::with_capacity(count as usize);
-        for _ in 0..count {
-            let mut txid = [0u8; 32];
-            f.read_exact(&mut txid)?;
-
-            let mut vout_buf = [0u8; 4];
-            f.read_exact(&mut vout_buf)?;
-            let vout = u32::from_le_bytes(vout_buf);
-
-            let mut val_buf = [0u8; 8];
-            f.read_exact(&mut val_buf)?;
-            let value = u64::from_le_bytes(val_buf);
-
-            entries.push((Txid::from_byte_array(txid), vout, value));
-        }
-
-        if !entries.is_empty() {
-            index.insert(script, entries);
-            total_scripts += 1;
-        }
-    }
-
-    let snapshot_mb = file_len as f64 / 1_048_576.0;
-    println!("  Loaded {} scripts from {} ({:.1} MB snapshot)", total_scripts, snapshot_path, snapshot_mb);
-    Ok((index, None))
 }
 
 // ─── Key Utilities ──────────────────────────────────────────────────────
@@ -533,34 +540,4 @@ fn increment_key(key: &mut [u8; 32]) {
             return;
         }
     }
-}
-
-fn is_valid_private_key(key: &[u8; 32]) -> bool {
-    // Must be > 0 and < secp256k1 order
-    // Order = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
-    if key.iter().all(|&b| b == 0) {
-        return false;
-    }
-    // Quick check: first byte of order is 0xFF, so keys starting with 0xFF
-    // need more careful comparison. For simplicity, reject 0xFFxx... keys
-    // that exceed the order. This is approximate but catches most invalid keys.
-    const ORDER: [u8; 32] = [
-        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE,
-        0xBA, 0xAE, 0xDC, 0xE6, 0xAF, 0x48, 0xA0, 0x3B,
-        0xBF, 0xD2, 0x5E, 0x8C, 0xD0, 0x36, 0x41, 0x41,
-    ];
-    if key[0] < 0xFF {
-        return true; // Definitely less than order
-    }
-    // key[0] == 0xFF, need full comparison
-    for i in 0..32 {
-        if key[i] < ORDER[i] {
-            return true;
-        }
-        if key[i] > ORDER[i] {
-            return false;
-        }
-    }
-    false // key == order, invalid
 }

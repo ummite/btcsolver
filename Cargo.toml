@@ -1,6 +1,6 @@
 [package]
 name = "btcsolver"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 
 [dependencies]
@@ -23,3 +23,12 @@ num_cpus = "1.16"
 rand = { version = "0.8", features = ["getrandom"] }
 getrandom = "0.2"
 ureq = { version = "2.12", features = ["json"] }
+zstd = "0.13"
+
+[[bin]]
+name = "brute_force"
+path = "src/bin/brute_force.rs"
+
+[[bin]]
+name = "full_utxo_indexer"
+path = "src/bin/full_utxo_indexer.rs"

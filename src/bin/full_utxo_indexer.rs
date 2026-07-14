@@ -10,10 +10,12 @@ use clap::{Parser, Subcommand};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use std::collections::HashSet;
 use std::fs::File;
-use std::io::{BufReader, Read, Write};
+use std::io::{BufReader, Read};
 use std::path::Path;
 use std::str::FromStr;
 use std::time::Instant;
+
+use btcsolver::flat_index::export_flat_snapshot;
 
 type OutPoint = ([u8; 32], u32);
 
@@ -85,6 +87,9 @@ struct UtxoTracker {
     /// Outpoints spent since last checkpoint
     spent_outpoints: HashSet<OutPoint>,
 
+    /// Outpoints added since last checkpoint (for incremental redb writes)
+    new_outpoints: HashSet<OutPoint>,
+
     /// Scripts affected by spends (need filtering at checkpoint)
     dirty_scripts: HashSet<Vec<u8>>,
 }
@@ -95,6 +100,7 @@ impl UtxoTracker {
             utxo_set: std::collections::HashMap::new(),
             script_index: std::collections::HashMap::new(),
             spent_outpoints: HashSet::new(),
+            new_outpoints: HashSet::new(),
             dirty_scripts: HashSet::new(),
         }
     }
@@ -109,44 +115,28 @@ impl UtxoTracker {
 
     /// Add a new output — O(1)
     fn add_output(&mut self, txid: [u8; 32], vout: u32, script: Vec<u8>, value: u64) {
-        self.utxo_set.insert((txid, vout), (script.clone(), value));
+        let op = (txid, vout);
+        self.utxo_set.insert(op, (script.clone(), value));
         self.script_index.entry(script).or_default().push((txid, vout, value));
+        self.new_outpoints.insert(op);
     }
 
     fn len(&self) -> usize {
         self.utxo_set.len()
     }
 
-    /// Export script_index to a binary snapshot file (lock-free read)
-    /// Format: [num_scripts:u32][script_len:u16][script_bytes][num_utxos:u32][txid:32][vout:u32][value:u64]...
+    /// Export script_index to a v2 flat snapshot file (zstd compressed, sorted for binary search).
+    /// Format: BTCS v2 header + zstd(sorted scripts with offset/count + flat UTXO data)
     fn export_snapshot(&self, db_path: &str) -> Result<()> {
         let snapshot_path = db_path.replace(".redb", ".snapshot");
-        let mut f = std::io::BufWriter::new(std::fs::File::create(&snapshot_path)?);
 
-        // Write number of scripts
-        let num_scripts = self.script_index.len() as u32;
-        f.write_all(&num_scripts.to_le_bytes())?;
-
-        for (script, entries) in &self.script_index {
-            let script_len = script.len() as u16;
-            f.write_all(&script_len.to_le_bytes())?;
-            f.write_all(script)?;
-
-            let num_entries = entries.len() as u32;
-            f.write_all(&num_entries.to_le_bytes())?;
-
-            for (txid, vout, value) in entries {
-                f.write_all(txid)?;
-                f.write_all(&vout.to_le_bytes())?;
-                f.write_all(&value.to_le_bytes())?;
-            }
-        }
-        f.flush()?;
+        // Use the flat_index v2 export (sorted + compact layout)
+        export_flat_snapshot(&self.script_index, &snapshot_path)?;
 
         Ok(())
     }
 
-    /// Save checkpoint — opens DB, writes, exports binary snapshot, releases lock
+    /// Save checkpoint — incremental: only write delta (new + spent), not full rewrite
     fn save_checkpoint(&mut self, db_path: &str, last_file: u32) -> Result<()> {
         // Export binary snapshot for lock-free reading by brute-force
         self.export_snapshot(db_path)?;
@@ -156,6 +146,7 @@ impl UtxoTracker {
         } else {
             Database::create(db_path)?
         };
+
         // Filter dirty scripts — remove spent entries (single pass per dirty script)
         for script in &self.dirty_scripts {
             if let Some(entries) = self.script_index.get_mut(script) {
@@ -175,35 +166,78 @@ impl UtxoTracker {
             meta.insert("utxo_count", self.utxo_set.len() as u64)?;
         }
 
-        // UTXO table
+        // UTXO table — INCREMENTAL: delete spent, insert new
         {
             let mut table = write_tx.open_table(UTXO_TABLE)?;
-            for ((txid, vout), (script, value)) in &self.utxo_set {
+
+            // Delete spent UTXOs
+            let spent_count = self.spent_outpoints.len();
+            for (txid, vout) in &self.spent_outpoints {
                 let mut key = Vec::with_capacity(36);
                 key.extend_from_slice(txid);
                 key.extend_from_slice(&vout.to_le_bytes());
-
-                let mut val = Vec::with_capacity(2 + script.len() + 8);
-                val.extend_from_slice(&(script.len() as u16).to_le_bytes());
-                val.extend_from_slice(script);
-                val.extend_from_slice(&value.to_le_bytes());
-
-                table.insert(&*key, &*val)?;
+                table.remove(&*key)?;
             }
+
+            // Insert new UTXOs only
+            let new_count = self.new_outpoints.len();
+            for (txid, vout) in &self.new_outpoints {
+                if let Some((script, value)) = self.utxo_set.get(&(*txid, *vout)) {
+                    let mut key = Vec::with_capacity(36);
+                    key.extend_from_slice(txid);
+                    key.extend_from_slice(&vout.to_le_bytes());
+
+                    let mut val = Vec::with_capacity(2 + script.len() + 8);
+                    val.extend_from_slice(&(script.len() as u16).to_le_bytes());
+                    val.extend_from_slice(script);
+                    val.extend_from_slice(&value.to_le_bytes());
+
+                    table.insert(&*key, &*val)?;
+                }
+            }
+
+            eprintln!("    UTXO delta: +{} new, -{} spent (vs {} full rewrite)",
+                new_count, spent_count, self.utxo_set.len());
         }
 
-        // Script table — use maintained index (already filtered)
+        // Script table — INCREMENTAL: only update dirty + new scripts
         {
             let mut table = write_tx.open_table(SCRIPT_TABLE)?;
-            for (script, entries) in &self.script_index {
-                let mut val = Vec::with_capacity(4 + 44 * entries.len());
-                val.extend_from_slice(&(entries.len() as u32).to_le_bytes());
-                for (txid, vout, value) in entries {
-                    val.extend_from_slice(txid);
-                    val.extend_from_slice(&vout.to_le_bytes());
-                    val.extend_from_slice(&value.to_le_bytes());
+
+            // Update dirty scripts (spent entries removed)
+            for script in &self.dirty_scripts {
+                if let Some(entries) = self.script_index.get(script) {
+                    if entries.is_empty() {
+                        table.remove(script.as_slice())?;
+                    } else {
+                        let mut val = Vec::with_capacity(4 + 44 * entries.len());
+                        val.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+                        for (txid, vout, value) in entries {
+                            val.extend_from_slice(txid);
+                            val.extend_from_slice(&vout.to_le_bytes());
+                            val.extend_from_slice(&value.to_le_bytes());
+                        }
+                        table.insert(script.as_slice(), &*val)?;
+                    }
                 }
-                table.insert(script.as_slice(), &*val)?;
+            }
+
+            // Insert/update scripts for new UTXOs
+            for (txid, vout) in &self.new_outpoints {
+                if let Some((script, _value)) = self.utxo_set.get(&(*txid, *vout)) {
+                    // The script may already exist (if other UTXOs use same script)
+                    // We need to write the full current state for this script
+                    if let Some(entries) = self.script_index.get(script) {
+                        let mut val = Vec::with_capacity(4 + 44 * entries.len());
+                        val.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+                        for (t, v, value) in entries {
+                            val.extend_from_slice(t);
+                            val.extend_from_slice(&v.to_le_bytes());
+                            val.extend_from_slice(&value.to_le_bytes());
+                        }
+                        table.insert(script.as_slice(), &*val)?;
+                    }
+                }
             }
         }
 
@@ -211,6 +245,7 @@ impl UtxoTracker {
 
         // Clear batch state
         self.spent_outpoints.clear();
+        self.new_outpoints.clear();
         self.dirty_scripts.clear();
 
         Ok(())
@@ -272,11 +307,15 @@ fn cmd_build(blocks_dir: &str, db_path: &str, obf_key_hex: &str, start_file: u32
     let skip_until = existing_progress.unwrap_or(0).max(start_file);
     let files_to_process = total_files.saturating_sub(skip_until as usize);
 
-    println!("UTXO Indexer - Build (v4 - lock-free between checkpoints)");
+    println!("UTXO Indexer - Build (v7 - incremental checkpoints + flat snapshot v2)");
     println!("  Blocks dir: {}", blocks_dir);
     println!("  Database: {}", db_path);
     println!("  Files: {} (skip {}-{}, process {})", total_files, 0, skip_until, files_to_process);
     println!("  Checkpoint interval: {} files", checkpoint_interval);
+    if checkpoint_interval < 100 {
+        println!("  WARNING: small checkpoint interval — expect slow checkpoints on RAID/NAS");
+        println!("  TIP: use --checkpoint-interval 200+ for faster overall progress");
+    }
     println!("  DB lock: released between checkpoints (brute-force can run in parallel)");
 
     if files_to_process <= 0 {
