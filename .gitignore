@@ -36,3 +36,13 @@ bitcoin.conf
 
 # UTXO cache / index (générés localement)
 utxo-cache.bin
+
+# UTXO index database + snapshot (fichiers gros, régénérés)
+utxo-index.redb
+utxo-index.snapshot
+utxo-index.snapshot.*
+
+# Brute-force runtime files (générés à l'exécution)
+brute-force-stats.json
+brute-force-progress.json
+found-keys.json
