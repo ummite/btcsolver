@@ -63,6 +63,10 @@ struct Cli {
     /// Output file for found keys (JSON). Default: found-keys.json
     #[arg(long, default_value = "found-keys.json")]
     output_file: String,
+
+    /// Max retries when DB is locked (0 = infinite). Default: 120
+    #[arg(long, default_value = "120")]
+    db_retries: u32,
 }
 
 fn main() -> Result<()> {
@@ -74,7 +78,7 @@ fn main() -> Result<()> {
     // Load UTXO index into RAM (with retry if indexer holds lock)
     println!("Loading UTXO index from {}...", cli.db_path);
     let load_start = Instant::now();
-    let (utxo_index, last_file) = load_index_with_retry(&cli.db_path, 5, 10)?;
+    let (utxo_index, last_file) = load_index_with_retry(&cli.db_path, cli.db_retries, 10)?;
     let load_time = load_start.elapsed();
 
     println!("Index loaded in {:?}!", load_time);
@@ -434,35 +438,109 @@ fn save_found_keys(output_file: &str, new_results: &[BalanceResult]) -> Result<(
 
 // ─── UTXO Index Loading ─────────────────────────────────────────────────
 
-/// Load the by_script table from redb into a HashMap in RAM, with retry on lock.
+/// Load index from binary snapshot (lock-free) or fall back to redb.
 /// Returns: (script_bytes -> Vec<(txid, vout, value)>, last_file)
 fn load_index_with_retry(
     db_path: &str,
     max_retries: u32,
     retry_delay_secs: u64,
 ) -> Result<(HashMap<Vec<u8>, Vec<(Txid, u32, u64)>>, Option<u64>)> {
-    for attempt in 1..=max_retries {
+    // Try snapshot first (lock-free!)
+    let snapshot_path = db_path.replace(".redb", ".snapshot");
+    if std::path::Path::new(&snapshot_path).exists() {
+        match load_snapshot_to_ram(&snapshot_path) {
+            Ok(result) => {
+                println!("  Loaded from snapshot (lock-free)!");
+                return Ok(result);
+            }
+            Err(e) => {
+                eprintln!("  Snapshot load failed: {}. Falling back to redb.", e);
+            }
+        }
+    } else {
+        eprintln!("  No snapshot found. Waiting for indexer checkpoint...");
+    }
+
+    // Fall back to redb with retries
+    let infinite = max_retries == 0;
+    let mut attempt = 0u32;
+
+    loop {
+        attempt += 1;
         match load_index_to_ram(db_path) {
             Ok(result) => return Ok(result),
             Err(e) => {
                 let err_msg = e.to_string();
                 if err_msg.contains("locked") || err_msg.contains("already open") || err_msg.contains("Busy") {
+                    let retry_label = if infinite { "∞" } else { &format!("{}", max_retries) };
                     eprintln!("  DB locked (indexer writing checkpoint). Retry {}/{} in {}s...",
-                        attempt, max_retries, retry_delay_secs);
+                        attempt, retry_label, retry_delay_secs);
                     std::thread::sleep(std::time::Duration::from_secs(retry_delay_secs));
+                    if !infinite && attempt >= max_retries {
+                        anyhow::bail!("Failed to open DB after {} retries", max_retries);
+                    }
                     continue;
                 }
-                // Table missing = no checkpoint written yet
                 if err_msg.contains("does not exist") || err_msg.contains("Table") {
-                    eprintln!("  Warning: Index table not found (no checkpoint written yet).");
-                    eprintln!("  Returning empty index. Brute-force will find nothing until indexer writes a checkpoint.");
+                    eprintln!("  Warning: Index table not found. Returning empty index.");
                     return Ok((HashMap::new(), None));
                 }
                 return Err(e);
             }
         }
     }
-    anyhow::bail!("Failed to open DB after {} retries", max_retries);
+}
+
+/// Load binary snapshot into RAM (no locks needed)
+fn load_snapshot_to_ram(snapshot_path: &str) -> Result<(HashMap<Vec<u8>, Vec<(Txid, u32, u64)>>, Option<u64>)> {
+    use std::io::Read;
+    let mut f = std::io::BufReader::new(std::fs::File::open(snapshot_path)?);
+    let file_len = f.get_ref().metadata()?.len();
+
+    let mut header = [0u8; 4];
+    f.read_exact(&mut header)?;
+    let num_scripts = u32::from_le_bytes(header);
+
+    let mut index: HashMap<Vec<u8>, Vec<(Txid, u32, u64)>> = HashMap::new();
+    let mut total_scripts = 0u64;
+
+    for _ in 0..num_scripts {
+        let mut slen_buf = [0u8; 2];
+        f.read_exact(&mut slen_buf)?;
+        let script_len = u16::from_le_bytes(slen_buf) as usize;
+
+        let mut script = vec![0u8; script_len];
+        f.read_exact(&mut script)?;
+
+        let mut count_buf = [0u8; 4];
+        f.read_exact(&mut count_buf)?;
+        let count = u32::from_le_bytes(count_buf);
+
+        let mut entries = Vec::with_capacity(count as usize);
+        for _ in 0..count {
+            let mut txid = [0u8; 32];
+            f.read_exact(&mut txid)?;
+
+            let mut vout_buf = [0u8; 4];
+            f.read_exact(&mut vout_buf)?;
+            let vout = u32::from_le_bytes(vout_buf);
+
+            let mut val_buf = [0u8; 8];
+            f.read_exact(&mut val_buf)?;
+            let value = u64::from_le_bytes(val_buf);
+
+            entries.push((Txid::from_byte_array(txid), vout, value));
+        }
+
+        if !entries.is_empty() {
+            index.insert(script, entries);
+            total_scripts += 1;
+        }
+    }
+
+    let snapshot_mb = file_len as f64 / 1_048_576.0;
+    println!("  Loaded {} scripts from {} ({:.1} MB snapshot)", total_scripts, snapshot_path, snapshot_mb);
+    Ok((index, None))
 }
 
 /// Load the by_script table from redb into a HashMap in RAM.
@@ -471,12 +549,10 @@ fn load_index_to_ram(db_path: &str) -> Result<(HashMap<Vec<u8>, Vec<(Txid, u32, 
     let db = Database::open(db_path)?;
     let rx = db.begin_read()?;
 
-    // Get meta
     let last_file = rx.open_table(META_TABLE)
         .ok()
         .and_then(|m| m.get("last_file").ok().flatten().map(|v| v.value()));
 
-    // Load script index (may not exist yet)
     let mut index: HashMap<Vec<u8>, Vec<(Txid, u32, u64)>> = HashMap::new();
 
     if let Ok(table) = rx.open_table(SCRIPT_TABLE) {
@@ -485,18 +561,14 @@ fn load_index_to_ram(db_path: &str) -> Result<(HashMap<Vec<u8>, Vec<(Txid, u32, 
             let script = key.value().to_vec();
             let vbuf = val.value();
 
-            if vbuf.len() < 4 {
-                continue;
-            }
+            if vbuf.len() < 4 { continue; }
 
             let count = u32::from_le_bytes(vbuf[..4].try_into().unwrap());
             let mut pos = 4usize;
             let mut entries = Vec::with_capacity(count as usize);
 
             for _ in 0..count {
-                if pos + 44 > vbuf.len() {
-                    break;
-                }
+                if pos + 44 > vbuf.len() { break; }
                 let txid_bytes: [u8; 32] = vbuf[pos..pos + 32].try_into().unwrap();
                 let vout = u32::from_le_bytes(vbuf[pos + 32..pos + 36].try_into().unwrap());
                 let value = u64::from_le_bytes(vbuf[pos + 36..pos + 44].try_into().unwrap());

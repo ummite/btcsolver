@@ -10,7 +10,7 @@ use clap::{Parser, Subcommand};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use std::collections::HashSet;
 use std::fs::File;
-use std::io::{BufReader, Read};
+use std::io::{BufReader, Read, Write};
 use std::path::Path;
 use std::str::FromStr;
 use std::time::Instant;
@@ -117,9 +117,45 @@ impl UtxoTracker {
         self.utxo_set.len()
     }
 
-    /// Save checkpoint — opens DB, writes, then releases lock immediately
+    /// Export script_index to a binary snapshot file (lock-free read)
+    /// Format: [num_scripts:u32][script_len:u16][script_bytes][num_utxos:u32][txid:32][vout:u32][value:u64]...
+    fn export_snapshot(&self, db_path: &str) -> Result<()> {
+        let snapshot_path = db_path.replace(".redb", ".snapshot");
+        let mut f = std::io::BufWriter::new(std::fs::File::create(&snapshot_path)?);
+
+        // Write number of scripts
+        let num_scripts = self.script_index.len() as u32;
+        f.write_all(&num_scripts.to_le_bytes())?;
+
+        for (script, entries) in &self.script_index {
+            let script_len = script.len() as u16;
+            f.write_all(&script_len.to_le_bytes())?;
+            f.write_all(script)?;
+
+            let num_entries = entries.len() as u32;
+            f.write_all(&num_entries.to_le_bytes())?;
+
+            for (txid, vout, value) in entries {
+                f.write_all(txid)?;
+                f.write_all(&vout.to_le_bytes())?;
+                f.write_all(&value.to_le_bytes())?;
+            }
+        }
+        f.flush()?;
+
+        Ok(())
+    }
+
+    /// Save checkpoint — opens DB, writes, exports binary snapshot, releases lock
     fn save_checkpoint(&mut self, db_path: &str, last_file: u32) -> Result<()> {
-        let db = Database::create(db_path)?;
+        // Export binary snapshot for lock-free reading by brute-force
+        self.export_snapshot(db_path)?;
+
+        let db = if std::path::Path::new(db_path).exists() {
+            Database::open(db_path)?
+        } else {
+            Database::create(db_path)?
+        };
         // Filter dirty scripts — remove spent entries (single pass per dirty script)
         for script in &self.dirty_scripts {
             if let Some(entries) = self.script_index.get_mut(script) {
