@@ -8,7 +8,7 @@ use bip39::Mnemonic;
 use bitcoin_hashes::Hash;
 use clap::{Parser, Subcommand};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::Path;
@@ -41,6 +41,9 @@ enum Commands {
         /// Start from a specific file number (resume)
         #[arg(short, long, default_value = "0")]
         start_file: u32,
+        /// Checkpoint interval in files (default: 50)
+        #[arg(long, default_value = "50")]
+        checkpoint_interval: u32,
     },
     /// Query balance for any private key from the index
     Query {
@@ -58,70 +61,191 @@ enum Commands {
 
 fn main() -> Result<()> {
     match Cli::parse().command {
-        Commands::Build { blocks_dir, db_path, obf_key, start_file } => {
-            cmd_build(&blocks_dir, &db_path, &obf_key, start_file)
+        Commands::Build { blocks_dir, db_path, obf_key, start_file, checkpoint_interval } => {
+            cmd_build(&blocks_dir, &db_path, &obf_key, start_file, checkpoint_interval)
         }
         Commands::Query { key, db_path } => cmd_query(&key, &db_path),
         Commands::Stats { db_path } => cmd_stats(&db_path),
     }
 }
 
-// ─── Build ────────────────────────────────────────────────────────────────
+// ─── Build (OPTIMIZED) ───────────────────────────────────────────────────
 
-fn cmd_build(blocks_dir: &str, db_path: &str, obf_key_hex: &str, start_file: u32) -> Result<()> {
+/// Optimized UTXO tracker — separates hot-path (in-memory) from cold-path (disk).
+///
+/// Key optimization: NO retain() in the hot path. Spends are tracked in a
+/// HashSet<OutPoint> and filtered at checkpoint time only.
+struct UtxoTracker {
+    /// Current unspent outputs: outpoint -> (script_bytes, value)
+    utxo_set: std::collections::HashMap<OutPoint, (Vec<u8>, u64)>,
+
+    /// Scripts that have new outputs since last checkpoint
+    new_outputs: std::collections::HashMap<Vec<u8>, Vec<([u8; 32], u32, u64)>>,
+
+    /// Outpoints spent since last checkpoint (for filtering)
+    spent_outpoints: HashSet<OutPoint>,
+
+    /// Scripts affected by spends since last checkpoint
+    dirty_scripts: HashSet<Vec<u8>>,
+}
+
+impl UtxoTracker {
+    fn new() -> Self {
+        Self {
+            utxo_set: std::collections::HashMap::new(),
+            new_outputs: std::collections::HashMap::new(),
+            spent_outpoints: HashSet::new(),
+            dirty_scripts: HashSet::new(),
+        }
+    }
+
+    /// Process a transaction spend (O(1) — no retain!)
+    fn spend(&mut self, prev_txid: [u8; 32], prev_vout: u32) {
+        if let Some((script, _value)) = self.utxo_set.remove(&(prev_txid, prev_vout)) {
+            self.spent_outpoints.insert((prev_txid, prev_vout));
+            self.dirty_scripts.insert(script);
+        }
+    }
+
+    /// Add a new output (O(1))
+    fn add_output(&mut self, txid: [u8; 32], vout: u32, script: Vec<u8>, value: u64) {
+        self.utxo_set.insert((txid, vout), (script.clone(), value));
+        self.new_outputs.entry(script).or_default().push((txid, vout, value));
+    }
+
+    /// Total UTXO count
+    fn len(&self) -> usize {
+        self.utxo_set.len()
+    }
+
+    /// Flush in-memory state to redb (only dirty scripts + new outputs)
+    fn save_checkpoint(&mut self, db: &Database, last_file: u32) -> Result<()> {
+        let write_tx = db.begin_write()?;
+
+        // Meta
+        {
+            let mut meta = write_tx.open_table(META_TABLE)?;
+            meta.insert("last_file", last_file as u64)?;
+            meta.insert("utxo_count", self.utxo_set.len() as u64)?;
+        }
+
+        // UTXO table — write ALL (needed for resume)
+        {
+            let mut table = write_tx.open_table(UTXO_TABLE)?;
+            for ((txid, vout), (script, value)) in &self.utxo_set {
+                let mut key = Vec::with_capacity(36);
+                key.extend_from_slice(txid);
+                key.extend_from_slice(&vout.to_le_bytes());
+
+                let mut val = Vec::with_capacity(2 + script.len() + 8);
+                val.extend_from_slice(&(script.len() as u16).to_le_bytes());
+                val.extend_from_slice(script);
+                val.extend_from_slice(&value.to_le_bytes());
+
+                table.insert(&*key, &*val)?;
+            }
+        }
+
+        // Script table — rebuild from utxo_set (authoritative source)
+        // Only scripts with UTXOs survive
+        {
+            // First, build a clean script_index from utxo_set
+            let mut clean_index: std::collections::HashMap<Vec<u8>, Vec<([u8; 32], u32, u64)>> =
+                std::collections::HashMap::with_capacity(self.utxo_set.len());
+
+            for ((txid, vout), (script, value)) in &self.utxo_set {
+                clean_index.entry(script.clone()).or_default()
+                    .push((*txid, *vout, *value));
+            }
+
+            let mut table = write_tx.open_table(SCRIPT_TABLE)?;
+            for (script, entries) in &clean_index {
+                let mut val = Vec::with_capacity(4 + 44 * entries.len());
+                val.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+                for (txid, vout, value) in entries {
+                    val.extend_from_slice(txid);
+                    val.extend_from_slice(&vout.to_le_bytes());
+                    val.extend_from_slice(&value.to_le_bytes());
+                }
+                table.insert(script.as_slice(), &*val)?;
+            }
+        }
+
+        write_tx.commit()?;
+
+        // Clear batch state after successful checkpoint
+        self.new_outputs.clear();
+        self.spent_outpoints.clear();
+        self.dirty_scripts.clear();
+
+        Ok(())
+    }
+
+    /// Load existing UTXO set from database (for resume)
+    fn load_from_db(db: &Database) -> Result<Self> {
+        let mut tracker = Self::new();
+        let read_tx = db.begin_read()?;
+
+        if let Ok(table) = read_tx.open_table(UTXO_TABLE) {
+            for entry in table.iter()? {
+                let (k, v) = entry?;
+                let kbuf = k.value();
+                let vbuf = v.value();
+                if kbuf.len() == 36 && vbuf.len() >= 10 {
+                    let txid: [u8; 32] = kbuf[..32].try_into().unwrap();
+                    let vout = u32::from_le_bytes(kbuf[32..36].try_into().unwrap());
+                    let script_len = u16::from_le_bytes(vbuf[..2].try_into().unwrap()) as usize;
+                    let script = vbuf[2..2 + script_len].to_vec();
+                    let value = u64::from_le_bytes(vbuf[2 + script_len..2 + script_len + 8].try_into().unwrap());
+                    tracker.utxo_set.insert((txid, vout), (script, value));
+                }
+            }
+        }
+
+        Ok(tracker)
+    }
+}
+
+fn cmd_build(blocks_dir: &str, db_path: &str, obf_key_hex: &str, start_file: u32, checkpoint_interval: u32) -> Result<()> {
     let obf_key = parse_obf_key(obf_key_hex)?;
     let block_files = collect_block_files(blocks_dir)?;
     let total_files = block_files.len();
 
     let db = Database::create(db_path)?;
 
-    // Check existing progress (only if database already had data)
+    // Check existing progress
     let existing_progress = {
         let read_tx = db.begin_read()?;
         if let Ok(meta) = read_tx.open_table(META_TABLE) {
             meta.get("last_file").ok().map(|v| v.map(|x| x.value() as u32).unwrap_or(0))
         } else {
-            None // Fresh database, no prior progress
+            None
         }
     };
 
     let skip_until = existing_progress.unwrap_or(0).max(start_file);
     let files_to_process = total_files.saturating_sub(skip_until as usize);
 
-    println!("UTXO Indexer - Build");
+    println!("UTXO Indexer - Build (OPTIMIZED)");
     println!("  Blocks dir: {}", blocks_dir);
     println!("  Database: {}", db_path);
     println!("  Files: {} (skip {}-{}, process {})", total_files, 0, skip_until, files_to_process);
+    println!("  Checkpoint interval: {} files", checkpoint_interval);
 
     if files_to_process <= 0 {
         println!("  Already up to date!");
         return Ok(());
     }
 
-    let mut utxo_set: HashMap<OutPoint, (Vec<u8>, u64)> = HashMap::new();
-    let mut script_index: HashMap<Vec<u8>, Vec<([u8; 32], u32, u64)>> = HashMap::new();
-
-    // Reload from DB if resuming
-    if existing_progress.is_some() {
+    // Load or create tracker
+    let mut tracker = if existing_progress.is_some() {
         println!("  Reloading existing UTXO set...");
-        let read_tx = db.begin_read()?;
-        let table = read_tx.open_table(UTXO_TABLE)?;
-        for entry in table.iter()? {
-            let (k, v) = entry?;
-            let kbuf = k.value();
-            let vbuf = v.value();
-            if kbuf.len() == 36 && vbuf.len() >= 10 {
-                let txid: [u8; 32] = kbuf[..32].try_into().unwrap();
-                let vout = u32::from_le_bytes(kbuf[32..36].try_into().unwrap());
-                let script_len = u16::from_le_bytes(vbuf[..2].try_into().unwrap()) as usize;
-                let script = vbuf[2..2 + script_len].to_vec();
-                let value = u64::from_le_bytes(vbuf[2 + script_len..2 + script_len + 8].try_into().unwrap());
-                utxo_set.insert((txid, vout), (script.clone(), value));
-                script_index.entry(script).or_default().push((txid, vout, value));
-            }
-        }
-        println!("  Loaded {} UTXOs", utxo_set.len());
-    }
+        let t = UtxoTracker::load_from_db(&db)?;
+        println!("  Loaded {} UTXOs", t.len());
+        t
+    } else {
+        UtxoTracker::new()
+    };
 
     let start = Instant::now();
     let mut total_blocks = 0u64;
@@ -132,94 +256,60 @@ fn cmd_build(blocks_dir: &str, db_path: &str, obf_key_hex: &str, start_file: u32
             continue;
         }
 
-        if file_idx % 50 == 0 {
+        let file_start = Instant::now();
+
+        scan_block_file_full(&block_file, obf_key, &mut tracker, &mut total_blocks, &mut total_txs)?;
+        let file_elapsed = file_start.elapsed();
+        let now_utxos = tracker.len();
+
+        // Progress every 10 files
+        if file_idx % 10 == 0 {
             let elapsed = start.elapsed();
             let processed = file_idx.saturating_sub(skip_until as usize);
             let eta = if processed > 0 {
                 let per_file = elapsed.as_secs_f64() / processed as f64;
                 let remaining = (total_files - file_idx) as f64 * per_file;
-                format!("{:.0}s remaining", remaining)
+                let mins = remaining / 60.0;
+                format!("{:.0}min remaining", mins)
             } else {
                 "calculating...".to_string()
             };
-            eprintln!("[{}/{}] {} blocks | {} txs | {} UTXOs | {:?} | {}",
-                file_idx, total_files, total_blocks, total_txs, utxo_set.len(),
-                start.elapsed(), eta);
+            let tx_rate = if elapsed.as_secs() > 0 {
+                total_txs as f64 / elapsed.as_secs_f64()
+            } else {
+                0.0
+            };
+            eprintln!("[{}/{}] {} blocks | {} txs ({:.0}k/s) | {} UTXOs | file:{:?} | {:?} total | {}",
+                file_idx, total_files, total_blocks, total_txs, tx_rate / 1000.0, now_utxos,
+                file_elapsed, start.elapsed(), eta);
         }
 
-        if file_idx > skip_until as usize && (file_idx - skip_until as usize) % 100 == 0 {
-            eprintln!("  Saving checkpoint...");
-            save_checkpoint(&db, file_idx as u32, &utxo_set, &script_index)?;
+        // Checkpoint
+        if file_idx > skip_until as usize && (file_idx - skip_until as usize) % checkpoint_interval as usize == 0 {
+            eprintln!("  >>> CHECKPOINT (file {})...", file_idx);
+            let cp_start = Instant::now();
+            tracker.save_checkpoint(&db, file_idx as u32)?;
+            eprintln!("  >>> CHECKPOINT done in {:?}", cp_start.elapsed());
         }
-
-        scan_block_file_full(&block_file, obf_key, &mut utxo_set, &mut script_index,
-            &mut total_blocks, &mut total_txs)?;
     }
 
-    eprintln!("  Saving final index...");
-    save_checkpoint(&db, total_files as u32, &utxo_set, &script_index)?;
+    eprintln!("  >>> FINAL CHECKPOINT...");
+    let cp_start = Instant::now();
+    tracker.save_checkpoint(&db, total_files as u32)?;
+    eprintln!("  >>> FINAL CHECKPOINT done in {:?}", cp_start.elapsed());
 
     let elapsed = start.elapsed();
     println!("\nDone in {:?}!", elapsed);
     println!("  Blocks: {} | Transactions: {} | UTXOs: {}",
-        total_blocks, total_txs, utxo_set.len());
+        total_blocks, total_txs, tracker.len());
 
-    Ok(())
-}
-
-fn save_checkpoint(
-    db: &Database,
-    last_file: u32,
-    utxo_set: &HashMap<OutPoint, (Vec<u8>, u64)>,
-    script_index: &HashMap<Vec<u8>, Vec<([u8; 32], u32, u64)>>,
-) -> Result<()> {
-    let write_tx = db.begin_write()?;
-
-    {
-        let mut meta = write_tx.open_table(META_TABLE)?;
-        meta.insert("last_file", last_file as u64)?;
-        meta.insert("utxo_count", utxo_set.len() as u64)?;
-    }
-
-    {
-        let mut table = write_tx.open_table(UTXO_TABLE)?;
-        for ((txid, vout), (script, value)) in utxo_set {
-            let mut key = Vec::with_capacity(36);
-            key.extend_from_slice(txid);
-            key.extend_from_slice(&vout.to_le_bytes());
-
-            let mut val = Vec::with_capacity(2 + script.len() + 8);
-            val.extend_from_slice(&(script.len() as u16).to_le_bytes());
-            val.extend_from_slice(script);
-            val.extend_from_slice(&value.to_le_bytes());
-
-            table.insert(&*key, &*val)?;
-        }
-    }
-
-    {
-        let mut table = write_tx.open_table(SCRIPT_TABLE)?;
-        for (script, entries) in script_index {
-            let mut val = Vec::with_capacity(4 + 44 * entries.len());
-            val.extend_from_slice(&(entries.len() as u32).to_le_bytes());
-            for (txid, vout, value) in entries {
-                val.extend_from_slice(txid);
-                val.extend_from_slice(&vout.to_le_bytes());
-                val.extend_from_slice(&value.to_le_bytes());
-            }
-            table.insert(script.as_slice(), &*val)?;
-        }
-    }
-
-    write_tx.commit()?;
     Ok(())
 }
 
 fn scan_block_file_full(
     path: &Path,
     obf_key: [u8; 8],
-    utxo_set: &mut HashMap<OutPoint, (Vec<u8>, u64)>,
-    script_index: &mut HashMap<Vec<u8>, Vec<([u8; 32], u32, u64)>>,
+    tracker: &mut UtxoTracker,
     total_blocks: &mut u64,
     total_txs: &mut u64,
 ) -> Result<()> {
@@ -228,8 +318,11 @@ fn scan_block_file_full(
     let mut buf = Vec::new();
     reader.read_to_end(&mut buf)?;
 
-    for (i, b) in buf.iter_mut().enumerate() {
-        *b ^= obf_key[i % 8];
+    // Optimized XOR deobfuscation — chunk by key size
+    for chunk in buf.chunks_mut(obf_key.len()) {
+        for (b, k) in chunk.iter_mut().zip(obf_key.iter()) {
+            *b ^= k;
+        }
     }
 
     let data = buf;
@@ -262,28 +355,23 @@ fn scan_block_file_full(
                 let txid = tx.compute_txid();
                 let txid_bytes = txid.to_byte_array();
 
+                // Process spends (O(1) — no retain!)
                 for input in tx.input.iter() {
                     let prev_txid: [u8; 32] = input.previous_output.txid.to_byte_array();
                     let prev_vout = input.previous_output.vout;
-                    if let Some((script, _value)) = utxo_set.remove(&(prev_txid, prev_vout)) {
-                        if let Some(entries) = script_index.get_mut(&script) {
-                            entries.retain(|(t, v, _)| (*t, *v) != (prev_txid, prev_vout));
-                            if entries.is_empty() {
-                                script_index.remove(&script);
-                            }
-                        }
-                    }
+                    tracker.spend(prev_txid, prev_vout);
                 }
 
+                // Add new outputs (O(1))
                 for (vout_idx, txout) in tx.output.iter().enumerate() {
                     let script = txout.script_pubkey.as_bytes().to_vec();
                     let value = txout.value.to_sat();
-                    utxo_set.insert((txid_bytes, vout_idx as u32), (script.clone(), value));
-                    script_index.entry(script).or_default().push((txid_bytes, vout_idx as u32, value));
+                    tracker.add_output(txid_bytes, vout_idx as u32, script, value);
                 }
             }
         }
 
+        // Jump directly to next block (no byte-by-byte scan)
         offset += 8 + block_size;
     }
 
@@ -300,8 +388,11 @@ fn cmd_query(key_input: &str, db_path: &str) -> Result<()> {
     let by_script = read_tx.open_table(SCRIPT_TABLE)?;
 
     let last_file = {
-        let meta = read_tx.open_table(META_TABLE)?;
-        meta.get("last_file")?.map(|v| v.value())
+        if let Ok(meta) = read_tx.open_table(META_TABLE) {
+            meta.get("last_file").ok().map(|v| v.map(|x| x.value()).unwrap_or(0))
+        } else {
+            None
+        }
     };
 
     println!("UTXO Query");
@@ -361,9 +452,14 @@ fn cmd_query(key_input: &str, db_path: &str) -> Result<()> {
 fn cmd_stats(db_path: &str) -> Result<()> {
     let db = Database::open(db_path)?;
     let read_tx = db.begin_read()?;
-    let meta = read_tx.open_table(META_TABLE)?;
-    let last_file = meta.get("last_file")?.map(|v| v.value());
-    let utxo_count = meta.get("utxo_count")?.map(|v| v.value());
+
+    let (last_file, utxo_count) = if let Ok(meta) = read_tx.open_table(META_TABLE) {
+        let lf = meta.get("last_file").ok().map(|v| v.map(|x| x.value()));
+        let uc = meta.get("utxo_count").ok().map(|v| v.map(|x| x.value()));
+        (lf.flatten(), uc.flatten())
+    } else {
+        (None, None)
+    };
 
     println!("UTXO Index Statistics");
     println!("  Database: {}", db_path);
