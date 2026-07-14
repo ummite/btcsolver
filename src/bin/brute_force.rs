@@ -311,10 +311,29 @@ fn main() -> Result<()> {
 
     let start = Instant::now();
 
-    if cli.use_gpu {
-        // TODO: GPU path - CUDA kernel launch
-        eprintln!("WARNING: GPU mode not yet implemented. Using CPU only.");
-        run_cpu_bruteforce(
+    let use_gpu = if cli.use_gpu {
+        let gpu_count = btcsolver::gpu::gpu_device_count();
+        if gpu_count <= 0 {
+            eprintln!("[GPU] No CUDA device found. Falling back to CPU.");
+            false
+        } else {
+            let n_init = btcsolver::gpu::gpu_init();
+            if n_init <= 0 {
+                eprintln!("[GPU] Init failed. Falling back to CPU.");
+                false
+            } else {
+                for info in btcsolver::gpu::detect_gpus() {
+                    println!("    GPU {}: {}", info.id, info.name);
+                }
+                true
+            }
+        }
+    } else {
+        false
+    };
+
+    if use_gpu {
+        run_gpu_bruteforce(
             Arc::new(flat_index),
             addr_flags,
             cli.count,
@@ -329,6 +348,7 @@ fn main() -> Result<()> {
             cli.stop_on_match,
             &progress_handle.as_ref().map(|(_, p)| Arc::clone(p)),
         );
+        btcsolver::gpu::gpu_cleanup();
     } else {
         run_cpu_bruteforce(
             Arc::new(flat_index),
@@ -567,15 +587,15 @@ fn run_cpu_bruteforce(
                     let mut last_key = [0u8; 32];
                     last_key.copy_from_slice(&key);
                     if let Ok(mut guard) = prog.try_lock() {
-                        let current_len = guard.len();
-                        while current_len <= thread_id {
+                        let mut idx = guard.len();
+                        while idx <= thread_id {
                             guard.push(ThreadProgress {
-                                thread_id: current_len,
+                                thread_id: idx,
                                 keys_tested: 0,
                                 last_key_hex: "".to_string(),
                                 mode: if random { "random".to_string() } else { "sequential".to_string() },
                             });
-                            break;
+                            idx += 1;
                         }
                         guard[thread_id].keys_tested += local_count;
                         guard[thread_id].last_key_hex = hex::encode(&last_key);
@@ -600,6 +620,205 @@ fn run_cpu_bruteforce(
     }
 
     // Wait for threads to finish
+    for handle in handles {
+        let _ = handle.join();
+    }
+}
+
+/// GPU-accelerated brute-force: GPU derives pubkeys, CPU does hashing + lookup.
+fn run_gpu_bruteforce(
+    flat_index: Arc<FlatIndex>,
+    addr_flags: AddrFlags,
+    max_keys: u64,
+    num_threads: usize,
+    batch_size: usize,
+    results: &Arc<Mutex<Vec<BalanceResult>>>,
+    keys_tested: &Arc<AtomicU64>,
+    stop_flag: &Arc<AtomicBool>,
+    output_file: &str,
+    start: &Instant,
+    random: bool,
+    stop_on_match: bool,
+    thread_progress: &Option<Arc<Mutex<Vec<ThreadProgress>>>>,
+) {
+    let gpu_batch = batch_size; // Keys per GPU batch
+    let mut handles = Vec::new();
+
+    for thread_id in 0..num_threads {
+        let flat_index = Arc::clone(&flat_index);
+        let results = Arc::clone(results);
+        let keys_tested = Arc::clone(keys_tested);
+        let stop_flag = Arc::clone(stop_flag);
+        let output_file = output_file.to_string();
+        let start_time = *start;
+        let progress = thread_progress.as_ref().map(|p| Arc::clone(p));
+
+        // Seed each thread's RNG
+        let seed = {
+            let mut s = [0u8; 32];
+            getrandom::getrandom(&mut s).expect("Failed to get random bytes");
+            let tid_bytes = (thread_id as u64).to_le_bytes();
+            for i in 0..8 { s[i] ^= tid_bytes[i]; }
+            s
+        };
+
+        let handle = thread::spawn(move || {
+            let secp = Secp256k1::<All>::new();
+            let network = Network::Bitcoin;
+
+            let mut rng = if random {
+                Some(StdRng::from_seed(seed))
+            } else {
+                None
+            };
+
+            let mut key = [0u8; 32];
+            key[31] = 1;
+            let mut local_count = 0u64;
+
+            // Buffers for GPU batch processing
+            let mut privkeys_buf = vec![0u8; gpu_batch * 32];
+            let mut pubkeys_buf = vec![0u8; gpu_batch * 33];
+
+            loop {
+                if stop_flag.load(Ordering::Relaxed) { break; }
+
+                // Generate batch of private keys
+                let mut batch_actual = 0usize;
+                for i in 0..gpu_batch {
+                    if max_keys > 0 && keys_tested.load(Ordering::Relaxed) >= max_keys {
+                        break;
+                    }
+
+                    if random {
+                        let r = rng.as_mut().unwrap();
+                        let mut candidate = [0u8; 32];
+                        r.fill(&mut candidate);
+                        key = candidate;
+                    } else {
+                        increment_key(&mut key);
+                    }
+
+                    // Write to GPU input buffer
+                    let off = i * 32;
+                        privkeys_buf[off..off+32].copy_from_slice(&key);
+                    batch_actual += 1;
+                }
+
+                if batch_actual == 0 { break; }
+
+                // GPU: derive compressed public keys
+                if btcsolver::gpu::gpu_derive(
+                    &privkeys_buf[..batch_actual * 32],
+                    &mut pubkeys_buf[..batch_actual * 33],
+                    batch_actual,
+                ) != 0 {
+                    eprintln!("[GPU] Derive failed for batch of {}", batch_actual);
+                    break;
+                }
+
+                // CPU: derive addresses and lookup in FlatIndex
+                for i in 0..batch_actual {
+                    let pk_data = &pubkeys_buf[i * 33..(i + 1) * 33];
+
+                    // Parse compressed public key from GPU output
+                    let compressed = match CompressedPublicKey::from_slice(pk_data) {
+                        Ok(c) => c,
+                        Err(_) => { local_count += 1; continue; }
+                    };
+
+                    let pubkey = match bitcoin::secp256k1::PublicKey::from_slice(pk_data) {
+                        Ok(p) => p,
+                        Err(_) => { local_count += 1; continue; }
+                    };
+
+                    let btc_pk = bitcoin::PublicKey { inner: pubkey, compressed: true };
+                    let xonly: UntweakedPublicKey = compressed.into();
+
+                    let mut total_sats = 0u64;
+                    let mut matched_addrs: Vec<String> = Vec::new();
+
+                    if addr_flags.has(AddrFlags::LEGACY) {
+                        let addr = bitcoin::Address::p2pkh(&btc_pk, network);
+                        let val = flat_index.lookup(addr.script_pubkey().as_bytes());
+                        if val > 0 {
+                            total_sats += val;
+                            matched_addrs.push(format!("{} [legacy]", addr));
+                        }
+                    }
+
+                    if addr_flags.has(AddrFlags::SEGWIT) {
+                        let addr = bitcoin::Address::p2wpkh(&compressed, network);
+                        let val = flat_index.lookup(addr.script_pubkey().as_bytes());
+                        if val > 0 {
+                            total_sats += val;
+                            matched_addrs.push(format!("{} [segwit]", addr));
+                        }
+                    }
+
+                    if addr_flags.has(AddrFlags::WRAPPED) {
+                        let addr = bitcoin::Address::p2shwpkh(&compressed, network);
+                        let val = flat_index.lookup(addr.script_pubkey().as_bytes());
+                        if val > 0 {
+                            total_sats += val;
+                            matched_addrs.push(format!("{} [wrapped]", addr));
+                        }
+                    }
+
+                    if addr_flags.has(AddrFlags::TAPROOT) {
+                        let addr = bitcoin::Address::p2tr(&secp, xonly, None, network);
+                        let val = flat_index.lookup(addr.script_pubkey().as_bytes());
+                        if val > 0 {
+                            total_sats += val;
+                            matched_addrs.push(format!("{} [taproot]", addr));
+                        }
+                    }
+
+                    if total_sats > 0 {
+                        let pk_off = i * 32;
+                        let key_hex = hex::encode(&privkeys_buf[pk_off..pk_off + 32]);
+
+                        let result = BalanceResult {
+                            key_hex: key_hex.clone(),
+                            wif: None,
+                            sats: total_sats,
+                            btc: total_sats as f64 / 100_000_000.0,
+                            addresses: matched_addrs.clone(),
+                            timestamp: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+                        };
+
+                        results.lock().unwrap().push(result.clone());
+                        save_found_keys(&output_file, &vec![result]).ok();
+
+                        if stop_on_match {
+                            eprintln!("\n\n BALANCE FOUND! Stopping...");
+                            eprintln!("  Key: {}", key_hex);
+                            eprintln!("  Balance: {} sats ({:.8} BTC)", total_sats, total_sats as f64 / 100_000_000.0);
+                            stop_flag.store(true, Ordering::Relaxed);
+                            break;
+                        }
+                    }
+
+                    local_count += 1;
+                }
+
+                keys_tested.fetch_add(local_count, Ordering::Relaxed);
+
+                // Progress
+                let total = keys_tested.load(Ordering::Relaxed);
+                let elapsed = start_time.elapsed();
+                let rate = if elapsed.as_secs_f64() > 0.0 {
+                    total as f64 / elapsed.as_secs_f64()
+                } else { 0.0 };
+                eprintln!("[GPU-Thread {}] {} keys tested | {:.0} keys/sec | {} matches",
+                    thread_id, total, rate, results.lock().unwrap().len());
+                local_count = 0;
+            }
+        });
+
+        handles.push(handle);
+    }
+
     for handle in handles {
         let _ = handle.join();
     }

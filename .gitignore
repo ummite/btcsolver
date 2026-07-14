@@ -46,3 +46,9 @@ utxo-index.snapshot.*
 brute-force-stats.json
 brute-force-progress.json
 found-keys.json
+
+# CUDA build artifacts (recompiled per GPU architecture)
+libsecp_gpu.dll
+libsecp_gpu.exp
+libsecp_gpu.lib
+*.cu.backup
