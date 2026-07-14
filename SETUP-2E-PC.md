@@ -114,6 +114,52 @@ Formats acceptés :
 
 ---
 
+## Système de cache locale (recommandé pour multi-PC)
+
+> **Problème :** Charger l'index UTXO (4+ Go) depuis le SAN (Y:) est lent
+> sur chaque PC. Le système de cache copie l'index sur le disque local
+> le plus rapide de chaque PC.
+
+### Configuration (1ère fois sur chaque PC)
+
+```powershell
+# Auto-détection du disque local le plus rapide + copie depuis le SAN
+.\sync-cache.bat init
+
+# Vérification
+.\sync-cache.bat status
+```
+
+Cela copie `utxo-index.redb` (4+ Go) sur votre disque local (C:, D:, etc.)
+en sélectionnant automatiquement celui avec le plus d'espace libre (10+ Go requis).
+
+### Synchronisation (avant chaque utilisation)
+
+```powershell
+# Vérifie si le SAN a des données plus récentes et sync si besoin
+.\sync-cache.bat sync
+```
+
+### Brute-force avec cache locale
+
+```powershell
+# Utilise la copie locale (chargement instantané)
+.\brute-force-local.bat
+
+# Avec options
+.\brute-force-local.bat --count 1000000000 --threads 8
+```
+
+### Avantages
+
+| Sans cache (SAN) | Avec cache locale |
+|---|---|
+| Chargement : plusieurs minutes | Chargement : ~10 secondes |
+| I/O réseau pendant le scan | Zéro I/O réseau |
+| Conflits possibles multi-PC | Isolé par PC |
+
+---
+
 ## Tous les scripts disponibles
 
 | Script | Usage | Temps |
@@ -127,6 +173,11 @@ Formats acceptés :
 | `build-cache.bat "cle1" "cle2"` | Construire une cache pour N clés | ~2h |
 | `check-cache.bat "cle"` | Vérifier solde depuis une cache | < 1s |
 | `index-stats.bat` | Statistiques de l'index | < 1s |
+| `sync-cache.bat init` | Copier l'index sur disque local | ~1-2 min |
+| `sync-cache.bat sync` | Mettre à jour la copie locale | Instant si à jour |
+| `sync-cache.bat status` | Voir l'état du cache | < 1s |
+| `brute-force-local.bat` | Brute-force avec cache locale | ~100k+/s |
+| `brute-force-random.bat` | Brute-force depuis le SAN | ~100k+/s |
 
 ---
 
