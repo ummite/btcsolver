@@ -122,7 +122,19 @@ impl FlatIndex {
         }
     }
 
+    /// Compare a script in the flat data (at entry index `i`) with `needle`.
+    /// Uses slice references (zero-cost — just pointer + length) with SIMD-optimized cmp.
+    #[inline]
+    fn cmp_script_at(&self, i: usize, needle: &[u8]) -> std::cmp::Ordering {
+        let entry = self.script_entries[i];
+        let s_len = entry.script_len as usize;
+        let s_start = entry.script_offset as usize;
+        let s_end = s_start + s_len;
+        self.all_data[s_start..s_end].cmp(needle)
+    }
+
     /// Look up a script and return the total value of all UTXOs for that script.
+    /// Uses SIMD-optimized slice comparison via cmp_script_at.
     #[inline]
     pub fn lookup(&self, script: &[u8]) -> u64 {
         if self.script_entries.is_empty() {
@@ -134,25 +146,16 @@ impl FlatIndex {
 
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            let entry = self.script_entries[mid];
-            let s_start = entry.script_offset as usize;
-            let s_end = (entry.script_offset + entry.script_len as u32) as usize;
-            let script_bytes = &self.all_data[s_start..s_end];
-
-            match script_bytes.cmp(script) {
+            match self.cmp_script_at(mid, script) {
                 std::cmp::Ordering::Less => lo = mid + 1,
                 std::cmp::Ordering::Greater => hi = mid,
                 std::cmp::Ordering::Equal => {
                     let mut total = 0u64;
 
-                    // Scan backward for earlier matches
+                    // Scan backward for earlier matches (shouldn't happen with unique scripts, but safe)
                     let mut idx = mid;
                     while idx > 0 {
-                        let prev = self.script_entries[idx - 1];
-                        let p_start = prev.script_offset as usize;
-                        let p_end = (prev.script_offset + prev.script_len as u32) as usize;
-                        let prev_bytes = &self.all_data[p_start..p_end];
-                        if prev_bytes != script {
+                        if self.cmp_script_at(idx - 1, script) != std::cmp::Ordering::Equal {
                             break;
                         }
                         idx -= 1;
@@ -160,14 +163,11 @@ impl FlatIndex {
 
                     // Scan forward including the match at `mid`
                     while idx < self.script_entries.len() {
-                        let cur = self.script_entries[idx];
-                        let c_start = cur.script_offset as usize;
-                        let c_end = (cur.script_offset + cur.script_len as u32) as usize;
-                        let cur_bytes = &self.all_data[c_start..c_end];
-                        if cur_bytes != script {
+                        if self.cmp_script_at(idx, script) != std::cmp::Ordering::Equal {
                             break;
                         }
 
+                        let cur = self.script_entries[idx];
                         let u_start = cur.utxo_offset as usize;
                         let u_end = u_start + (cur.utxo_count as usize) * UtxoEntry::SIZE;
                         let utxo_slice = &self.utxo_data[u_start..u_end];
@@ -199,12 +199,7 @@ impl FlatIndex {
 
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            let entry = self.script_entries[mid];
-            let s_start = entry.script_offset as usize;
-            let s_end = (entry.script_offset + entry.script_len as u32) as usize;
-            let script_bytes = &self.all_data[s_start..s_end];
-
-            match script_bytes.cmp(script) {
+            match self.cmp_script_at(mid, script) {
                 std::cmp::Ordering::Less => lo = mid + 1,
                 std::cmp::Ordering::Greater => hi = mid,
                 std::cmp::Ordering::Equal => {
@@ -213,14 +208,11 @@ impl FlatIndex {
 
                     let mut idx = mid;
                     while idx < self.script_entries.len() {
-                        let cur = self.script_entries[idx];
-                        let c_start = cur.script_offset as usize;
-                        let c_end = (cur.script_offset + cur.script_len as u32) as usize;
-                        let cur_bytes = &self.all_data[c_start..c_end];
-                        if cur_bytes != script {
+                        if self.cmp_script_at(idx, script) != std::cmp::Ordering::Equal {
                             break;
                         }
 
+                        let cur = self.script_entries[idx];
                         let u_start = cur.utxo_offset as usize;
                         let u_end = u_start + (cur.utxo_count as usize) * UtxoEntry::SIZE;
                         let utxo_slice = &self.utxo_data[u_start..u_end];

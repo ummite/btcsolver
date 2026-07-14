@@ -13,7 +13,61 @@ use std::time::Instant;
 
 use btcsolver::flat_index::FlatIndex;
 
-/// BTCSolver - Brute-force de cl^es priv^ees (CPU multi-core + FlatIndex)
+/// Bitmask flags for address types — avoids string allocs in hot loop
+#[derive(Clone, Copy)]
+struct AddrFlags(u8);
+impl AddrFlags {
+    const LEGACY:  u8 = 1 << 0;
+    const SEGWIT:  u8 = 1 << 1;
+    const WRAPPED: u8 = 1 << 2;
+    const TAPROOT: u8 = 1 << 3;
+    const ALL: u8   = Self::LEGACY | Self::SEGWIT | Self::WRAPPED | Self::TAPROOT;
+
+    fn has(&self, flag: u8) -> bool { self.0 & flag != 0 }
+
+    fn from_str(s: &str) -> Self {
+        let mut flags: u8 = 0;
+        for part in s.split(',') {
+            match part.trim().to_lowercase().as_str() {
+                "legacy"  => flags |= Self::LEGACY,
+                "segwit"  => flags |= Self::SEGWIT,
+                "wrapped" => flags |= Self::WRAPPED,
+                "taproot" => flags |= Self::TAPROOT,
+                other => eprintln!("WARNING: unknown address type '{}'", other),
+            }
+        }
+        AddrFlags(flags)
+    }
+
+    fn to_display(&self) -> String {
+        let mut parts = Vec::new();
+        if self.0 & Self::LEGACY  != 0 { parts.push("legacy"); }
+        if self.0 & Self::SEGWIT  != 0 { parts.push("segwit"); }
+        if self.0 & Self::WRAPPED != 0 { parts.push("wrapped"); }
+        if self.0 & Self::TAPROOT != 0 { parts.push("taproot"); }
+        parts.join(",")
+    }
+}
+
+/// Per-thread progress entry for resume support
+#[derive(Serialize, serde::Deserialize, Clone, Debug)]
+struct ThreadProgress {
+    thread_id: usize,
+    keys_tested: u64,
+    last_key_hex: String,
+    mode: String, // "random" or "sequential"
+}
+
+#[derive(Serialize, serde::Deserialize, Clone, Debug)]
+struct ProgressFile {
+    version: u32,
+    mode: String,
+    total_keys_tested: u64,
+    threads: Vec<ThreadProgress>,
+    timestamp: String,
+}
+
+/// BTCSolver - Brute-force de cl^es priv^ees (CPU multi-core + FlatIndex v9)
 #[derive(Parser)]
 struct Cli {
     /// Path to UTXO index database (for .redb fallback)
@@ -79,13 +133,21 @@ struct Cli {
     /// Minimum UTXO value in sats to include (filter dust). Default: 0 (all)
     #[arg(long, default_value = "0")]
     min_value: u64,
+
+    /// Progress file for resume (JSON with last keys per thread). Default: brute-force-progress.json
+    #[arg(long, default_value = "brute-force-progress.json")]
+    progress_file: String,
+
+    /// Save progress file every N seconds (0 = disabled). Default: 60
+    #[arg(long, default_value = "60")]
+    progress_interval: u64,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Parse address types
-    let addr_types: Vec<String> = cli.addr_types.split(',').map(|s| s.trim().to_string()).collect();
+    // Parse address types into bitmask (no string allocs in hot loop)
+    let addr_flags = AddrFlags::from_str(&cli.addr_types);
 
     // Determine snapshot path
     let snapshot_path = cli
@@ -145,7 +207,7 @@ fn main() -> Result<()> {
         println!("  Keys to test: unlimited (Ctrl+C to stop)");
     }
     println!("  Batch size: {}", batch_size);
-    println!("  Address types: {}", cli.addr_types);
+    println!("  Address types: {}", addr_flags.to_display());
     if cli.stop_on_match {
         println!("  Auto-stop: ENABLED on first balance");
         println!("  Output file: {}", cli.output_file);
@@ -155,6 +217,9 @@ fn main() -> Result<()> {
     }
     if cli.min_value > 0 {
         println!("  Dust filter: >= {} sats", cli.min_value);
+    }
+    if cli.progress_interval > 0 {
+        println!("  Progress file: {} (every {}s)", cli.progress_file, cli.progress_interval);
     }
     println!();
 
@@ -196,6 +261,54 @@ fn main() -> Result<()> {
         None
     };
 
+    // Launch progress saver thread (for resume after crash)
+    let progress_handle = if cli.progress_interval > 0 {
+        let progress_file = cli.progress_file.clone();
+        let keys_tested = Arc::clone(&keys_tested);
+        let stop_flag = Arc::clone(&stop_flag);
+        let thread_progress = Arc::new(Mutex::new(Vec::<ThreadProgress>::new()));
+        let mode_str = if cli.random { "random" } else { "sequential" }.to_string();
+        let interval = cli.progress_interval;
+        let tp_for_closure = Arc::clone(&thread_progress);
+        let handle = thread::spawn(move || {
+            loop {
+                if stop_flag.load(Ordering::Relaxed) {
+                    let threads = tp_for_closure.lock().unwrap();
+                    if !threads.is_empty() {
+                        let pf = ProgressFile {
+                            version: 1,
+                            mode: mode_str.clone(),
+                            total_keys_tested: keys_tested.load(Ordering::Relaxed),
+                            threads: threads.clone(),
+                            timestamp: chrono::Local::now().to_rfc3339(),
+                        };
+                        if let Ok(json) = serde_json::to_string_pretty(&pf) {
+                            std::fs::write(&progress_file, &json).ok();
+                        }
+                    }
+                    break;
+                }
+                thread::sleep(std::time::Duration::from_secs(interval));
+                let threads = tp_for_closure.lock().unwrap();
+                if !threads.is_empty() {
+                    let pf = ProgressFile {
+                        version: 1,
+                        mode: mode_str.clone(),
+                        total_keys_tested: keys_tested.load(Ordering::Relaxed),
+                        threads: threads.clone(),
+                        timestamp: chrono::Local::now().to_rfc3339(),
+                    };
+                    if let Ok(json) = serde_json::to_string_pretty(&pf) {
+                        std::fs::write(&progress_file, &json).ok();
+                    }
+                }
+            }
+        });
+        Some((handle, thread_progress))
+    } else {
+        None
+    };
+
     let start = Instant::now();
 
     if cli.use_gpu {
@@ -203,7 +316,7 @@ fn main() -> Result<()> {
         eprintln!("WARNING: GPU mode not yet implemented. Using CPU only.");
         run_cpu_bruteforce(
             Arc::new(flat_index),
-            addr_types.clone(),
+            addr_flags,
             cli.count,
             num_threads,
             batch_size,
@@ -214,11 +327,12 @@ fn main() -> Result<()> {
             &start,
             cli.random,
             cli.stop_on_match,
+            &progress_handle.as_ref().map(|(_, p)| Arc::clone(p)),
         );
     } else {
         run_cpu_bruteforce(
             Arc::new(flat_index),
-            addr_types.clone(),
+            addr_flags,
             cli.count,
             num_threads,
             batch_size,
@@ -229,11 +343,16 @@ fn main() -> Result<()> {
             &start,
             cli.random,
             cli.stop_on_match,
+            &progress_handle.as_ref().map(|(_, p)| Arc::clone(p)),
         );
     }
 
     // Wait for stats writer to finish
     if let Some(handle) = stats_handle {
+        let _ = handle.join();
+    }
+    // Wait for progress saver to finish
+    if let Some((handle, _)) = progress_handle {
         let _ = handle.join();
     }
 
@@ -264,7 +383,7 @@ fn main() -> Result<()> {
 
 fn run_cpu_bruteforce(
     flat_index: Arc<FlatIndex>,
-    addr_types: Vec<String>,
+    addr_flags: AddrFlags,
     max_keys: u64,
     num_threads: usize,
     batch_size: usize,
@@ -275,17 +394,18 @@ fn run_cpu_bruteforce(
     start: &Instant,
     random: bool,
     stop_on_match: bool,
+    thread_progress: &Option<Arc<Mutex<Vec<ThreadProgress>>>>,
 ) {
     let mut handles = Vec::new();
 
     for thread_id in 0..num_threads {
         let flat_index = Arc::clone(&flat_index);
-        let addr_types = addr_types.to_vec();
         let results = Arc::clone(results);
         let keys_tested = Arc::clone(keys_tested);
         let stop_flag = Arc::clone(stop_flag);
         let output_file = output_file.to_string();
         let start_time = *start;
+        let progress = thread_progress.as_ref().map(|p| Arc::clone(p));
 
         // Seed each thread's RNG with true entropy from getrandom
         let seed = {
@@ -358,7 +478,7 @@ fn run_cpu_bruteforce(
                     let mut total_sats = 0u64;
                     let mut matched_addrs: Vec<String> = Vec::new();
 
-                    if addr_types.contains(&"legacy".to_string()) {
+                    if addr_flags.has(AddrFlags::LEGACY) {
                         let addr = bitcoin::Address::p2pkh(pubkey, network);
                         let script = addr.script_pubkey();
                         let val = flat_index.lookup(script.as_bytes());
@@ -368,7 +488,7 @@ fn run_cpu_bruteforce(
                         }
                     }
 
-                    if addr_types.contains(&"segwit".to_string()) {
+                    if addr_flags.has(AddrFlags::SEGWIT) {
                         let addr = bitcoin::Address::p2wpkh(&compressed, network);
                         let script = addr.script_pubkey();
                         let val = flat_index.lookup(script.as_bytes());
@@ -378,7 +498,7 @@ fn run_cpu_bruteforce(
                         }
                     }
 
-                    if addr_types.contains(&"wrapped".to_string()) {
+                    if addr_flags.has(AddrFlags::WRAPPED) {
                         let addr = bitcoin::Address::p2shwpkh(&compressed, network);
                         let script = addr.script_pubkey();
                         let val = flat_index.lookup(script.as_bytes());
@@ -388,7 +508,7 @@ fn run_cpu_bruteforce(
                         }
                     }
 
-                    if addr_types.contains(&"taproot".to_string()) {
+                    if addr_flags.has(AddrFlags::TAPROOT) {
                         let addr = bitcoin::Address::p2tr(&secp, xonly, None, network);
                         let script = addr.script_pubkey();
                         let val = flat_index.lookup(script.as_bytes());
@@ -441,6 +561,26 @@ fn run_cpu_bruteforce(
                 }
 
                 keys_tested.fetch_add(local_count, Ordering::Relaxed);
+
+                // Update progress file data (for crash recovery)
+                if let Some(ref prog) = progress {
+                    let mut last_key = [0u8; 32];
+                    last_key.copy_from_slice(&key);
+                    if let Ok(mut guard) = prog.try_lock() {
+                        let current_len = guard.len();
+                        while current_len <= thread_id {
+                            guard.push(ThreadProgress {
+                                thread_id: current_len,
+                                keys_tested: 0,
+                                last_key_hex: "".to_string(),
+                                mode: if random { "random".to_string() } else { "sequential".to_string() },
+                            });
+                            break;
+                        }
+                        guard[thread_id].keys_tested += local_count;
+                        guard[thread_id].last_key_hex = hex::encode(&last_key);
+                    }
+                }
 
                 // Progress report
                 let total = keys_tested.load(Ordering::Relaxed);
