@@ -2,6 +2,7 @@
 //!
 //! Pipeline: GPU derives compressed public keys from private keys in batch;
 //! CPU performs SHA256+RIPEMD160 hashing and FlatIndex lookups.
+//! Also supports combined derive+lookup where GPU does everything.
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -13,6 +14,10 @@ type FnDeriveMulti = unsafe extern "C" fn(*const u8, *mut u8, i32, *const i32, i
 type FnDeviceCount = unsafe extern "C" fn() -> i32;
 type FnDeviceName = unsafe extern "C" fn(i32, *mut i8, i32) -> ();
 type FnCleanup = unsafe extern "C" fn() -> ();
+type FnLoadIndex = unsafe extern "C" fn(*const (), *const u8, *const u8, u32, usize, usize) -> i32;
+type FnUnloadIndex = unsafe extern "C" fn() -> ();
+type FnDeriveLookup = unsafe extern "C" fn(*const u8, *mut u64, i32, u32, *const i32, i32) -> i32;
+type FnDeriveLookupSingle = unsafe extern "C" fn(*const u8, *mut u64, i32, u32) -> i32;
 
 static GPU_FUNCS: OnceLock<GpuFuncs> = OnceLock::new();
 
@@ -26,6 +31,10 @@ struct GpuFuncs {
     pub device_count: FnDeviceCount,
     pub device_name: FnDeviceName,
     pub cleanup: FnCleanup,
+    pub load_index: Option<FnLoadIndex>,
+    pub unload_index: Option<FnUnloadIndex>,
+    pub derive_lookup: Option<FnDeriveLookup>,
+    pub derive_lookup_single: Option<FnDeriveLookupSingle>,
 }
 
 /// Find the CUDA DLL
@@ -58,6 +67,10 @@ fn load_gpu() -> Result<(), String> {
         device_count: unsafe { *lib.get::<FnDeviceCount>(b"secp_gpu_device_count").map_err(|e| e.to_string())? },
         device_name: unsafe { *lib.get::<FnDeviceName>(b"secp_gpu_device_name").map_err(|e| e.to_string())? },
         cleanup: unsafe { *lib.get::<FnCleanup>(b"secp_gpu_cleanup").map_err(|e| e.to_string())? },
+        load_index: unsafe { lib.get::<FnLoadIndex>(b"secp_gpu_load_index").ok().map(|p| *p) },
+        unload_index: unsafe { lib.get::<FnUnloadIndex>(b"secp_gpu_unload_index").ok().map(|p| *p) },
+        derive_lookup: unsafe { lib.get::<FnDeriveLookup>(b"secp_gpu_derive_lookup").ok().map(|p| *p) },
+        derive_lookup_single: unsafe { lib.get::<FnDeriveLookupSingle>(b"secp_gpu_derive_lookup_single").ok().map(|p| *p) },
     };
 
     // Keep library alive (function pointers remain valid while lib is loaded)
@@ -136,4 +149,90 @@ pub fn detect_gpus() -> Vec<GpuInfo> {
 pub struct GpuInfo {
     pub id: i32,
     pub name: String,
+}
+
+/// Load FlatIndex data onto all GPU devices.
+/// script_entries: packed array of (offset:u32, len:u16, utxo_offset:u32, utxo_count:u32)
+/// all_data: raw script bytes
+/// utxo_data: raw UTXO entry bytes (44 bytes each: txid[32] + vout[4] + value[8])
+pub fn gpu_load_index(
+    script_entries: &[u8],
+    all_data: &[u8],
+    utxo_data: &[u8],
+    num_entries: u32,
+) -> i32 {
+    if !ensure_loaded() { return -1; }
+    let funcs = GPU_FUNCS.get().unwrap();
+    match (funcs.load_index, funcs.unload_index) {
+        (Some(load), _) => unsafe {
+            (load)(
+                script_entries.as_ptr() as *const (),
+                all_data.as_ptr(),
+                utxo_data.as_ptr(),
+                num_entries,
+                all_data.len(),
+                utxo_data.len(),
+            )
+        },
+        _ => -1,
+    }
+}
+
+/// Unload FlatIndex data from all GPU devices
+pub fn gpu_unload_index() {
+    if let Some(funcs) = GPU_FUNCS.get() {
+        if let Some(unload) = funcs.unload_index {
+            unsafe { (unload)() };
+        }
+    }
+}
+
+/// Derive pubkey + FlatIndex lookup in one kernel launch.
+/// privkeys: input private keys (32 bytes each, LE)
+/// total_values: output total UTXO value per key (8 bytes each, LE)
+/// addr_types: bitmask (1=legacy, 2=segwit, 4=wrapped, 8=taproot)
+pub fn gpu_derive_lookup(
+    privkeys: &[u8],
+    total_values: &mut [u64],
+    count: usize,
+    addr_types: u32,
+    device_ids: &[i32],
+) -> i32 {
+    if !ensure_loaded() { return -1; }
+    let funcs = GPU_FUNCS.get().unwrap();
+    match funcs.derive_lookup {
+        Some(f) => unsafe {
+            (f)(
+                privkeys.as_ptr(),
+                total_values.as_mut_ptr(),
+                count as i32,
+                addr_types,
+                device_ids.as_ptr(),
+                device_ids.len() as i32,
+            )
+        },
+        None => -1,
+    }
+}
+
+/// Simple wrapper for single-GPU derive+lookup (uses all available GPUs)
+pub fn gpu_derive_lookup_single(
+    privkeys: &[u8],
+    total_values: &mut [u64],
+    count: usize,
+    addr_types: u32,
+) -> i32 {
+    if !ensure_loaded() { return -1; }
+    let funcs = GPU_FUNCS.get().unwrap();
+    match funcs.derive_lookup_single {
+        Some(f) => unsafe {
+            (f)(
+                privkeys.as_ptr(),
+                total_values.as_mut_ptr(),
+                count as i32,
+                addr_types,
+            )
+        },
+        None => -1,
+    }
 }

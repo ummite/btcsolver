@@ -1,0 +1,68 @@
+[
+  {
+    "index": 17698838,
+    "sample_utxos": [
+      "f2244b7de403c238:0 = 2829113 sats"
+    ],
+    "script_hex": "76a914bdd849d86fc9b8fd92677e053670a16cf7bbfaa888ac",
+    "script_len": 25,
+    "script_offset": 453293451,
+    "utxo_count": 1,
+    "utxo_offset": 1696702964
+  },
+  {
+    "index": 17698839,
+    "sample_utxos": [
+      "4f510f4513bfdc91:0 = 1000090 sats"
+    ],
+    "script_hex": "76a914bdd84a713082c765a6a31ac254888b00b30adb4388ac",
+    "script_len": 25,
+    "script_offset": 453293476,
+    "utxo_count": 1,
+    "utxo_offset": 1696703008
+  },
+  {
+    "index": 17698840,
+    "sample_utxos": [
+      "f6fa09ce679fff50:0 = 1248700 sats"
+    ],
+    "script_hex": "76a914bdd84a7bdad0af29073e18a8b4c615968161832288ac",
+    "script_len": 25,
+    "script_offset": 453293501,
+    "utxo_count": 1,
+    "utxo_offset": 1696703052
+  },
+  {
+    "index": 17698841,
+    "sample_utxos": [
+      "457166338d763731:0 = 1000 sats"
+    ],
+    "script_hex": "76a914bdd84ad97ec03ec6c8eb7cb9134b95c98273abda88ac",
+    "script_len": 25,
+    "script_offset": 453293526,
+    "utxo_count": 1,
+    "utxo_offset": 1696703096
+  },
+  {
+    "index": 17698842,
+    "sample_utxos": [
+      "1d2417a092da6e7a:0 = 1607358 sats"
+    ],
+    "script_hex": "76a914bdd84b68b98b2c4152ec6528c54dbdcbaeb60f1c88ac",
+    "script_len": 25,
+    "script_offset": 453293551,
+    "utxo_count": 1,
+    "utxo_offset": 1696703140
+  },
+  {
+    "index": 17698843,
+    "sample_utxos": [
+      "d54c0f62fe0fc25e:0 = 696780 sats"
+    ],
+    "script_hex": "76a914bdd84bd5084b4779f862c59c91b54996e561f30288ac",
+    "script_len": 25,
+    "script_offset": 453293576,
+    "utxo_count": 1,
+    "utxo_offset": 1696703184
+  }
+]

@@ -34,18 +34,36 @@ quick_check.ps1
 bitcoin.conf
 *.redb
 
-# UTXO cache / index (générés localement)
+# UTXO cache / index (générés localement, souvent multi-GB)
 utxo-cache.bin
-
-# UTXO index database + snapshot (fichiers gros, régénérés)
 utxo-index.redb
+utxo-index.redb.*
+utxo-index.redb.bak*
 utxo-index.snapshot
 utxo-index.snapshot.*
+*.redb.bak*
+*.snapshot.bak
+*.bak
 
 # Brute-force runtime files (générés à l'exécution)
 brute-force-stats.json
+brute-force-stats-*.json
 brute-force-progress.json
+brute-force-progress-*.json
 found-keys.json
+brute-force-error.log
+
+# Brainwallet / bible pattern outputs (générés, peuvent être énormes)
+bible-patterns*.txt
+bible-brainwallet*.txt
+bible-brainwallet*.json
+brainwallet-*-results.json
+brainwallet-*-corpus*.txt
+brainwallet-all*.txt
+brainwallet-matches.json
+brainwallet-extended-matches.json
+brainwallet-bible-matches.json
+*-matches.json
 
 # CUDA build artifacts (recompiled per GPU architecture)
 libsecp_gpu.dll

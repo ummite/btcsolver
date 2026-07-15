@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 
 /* ============================================================
  * Constants
@@ -209,20 +210,13 @@ __device__ __forceinline__ void fe_add(fe *r, const fe *a, const fe *b) {
         r->v[i] = s & 0xFFFFFFFF;
         carry = s >> 32;
     }
-    /* Subtract p if overflow */
-    if (carry || !fe_is_zero(a) || !fe_is_zero(b)) {
+    /* Subtract p only if carry (result >= 2^256, so definitely >= p) */
+    if (carry) {
         int borrow = 0;
         for (int i = 0; i < FE_LIMBS; i++) {
             uint64_t s = (uint64_t)r->v[i] - CONST_P[i] - borrow;
-            uint32_t d = s & 0xFFFFFFFF;
+            r->v[i] = s & 0xFFFFFFFF;
             borrow = (s >> 32) & 1;
-            /* Keep result if no borrow (i.e., r >= p), else keep original */
-            if (borrow && i == FE_LIMBS - 1) {
-                /* r < p, subtraction was wrong, restore */
-                /* Actually use conditional: if final borrow, don't subtract */
-                break;
-            }
-            r->v[i] = d;
         }
     }
 }
@@ -616,60 +610,302 @@ __global__ void precompute_kernel(struct dev_prec *prec) {
 }
 
 /* ============================================================
- * Main kernel: derive compressed public keys
+ * SHA256 implementation (device) — variable length
  * ============================================================ */
+__device__ __constant__ uint32_t sha256_k[64] = {
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5,
+    0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
+    0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc,
+    0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+    0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
+    0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3,
+    0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5,
+    0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+    0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+};
+
+__device__ __forceinline__ uint32_t sha_rotr(uint32_t x, int n) {
+    return (x >> n) | (x << (32 - n));
+}
+
+/* SHA256 of N bytes (N < 55, fits in 1 block). Output: 32 bytes big-endian. */
+__device__ void sha256_n(const uint8_t *input, int n, uint8_t *output) {
+    uint32_t h[8] = {
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
+    };
+
+    uint32_t w[64] = {0};
+    for (int i = 0; i < n; i++) {
+        int wi = i / 4;
+        int shift = (3 - (i % 4)) * 8;
+        w[wi] |= (uint32_t)input[i] << shift;
+    }
+    // Padding: 0x80 byte, then zeros, then 64-bit length in bits (BE)
+    int last_byte = n % 4;
+    int pad_word = n / 4;
+    uint32_t pad = 0x80000000U >> (last_byte * 8);
+    uint64_t bitlen = n * 8;
+    if (last_byte == 3) { pad_word++; pad = 0x80; }
+    w[pad_word] |= pad;
+    // Length in last word
+    w[15] |= (uint32_t)bitlen;
+
+    // Schedule
+    for (int i = 16; i < 64; i++) {
+        uint32_t s0 = sha_rotr(w[i-15], 7) ^ sha_rotr(w[i-15], 18) ^ (w[i-15] >> 3);
+        uint32_t s1 = sha_rotr(w[i-2], 17) ^ sha_rotr(w[i-2], 19) ^ (w[i-2] >> 10);
+        w[i] = w[i-16] + s0 + w[i-7] + s1;
+    }
+
+    // 64 rounds
+    uint32_t a=h[0],b=h[1],c=h[2],d=h[3],e=h[4],f=h[5],g=h[6],hh=h[7];
+    for (int i = 0; i < 64; i++) {
+        uint32_t S1 = sha_rotr(e,6)^sha_rotr(e,11)^sha_rotr(e,25);
+        uint32_t ch_ = (e&f)^(~e&g);
+        uint32_t t1 = hh+S1+ch_+sha256_k[i]+w[i];
+        uint32_t S0 = sha_rotr(a,2)^sha_rotr(a,13)^sha_rotr(a,22);
+        uint32_t maj_ = (a&b)^(a&c)^(b&c);
+        uint32_t t2 = S0+maj_;
+        hh=g; g=f; f=e; e=d+t1; d=c; c=b; b=a; a=t1+t2;
+    }
+    h[0]+=a; h[1]+=b; h[2]+=c; h[3]+=d; h[4]+=e; h[5]+=f; h[6]+=g; h[7]+=hh;
+
+    for (int i = 0; i < 8; i++) {
+        output[i*4+0] = (h[i]>>24)&0xFF; output[i*4+1] = (h[i]>>16)&0xFF;
+        output[i*4+2] = (h[i]>>8)&0xFF;  output[i*4+3]  = h[i]&0xFF;
+    }
+}
+
+/* ============================================================
+ * RIPEMD160 implementation (device) — variable length
+ * ============================================================ */
+__device__ __forceinline__ uint32_t f_rip(int j, uint32_t x, uint32_t y, uint32_t z) {
+    int r = j / 16;
+    if (r == 0) return x^y^z;
+    if (r == 1) return (x&y)|(~x&z);
+    if (r == 2) return (x|~y)^z;
+    return x^(y|~z);
+}
+
+/* RIPEMD160 of N bytes (N < 55, fits in 1 block). Output: 20 bytes big-endian. */
+__device__ void ripemd160_n(const uint8_t *input, int n, uint8_t *output) {
+    uint32_t h[5] = {0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0};
+
+    // Build padded block (16 x 32-bit words, big-endian)
+    uint32_t X[16] = {0};
+    for (int i = 0; i < n; i++) {
+        int wi = i / 4;
+        int shift = (3 - (i % 4)) * 8;
+        X[wi] |= (uint32_t)input[i] << shift;
+    }
+    int last_byte = n % 4;
+    int pad_word = n / 4;
+    X[pad_word] |= 0x80000000U >> (last_byte * 8);
+    if (last_byte == 3) X[0] = (uint32_t)(n * 8); // length in first word of 2nd block -> wraps
+    else X[15] |= (uint32_t)(n * 8);
+
+    // Round constants
+    static const uint32_t K[5]  = {0x00000000,0x5a827999,0x6ed9eba1,0x8f1bbcdc,0xa953fd4e};
+    static const uint32_t K1[5] = {0x50a28be6,0x5c4dd124,0x6d703ef3,0x7a6d76e9,0x00000000};
+    static const int  R[5]  = {11,14,15,12,5};
+    static const int  R1[5] = {8,9,9,11,13};
+
+    // Permutations
+    static const int P[80]  = {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,
+        5,4,3,2,1,0,7,6,5,4,3,2,1,0,7,6,
+        1,6,11,0,5,10,15,4,9,14,3,8,13,2,7,12,
+        5,8,11,14,1,4,7,10,13,0,3,6,9,12,15,2,
+        0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15};
+    static const int P1[80] = {5,14,7,0,9,2,11,4,13,6,15,8,1,10,3,12,
+        6,11,3,7,0,13,5,10,14,15,8,12,4,9,1,2,
+        15,5,1,3,7,14,6,9,11,8,12,2,10,0,4,13,
+        8,6,4,1,3,11,15,0,5,12,2,13,9,7,10,14,
+        12,15,10,4,1,5,8,7,6,2,13,14,0,3,9,11};
+
+    // Compression
+    uint32_t a=h[0],b=h[1],c=h[2],d=h[3],e=h[4];
+    uint32_t a1=a,b1=b,c1=c,d1=d,e1=e;
+
+    for (int j = 0; j < 80; j++) {
+        int r = j / 16;
+        uint32_t t = sha_rotr(a + f_rip(j,b,c,d) + X[P[j]] + K[r], R[r]) + e;
+        a=e; e=sha_rotr(d,10); d=c; c=sha_rotr(b,10); b=t;
+
+        t = sha_rotr(a1 + f_rip(79-j,b1,c1,d1) + X[P1[j]] + K1[r], R1[r]) + e1;
+        a1=e1; e1=sha_rotr(d1,10); d1=c1; c1=sha_rotr(b1,10); b1=t;
+    }
+
+    uint32_t t1 = h[2]+d+e1;
+    uint32_t t2 = h[3]+a+b1;
+    uint32_t t3 = h[4]+b+c1;
+    uint32_t t4 = h[0]+e+a1;
+    h[0] = h[1]+t1; h[1] = t1; h[2] = t2; h[3] = t3; h[4] = t4;
+
+    for (int i = 0; i < 5; i++) {
+        output[i*4+0] = (h[i]>>24)&0xFF; output[i*4+1] = (h[i]>>16)&0xFF;
+        output[i*4+2] = (h[i]>>8)&0xFF;  output[i*4+3]  = h[i]&0xFF;
+    }
+}
+
+/* ============================================================
+ * FlatIndex binary search on GPU
+ * ============================================================ */
+
+/* FlatIndex entry on GPU — matches Rust ScriptEntry layout (12 bytes, packed) */
+typedef struct {
+    uint32_t script_offset;
+    uint16_t script_len;
+    uint32_t utxo_offset;
+    uint32_t utxo_count;
+} gpu_script_entry_t;
+
+/* Compare a generated script (gen_script, gen_len) with the stored script at index i.
+ * Returns: -1 if stored < gen, 0 if equal, +1 if stored > gen
+ * Uses __ldg() for read-only cache to speed up random accesses.
+ * Byte-by-byte comparison (scripts are raw bytes, endianness matters). */
+__device__ int cmp_script_with_index(
+    const gpu_script_entry_t *script_entries,
+    const uint8_t *all_data,
+    int i,
+    const uint8_t *gen_script,
+    int gen_len)
+{
+    gpu_script_entry_t entry = script_entries[i];
+    const uint8_t *stored = all_data + entry.script_offset;
+    int stored_len = entry.script_len;
+
+    int minlen = (stored_len < gen_len) ? stored_len : gen_len;
+
+    /* Byte-by-byte comparison using read-only cache */
+    for (int k = 0; k < minlen; k++) {
+        uint8_t sb = __ldg(stored + k);
+        uint8_t gb = gen_script[k];
+        if (sb != gb) return sb < gb ? -1 : 1;
+    }
+
+    /* One is a prefix of the other */
+    if (stored_len < gen_len) return -1;
+    if (stored_len > gen_len) return 1;
+    return 0;
+}
+
+/* Sum UTXO values for a matched script entry.
+ * UTXO entries are 44 bytes: txid(32) + vout(4) + value(8) */
+__device__ uint64_t sum_utxo_values(
+    const uint8_t *utxo_data,
+    uint32_t utxo_offset,
+    uint32_t utxo_count)
+{
+    uint64_t total = 0;
+    for (uint32_t i = 0; i < utxo_count; i++) {
+        uint32_t pos = utxo_offset + (i * 44);
+        /* value is at offset 32 within each 44-byte entry, little-endian */
+        uint64_t val = *(const uint64_t *)(utxo_data + pos + 32);
+        total += val;
+    }
+    return total;
+}
+
+/* Binary search for a generated script in the FlatIndex.
+ * Returns total UTXO value if found, 0 if not found. */
+__device__ uint64_t flat_index_lookup(
+    const gpu_script_entry_t *script_entries,
+    const uint8_t *all_data,
+    const uint8_t *utxo_data,
+    uint32_t num_entries,
+    const uint8_t *gen_script,
+    int gen_len)
+{
+    if (num_entries == 0) return 0;
+
+    uint32_t lo = 0;
+    uint32_t hi = num_entries;
+
+    while (lo < hi) {
+        uint32_t mid = lo + ((hi - lo) >> 1);
+        int cmp = cmp_script_with_index(script_entries, all_data, (int)mid,
+                                        gen_script, gen_len);
+        if (cmp < 0) lo = mid + 1;
+        else if (cmp > 0) hi = mid;
+        else {
+            /* Found — sum UTXO values */
+            gpu_script_entry_t entry = script_entries[mid];
+            return sum_utxo_values(utxo_data, entry.utxo_offset, entry.utxo_count);
+        }
+    }
+
+    return 0;
+}
+
+/* ============================================================
+ * Main kernel: derive pubkey + hash160 + SHA256(pubkey)
+ *
+ * Output per key (85 bytes):
+ *   [0..32]   = compressed pubkey (33 bytes)
+ *   [33..52]  = hash160 = RIPEMD160(SHA256(pubkey)) (20 bytes)
+ *   [53..84]  = SHA256(pubkey) (32 bytes)
+ *
+ * CPU consumer builds scripts by simple byte concatenation:
+ *   Legacy:  76a914 + hash160 + 88ac  (25 bytes)
+ *   Segwit:  0014 + sha256[0..19]     (22 bytes)
+ *   Wrapped: 76a914 + RIPEMD160(0014+sha256[0..19]) + 88ac  (CPU does 1 RIPEMD160)
+ *   Taproot: x-only pubkey from pubkey[1..33]
+ *
+ * GPU saves: SHA256(pubkey) + RIPEMD160(SHA256(pubkey)) per key
+ * CPU saves: zero hashing for legacy, just byte concat
+ * ============================================================ */
+#define OUT_PUBKEY  0   // 33 bytes
+#define OUT_HASH160 33  // 20 bytes
+#define OUT_SHA256  53  // 32 bytes
+#define OUT_STRIDE  85  // total per key
 
 __global__ void derive_pubkey_kernel(
     const uint8_t *privkeys,
-    uint8_t *pubkeys,
+    uint8_t *output,  /* per key: OUT_STRIDE bytes */
     const point_t *base_table,
     int count)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= count) return;
 
-    /* Load private key as 8 x 32-bit limbs (little-endian) */
+    /* Load private key (LE) */
     const uint32_t *sk32 = (const uint32_t *)(privkeys + idx * 32);
     uint32_t sk[FE_LIMBS];
     for (int i = 0; i < FE_LIMBS; i++) sk[i] = sk32[i];
 
-    /* Scalar multiplication: P = sk * G (double-and-add) */
+    /* Scalar multiplication: P = sk * G */
     point_t acc;
-    fe_zero(&acc.x);
-    fe_zero(&acc.y);
-    fe_set1(&acc.z);
+    fe_zero(&acc.x); fe_zero(&acc.y); fe_set1(&acc.z);
 
-    /* Find most significant bit */
     int msb = -1;
     for (int i = FE_LIMBS - 1; i >= 0; i--) {
         if (sk[i] != 0) {
             for (int b = 31; b >= 0; b--) {
-                if ((sk[i] >> b) & 1) {
-                    msb = i * 32 + b;
-                    goto found_msb;
-                }
+                if ((sk[i] >> b) & 1) { msb = i*32+b; goto found_msb; }
             }
         }
     }
 found_msb:
 
-    if (msb < 0) {
-        /* sk = 0 */
-        uint8_t *out = pubkeys + idx * 33;
-        for (int i = 0; i < 33; i++) out[i] = 0;
-        return;
-    }
+    uint8_t *out = output + idx * OUT_STRIDE;
+    if (msb < 0) { for (int i = 0; i < OUT_STRIDE; i++) out[i] = 0; return; }
 
-    /* Initialize with G */
+    /* Double-and-add */
     fe_copy(&acc.x, &base_table[0].x);
     fe_copy(&acc.y, &base_table[0].y);
     fe_set1(&acc.z);
 
-    /* Double-and-add from msb-1 down to 0 */
     point_t tp;
     for (int bit = msb - 1; bit >= 0; bit--) {
         pt_dbl(&acc, &acc);
-
         int limb = bit / 32;
         int pos  = bit % 32;
         if ((sk[limb] >> pos) & 1) {
@@ -684,17 +920,161 @@ found_msb:
     fe ox, oy;
     pt_to_affine(&ox, &oy, &acc);
 
-    /* Output compressed pubkey: 0x02/0x03 + x (big-endian, 32 bytes) */
-    uint8_t *out = pubkeys + idx * 33;
-    out[0] = (oy.v[0] & 1) ? 0x03 : 0x02;
-
-    /* x in big-endian */
+    /* Compressed pubkey: 0x02/0x03 + x (BE) */
+    uint8_t pubkey[33];
+    pubkey[0] = (oy.v[0] & 1) ? 0x03 : 0x02;
     for (int i = 0; i < 32; i++) {
-        int byte_idx = 31 - i;  /* byte in little-endian order */
-        int l = byte_idx / 4;
-        int shift = (byte_idx % 4) * 8;
-        out[1 + i] = (ox.v[l] >> shift) & 0xFF;
+        int byte_idx = 31 - i;
+        pubkey[1+i] = (ox.v[byte_idx/4] >> ((byte_idx%4)*8)) & 0xFF;
     }
+    // Write pubkey to output
+    for (int i = 0; i < 33; i++) out[OUT_PUBKEY+i] = pubkey[i];
+
+    /* Compute SHA256(pubkey) — needed for both hash160 and segwit */
+    uint8_t sha[32];
+    sha256_n(pubkey, 33, sha);
+
+    /* Write SHA256(pubkey) to output */
+    for (int i = 0; i < 32; i++) out[OUT_SHA256+i] = sha[i];
+
+    /* Compute hash160 = RIPEMD160(SHA256(pubkey)) */
+    ripemd160_n(sha, 32, out + OUT_HASH160);
+}
+
+/* ============================================================
+ * Combined kernel: derive pubkey + FlatIndex lookup
+ *
+ * Each thread processes one key:
+ *   1. Derive compressed pubkey from privkey
+ *   2. Compute SHA256(pubkey) and hash160
+ *   3. Build 4 script types and binary search in FlatIndex
+ *   4. Output: 8 bytes per key (total value across all address types)
+ *
+ * Address type bitmask:
+ *   bit 0 = legacy (P2PKH)
+ *   bit 1 = segwit  (P2WPKH)
+ *   bit 2 = wrapped (P2SH-P2WPKH)
+ *   bit 3 = taproot (P2TR)
+ * ============================================================ */
+__global__ void derive_lookup_kernel(
+    const uint8_t *privkeys,
+    uint64_t *total_values,  /* 8 bytes per key: sum of all matched UTXO values */
+    const point_t *base_table,
+    const gpu_script_entry_t *script_entries,
+    const uint8_t *all_data,
+    const uint8_t *utxo_data,
+    uint32_t num_script_entries,
+    int count,
+    uint32_t addr_types)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= count) return;
+
+    /* Load private key (LE) */
+    const uint32_t *sk32 = (const uint32_t *)(privkeys + idx * 32);
+    uint32_t sk[FE_LIMBS];
+    for (int i = 0; i < FE_LIMBS; i++) sk[i] = sk32[i];
+
+    /* Scalar multiplication: P = sk * G (same as derive_pubkey_kernel) */
+    point_t acc;
+    fe_zero(&acc.x); fe_zero(&acc.y); fe_set1(&acc.z);
+
+    int msb = -1;
+    for (int i = FE_LIMBS - 1; i >= 0; i--) {
+        if (sk[i] != 0) {
+            for (int b = 31; b >= 0; b--) {
+                if ((sk[i] >> b) & 1) { msb = i*32+b; goto found_msb2; }
+            }
+        }
+    }
+found_msb2:
+
+    if (msb < 0) { total_values[idx] = 0; return; }
+
+    /* Double-and-add */
+    fe_copy(&acc.x, &base_table[0].x);
+    fe_copy(&acc.y, &base_table[0].y);
+    fe_set1(&acc.z);
+
+    point_t tp;
+    for (int bit = msb - 1; bit >= 0; bit--) {
+        pt_dbl(&acc, &acc);
+        int limb = bit / 32;
+        int pos  = bit % 32;
+        if ((sk[limb] >> pos) & 1) {
+            fe_copy(&tp.x, &base_table[0].x);
+            fe_copy(&tp.y, &base_table[0].y);
+            fe_set1(&tp.z);
+            pt_add(&acc, &acc, &tp);
+        }
+    }
+
+    /* Convert to affine */
+    fe ox, oy;
+    pt_to_affine(&ox, &oy, &acc);
+
+    /* Compressed pubkey: 0x02/0x03 + x (BE) */
+    uint8_t pubkey[33];
+    pubkey[0] = (oy.v[0] & 1) ? 0x03 : 0x02;
+    for (int i = 0; i < 32; i++) {
+        int byte_idx = 31 - i;
+        pubkey[1+i] = (ox.v[byte_idx/4] >> ((byte_idx%4)*8)) & 0xFF;
+    }
+
+    /* Compute SHA256(pubkey) — needed for hash160, segwit, wrapped */
+    uint8_t sha[32];
+    sha256_n(pubkey, 33, sha);
+
+    /* Compute hash160 = RIPEMD160(SHA256(pubkey)) — needed for legacy */
+    uint8_t hash160[20];
+    ripemd160_n(sha, 32, hash160);
+
+    uint64_t total = 0;
+
+    /* Legacy (P2PKH): 76a914 + hash160(20) + 88ac = 25 bytes */
+    if (addr_types & 0x01) {
+        uint8_t script[25];
+        script[0] = 0x76; script[1] = 0xa9; script[2] = 0x14;
+        for (int i = 0; i < 20; i++) script[3+i] = hash160[i];
+        script[23] = 0x88; script[24] = 0xac;
+        total += flat_index_lookup(script_entries, all_data, utxo_data,
+                                   num_script_entries, script, 25);
+    }
+
+    /* Segwit (P2WPKH): 0014 + sha256[0..19] = 22 bytes */
+    if (addr_types & 0x02) {
+        uint8_t script[22];
+        script[0] = 0x00; script[1] = 0x14;
+        for (int i = 0; i < 20; i++) script[2+i] = sha[i];
+        total += flat_index_lookup(script_entries, all_data, utxo_data,
+                                   num_script_entries, script, 22);
+    }
+
+    /* Wrapped (P2SH-P2WPKH): 76a914 + RIPEMD160(0014+sha[0..19]) + 88ac = 25 bytes */
+    if (addr_types & 0x04) {
+        uint8_t witness[22];
+        witness[0] = 0x00; witness[1] = 0x14;
+        for (int i = 0; i < 20; i++) witness[2+i] = sha[i];
+        uint8_t w_hash160[20];
+        ripemd160_n(witness, 22, w_hash160);
+        uint8_t script[25];
+        script[0] = 0x76; script[1] = 0xa9; script[2] = 0x14;
+        for (int i = 0; i < 20; i++) script[3+i] = w_hash160[i];
+        script[23] = 0x88; script[24] = 0xac;
+        total += flat_index_lookup(script_entries, all_data, utxo_data,
+                                   num_script_entries, script, 25);
+    }
+
+    /* Taproot (P2TR): 52ab + xonly_pk(32) = 34 bytes */
+    if (addr_types & 0x08) {
+        uint8_t script[34];
+        script[0] = 0x52; script[1] = 0xab;
+        for (int i = 0; i < 32; i++) script[2+i] = pubkey[1+i];
+        total += flat_index_lookup(script_entries, all_data, utxo_data,
+                                   num_script_entries, script, 34);
+    }
+
+    total_values[idx] = total;
 }
 
 /* ============================================================
@@ -713,6 +1093,15 @@ typedef struct {
     int             initialized;
     char            name[128];
     size_t          mem_total;
+
+    /* FlatIndex data (loaded once, reused across batches) */
+    gpu_script_entry_t *d_script_entries;
+    uint8_t          *d_all_data;       /* script bytes */
+    uint8_t          *d_utxo_data;      /* full UTXO entries (44 bytes each) */
+    uint32_t          num_script_entries;
+    size_t            all_data_size;
+    size_t            utxo_data_size;
+    int               index_loaded;
 } gpu_device_t;
 
 static gpu_device_t gpu_devs[MAX_DEVICES];
@@ -743,6 +1132,13 @@ static cudaError_t init_one_device(int dev_id) {
     gpu_devs[num_gpu_devs].id = dev_id;
     gpu_devs[num_gpu_devs].alloc_size = 0;
     gpu_devs[num_gpu_devs].initialized = 1;
+    gpu_devs[num_gpu_devs].d_script_entries = NULL;
+    gpu_devs[num_gpu_devs].d_all_data = NULL;
+    gpu_devs[num_gpu_devs].d_utxo_data = NULL;
+    gpu_devs[num_gpu_devs].num_script_entries = 0;
+    gpu_devs[num_gpu_devs].all_data_size = 0;
+    gpu_devs[num_gpu_devs].utxo_data_size = 0;
+    gpu_devs[num_gpu_devs].index_loaded = 0;
     gpu_devs[num_gpu_devs].mem_total = prop.totalGlobalMem;
     strncpy(gpu_devs[num_gpu_devs].name, prop.name, 127);
     gpu_devs[num_gpu_devs].name[127] = 0;
@@ -813,12 +1209,13 @@ GPU_API int secp_gpu_derive_multi(
 
         cudaSetDevice(dev->id);
 
+        size_t out_stride = 85; // pubkey(33) + hash160(20) + sha256(32)
         size_t needed = n * 32;
         if (needed > dev->alloc_size) {
             if (dev->d_privkeys) cudaFree(dev->d_privkeys);
             if (dev->d_pubkeys) cudaFree(dev->d_pubkeys);
             cudaMalloc(&dev->d_privkeys, needed);
-            cudaMalloc(&dev->d_pubkeys, n * 33);
+            cudaMalloc(&dev->d_pubkeys, n * out_stride);
             dev->alloc_size = needed;
         }
 
@@ -830,7 +1227,7 @@ GPU_API int secp_gpu_derive_multi(
             dev->d_privkeys, dev->d_pubkeys,
             dev->base_table, n);
 
-        cudaMemcpyAsync(pubkeys + offset * 33, dev->d_pubkeys, n * 33,
+        cudaMemcpyAsync(pubkeys + offset * out_stride, dev->d_pubkeys, n * out_stride,
                         cudaMemcpyDeviceToHost, dev->stream);
 
         cudaStreamSynchronize(dev->stream);
@@ -864,11 +1261,178 @@ GPU_API void secp_gpu_device_name(int idx, char *buf, int bufsize) {
     }
 }
 
+/* Load FlatIndex data onto GPU devices.
+ * script_entries: array of gpu_script_entry_t (12 bytes each, packed)
+ * all_data: raw script bytes
+ * utxo_data: raw UTXO entry bytes (44 bytes each: txid[32] + vout[4] + value[8])
+ * num_entries: number of script entries
+ * Returns: 0 on success, -1 on error */
+GPU_API int secp_gpu_load_index(
+    const void *script_entries,
+    const uint8_t *all_data,
+    const uint8_t *utxo_data,
+    uint32_t num_entries,
+    size_t all_data_size,
+    size_t utxo_data_size)
+{
+    if (num_gpu_devs == 0) {
+        fprintf(stderr, "[GPU] Not initialized.\n");
+        return -1;
+    }
+
+    for (int d = 0; d < num_gpu_devs; d++) {
+        cudaSetDevice(gpu_devs[d].id);
+
+        /* Free previous index if any */
+        if (gpu_devs[d].d_script_entries) cudaFree(gpu_devs[d].d_script_entries);
+        if (gpu_devs[d].d_all_data) cudaFree(gpu_devs[d].d_all_data);
+        if (gpu_devs[d].d_utxo_data) cudaFree(gpu_devs[d].d_utxo_data);
+
+        size_t entries_size = num_entries * sizeof(gpu_script_entry_t);
+
+        cudaMalloc(&gpu_devs[d].d_script_entries, entries_size);
+        cudaMalloc(&gpu_devs[d].d_all_data, all_data_size);
+        cudaMalloc(&gpu_devs[d].d_utxo_data, utxo_data_size);
+
+        cudaMemcpy(gpu_devs[d].d_script_entries, script_entries, entries_size,
+                   cudaMemcpyHostToDevice);
+        cudaMemcpy(gpu_devs[d].d_all_data, all_data, all_data_size,
+                   cudaMemcpyHostToDevice);
+        cudaMemcpy(gpu_devs[d].d_utxo_data, utxo_data, utxo_data_size,
+                   cudaMemcpyHostToDevice);
+
+        gpu_devs[d].num_script_entries = num_entries;
+        gpu_devs[d].all_data_size = all_data_size;
+        gpu_devs[d].utxo_data_size = utxo_data_size;
+        gpu_devs[d].index_loaded = 1;
+
+        size_t total_mb = (entries_size + all_data_size + utxo_data_size) / (1024.0 * 1024.0);
+        printf("[GPU] Device %d: index loaded (%.0f MB — entries=%.0fMB data=%.0fMB utxo=%.0fMB)\n",
+               d, total_mb,
+               entries_size / (1024.0*1024.0),
+               all_data_size / (1024.0*1024.0),
+               utxo_data_size / (1024.0*1024.0));
+    }
+
+    cudaSetDevice(0);
+    return 0;
+}
+
+/* Unload FlatIndex data from GPU devices */
+GPU_API void secp_gpu_unload_index(void) {
+    for (int d = 0; d < num_gpu_devs; d++) {
+        if (!gpu_devs[d].index_loaded) continue;
+        cudaSetDevice(gpu_devs[d].id);
+        if (gpu_devs[d].d_script_entries) { cudaFree(gpu_devs[d].d_script_entries); gpu_devs[d].d_script_entries = NULL; }
+        if (gpu_devs[d].d_all_data) { cudaFree(gpu_devs[d].d_all_data); gpu_devs[d].d_all_data = NULL; }
+        if (gpu_devs[d].d_utxo_data) { cudaFree(gpu_devs[d].d_utxo_data); gpu_devs[d].d_utxo_data = NULL; }
+        gpu_devs[d].index_loaded = 0;
+        printf("[GPU] Device %d: index unloaded\n", d);
+    }
+    cudaSetDevice(0);
+}
+
+/* Derive pubkey + FlatIndex lookup in one kernel launch.
+ * privkeys: input private keys (32 bytes each, LE)
+ * total_values: output total UTXO value per key (8 bytes each, LE)
+ * count: number of keys
+ * addr_types: bitmask (1=legacy, 2=segwit, 4=wrapped, 8=taproot)
+ * Returns: 0 on success, -1 on error */
+GPU_API int secp_gpu_derive_lookup(
+    const uint8_t *privkeys,
+    uint64_t *total_values,
+    int count,
+    uint32_t addr_types,
+    const int *device_ids,
+    int num_devs)
+{
+    if (num_gpu_devs == 0) {
+        fprintf(stderr, "[GPU] Not initialized.\n");
+        return -1;
+    }
+    if (num_devs <= 0) num_devs = num_gpu_devs;
+
+    /* Check index is loaded */
+    for (int d = 0; d < num_devs; d++) {
+        int did = device_ids ? device_ids[d % num_gpu_devs] : d;
+        if (did >= num_gpu_devs) continue;
+        if (!gpu_devs[did].index_loaded) {
+            fprintf(stderr, "[GPU] Device %d: index not loaded. Call secp_gpu_load_index() first.\n", did);
+            return -1;
+        }
+    }
+
+    int keys_per_dev = count / num_devs;
+    int remainder = count % num_devs;
+    int offset = 0;
+
+    for (int d = 0; d < num_devs; d++) {
+        int n = keys_per_dev + (d < remainder ? 1 : 0);
+        if (n <= 0) continue;
+
+        int did = device_ids ? device_ids[d % num_gpu_devs] : d;
+        if (did >= num_gpu_devs) continue;
+        gpu_device_t *dev = &gpu_devs[did];
+
+        cudaSetDevice(dev->id);
+
+        /* Allocate input buffer */
+        size_t needed = n * 32;
+        if (needed > dev->alloc_size) {
+            if (dev->d_privkeys) cudaFree(dev->d_privkeys);
+            cudaMalloc(&dev->d_privkeys, needed);
+            dev->alloc_size = needed;
+        }
+
+        /* Allocate output buffer */
+        size_t out_size = n * sizeof(uint64_t);
+        uint64_t *d_out;
+        cudaMalloc(&d_out, out_size);
+
+        /* Transfer privkeys to device */
+        cudaMemcpyAsync(dev->d_privkeys, privkeys + offset * 32, n * 32,
+                        cudaMemcpyHostToDevice, dev->stream);
+
+        /* Launch kernel */
+        int blocks = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        derive_lookup_kernel<<<blocks, BLOCK_SIZE, 0, dev->stream>>>(
+            dev->d_privkeys, d_out,
+            dev->base_table,
+            dev->d_script_entries, dev->d_all_data, dev->d_utxo_data,
+            dev->num_script_entries,
+            n, addr_types);
+
+        /* Transfer results back */
+        cudaMemcpyAsync(total_values + offset, d_out, out_size,
+                        cudaMemcpyDeviceToHost, dev->stream);
+
+        cudaStreamSynchronize(dev->stream);
+        cudaFree(d_out);
+        offset += n;
+    }
+
+    cudaSetDevice(0);
+    return 0;
+}
+
+/* Simple wrapper for single-GPU derive+lookup */
+GPU_API int secp_gpu_derive_lookup_single(
+    const uint8_t *privkeys,
+    uint64_t *total_values,
+    int count,
+    uint32_t addr_types)
+{
+    return secp_gpu_derive_lookup(privkeys, total_values, count, addr_types, NULL, num_gpu_devs);
+}
+
 GPU_API void secp_gpu_cleanup(void) {
     for (int i = 0; i < num_gpu_devs; i++) {
         cudaSetDevice(gpu_devs[i].id);
         if (gpu_devs[i].d_privkeys) cudaFree(gpu_devs[i].d_privkeys);
         if (gpu_devs[i].d_pubkeys) cudaFree(gpu_devs[i].d_pubkeys);
+        if (gpu_devs[i].d_script_entries) cudaFree(gpu_devs[i].d_script_entries);
+        if (gpu_devs[i].d_all_data) cudaFree(gpu_devs[i].d_all_data);
+        if (gpu_devs[i].d_utxo_data) cudaFree(gpu_devs[i].d_utxo_data);
         if (gpu_devs[i].stream) cudaStreamDestroy(gpu_devs[i].stream);
         gpu_devs[i].initialized = 0;
     }
@@ -892,12 +1456,21 @@ int main() {
     uint8_t privkey[32] = {0};
     privkey[31] = 1;
 
-    uint8_t pubkey[33];
-    if (secp_gpu_derive(privkey, pubkey, 1) == 0) {
-        printf("PubKey(1) = %02x", pubkey[0]);
-        for (int i = 1; i < 33; i++) printf("%02x", pubkey[i]);
+    uint8_t output[85];
+    if (secp_gpu_derive(privkey, output, 1) == 0) {
+        printf("PubKey(1) = %02x", output[0]);
+        for (int i = 1; i < 33; i++) printf("%02x", output[i]);
         printf("\n");
         printf("Expected    = 0279BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798\n");
+        // Print hash160
+        printf("hash160   = ");
+        for (int i = 33; i < 53; i++) printf("%02x", output[i]);
+        printf("\n");
+        printf("Expected  = 1698f40d626808d2bcf0e6cca7c0d5d4c835e0eb\n");
+        // Print SHA256(pubkey)
+        printf("SHA256(pk)= ");
+        for (int i = 53; i < 85; i++) printf("%02x", output[i]);
+        printf("\n");
     }
 
     secp_gpu_cleanup();

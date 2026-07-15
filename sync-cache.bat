@@ -1,21 +1,40 @@
 @echo off
-REM BTCSolver - Sync local cache with SAN index
-REM
-REM Usage:
-REM   sync-cache.bat init      - First-time: copy index from SAN to local disk
-REM   sync-cache.bat sync      - Check for updates and sync if needed
-REM   sync-cache.bat status    - Show cache status
-REM   sync-cache.bat path      - Print local cache path
-REM
-REM Auto-detects fastest local disk with 10+ GB free space.
-REM Override with: sync-cache.bat init --cache-dir D:\btcsolver-cache
+REM Sync UTXO index from SAN (Y:) master to local cache (C:)
+REM Y: is always the source of truth; C: is a read-only cache
 
-cd /d %~dp0
+set SAN_PATH=Y:\btcsolver\utxo-index.snapshot
+set CACHE_PATH=C:\btcsolver-cache\utxo-index.snapshot
 
-if not exist "cache_manager.exe" (
-    echo ERROR: cache_manager.exe not found!
-    pause
+echo === Sync UTXO Index: SAN -> Local Cache ===
+echo Master : %SAN_PATH%
+echo Cache  : %CACHE_PATH%
+
+REM Check if master exists
+if not exist "%SAN_PATH%" (
+    echo ERREUR: Master non trouve sur Y:
     exit /b 1
 )
 
-cache_manager.exe --san-path "Y:\btcsolver\utxo-index.redb" %*
+REM Check if cache needs update (compare timestamps)
+for %%F in ("%SAN_PATH%") do set MASTER_TIME=%%~tF
+for %%F in ("%CACHE_PATH%") do set CACHE_TIME=%%~tF 2>nul
+
+if "%CACHE_TIME%"=="" (
+    echo Cache inexistant - copie initiale...
+    mkdir "C:\btcsolver-cache" 2>nul
+    copy /Y "%SAN_PATH%" "%CACHE_PATH%" >nul
+    echo Cache cree sur C:
+) else (
+    echo Timestamps - Master: %MASTER_TIME% | Cache: %CACHE_TIME%
+    REM If master is newer, sync
+    if /i "%MASTER_TIME%" gtr "%CACHE_TIME%" (
+        echo Master plus recente - sync en cours...
+        copy /Y "%SAN_PATH%" "%CACHE_PATH%" >nul
+        echo Cache mis a jour!
+    ) else (
+        echo Cache deja a jour - nothing to do.
+    )
+)
+
+echo.
+echo === Sync termine ===

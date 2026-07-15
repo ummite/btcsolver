@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>BTC Solver — Dashboard</title>
+  <link rel="stylesheet" href="/static/style.css" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+</head>
+<body>
+  <div class="app">
+    <!-- Header -->
+    <header class="header">
+      <div class="header-left">
+        <div class="logo">
+          <span class="logo-icon">₿</span>
+          <div>
+            <h1>BTC Solver</h1>
+            <span class="subtitle">Private Key Scanner Dashboard</span>
+          </div>
+        </div>
+      </div>
+      <div class="header-right">
+        <div class="ws-status" id="wsStatus">
+          <span class="dot" id="wsDot"></span>
+          <span id="wsLabel">Connexion…</span>
+        </div>
+        <div class="clock" id="clock">--:--:--</div>
+      </div>
+    </header>
+
+    <!-- Main grid -->
+    <main class="grid">
+      <!-- Row 1: Live stats -->
+      <section class="card card-wide" id="scanStatusCard">
+        <div class="card-header">
+          <h2>Scan en direct</h2>
+          <div class="status-badge" id="scanBadge">
+            <span class="dot"></span>
+            <span id="scanBadgeText">Arrêté</span>
+          </div>
+        </div>
+        <div class="stats-grid">
+          <div class="stat">
+            <span class="stat-label">Clés / sec</span>
+            <span class="stat-value mono" id="keysPerSec">—</span>
+          </div>
+          <div class="stat">
+            <span class="stat-label">Clés testées</span>
+            <span class="stat-value mono" id="keysTested">—</span>
+          </div>
+          <div class="stat">
+            <span class="stat-label">Matches</span>
+            <span class="stat-value mono highlight" id="matchesFound">0</span>
+          </div>
+          <div class="stat">
+            <span class="stat-label">Durée</span>
+            <span class="stat-value mono" id="elapsed">—</span>
+          </div>
+          <div class="stat">
+            <span class="stat-label">GPU</span>
+            <span class="stat-value mono" id="gpuUtil">—</span>
+          </div>
+          <div class="stat">
+            <span class="stat-label">Temp GPU</span>
+            <span class="stat-value mono" id="gpuTemp">—</span>
+          </div>
+          <div class="stat">
+            <span class="stat-label">VRAM</span>
+            <span class="stat-value mono" id="gpuVram">—</span>
+          </div>
+          <div class="stat">
+            <span class="stat-label">RAM</span>
+            <span class="stat-value mono" id="ramMb">—</span>
+          </div>
+        </div>
+        <div class="position-bar">
+          <span class="stat-label">Position actuelle</span>
+          <code class="position mono" id="currentPosition">—</code>
+        </div>
+      </section>
+
+      <!-- Scan control -->
+      <section class="card">
+        <div class="card-header">
+          <h2>Contrôle du scan</h2>
+        </div>
+        <form id="scanForm" class="form">
+          <div class="field">
+            <label for="startKey">Clé de départ (hex, optionnel)</label>
+            <input type="text" id="startKey" class="mono" placeholder="Laisser vide pour reprendre la position sauvegardée" spellcheck="false" />
+            <p class="hint">64 caractères hex. Vide = resume depuis le fichier de progression.</p>
+          </div>
+          <div class="field-row">
+            <div class="field">
+              <label for="count">Nombre de clés (0 = illimité)</label>
+              <input type="number" id="count" value="0" min="0" />
+            </div>
+            <div class="field">
+              <label for="threads">Threads CPU</label>
+              <input type="number" id="threads" value="23" min="1" max="128" />
+            </div>
+          </div>
+          <div class="field-row">
+            <div class="field">
+              <label for="batchSize">Batch size</label>
+              <input type="number" id="batchSize" value="256000" min="1000" step="1000" />
+            </div>
+            <div class="field checkbox-field">
+              <label class="checkbox-label">
+                <input type="checkbox" id="useGpu" checked />
+                <span>Utiliser le GPU (CUDA)</span>
+              </label>
+            </div>
+          </div>
+          <div class="field">
+            <label for="addrTypes">Types d'adresses</label>
+            <input type="text" id="addrTypes" value="legacy,segwit,wrapped,taproot" class="mono" />
+          </div>
+          <div class="btn-row">
+            <button type="submit" class="btn btn-primary" id="btnStart">
+              <span class="btn-icon">▶</span> Démarrer
+            </button>
+            <button type="button" class="btn btn-danger" id="btnStop" disabled>
+              <span class="btn-icon">■</span> Arrêter
+            </button>
+          </div>
+          <div class="form-msg" id="scanMsg"></div>
+        </form>
+      </section>
+
+      <!-- Key checker -->
+      <section class="card">
+        <div class="card-header">
+          <h2>Vérifier une clé</h2>
+        </div>
+        <form id="keyForm" class="form">
+          <div class="field">
+            <label for="keyInput">Clé privée</label>
+            <textarea id="keyInput" class="mono" rows="3" placeholder="Hex (64 chars) · WIF · BIP39 (12/24 mots) · brainwallet" spellcheck="false"></textarea>
+          </div>
+          <div class="field-row">
+            <div class="field">
+              <label for="keyFormat">Format</label>
+              <select id="keyFormat">
+                <option value="">Auto-détecter</option>
+                <option value="hex">Hex</option>
+                <option value="wif">WIF</option>
+                <option value="bip39">BIP39</option>
+                <option value="brainwallet">Brainwallet</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="passphrase">Passphrase BIP39 (optionnel)</label>
+              <input type="password" id="passphrase" placeholder="Optionnel" autocomplete="off" />
+            </div>
+          </div>
+          <div class="btn-row">
+            <button type="submit" class="btn btn-primary" id="btnCheck">
+              Vérifier
+            </button>
+          </div>
+        </form>
+        <div id="keyResult" class="key-result hidden"></div>
+      </section>
+
+      <!-- Bitcoin Core -->
+      <section class="card">
+        <div class="card-header">
+          <h2>Bitcoin Core</h2>
+          <div class="status-badge" id="btcBadge">
+            <span class="dot"></span>
+            <span id="btcBadgeText">—</span>
+          </div>
+        </div>
+        <div class="stats-grid compact">
+          <div class="stat">
+            <span class="stat-label">Blocs</span>
+            <span class="stat-value mono" id="btcBlocks">—</span>
+          </div>
+          <div class="stat">
+            <span class="stat-label">Headers</span>
+            <span class="stat-value mono" id="btcHeaders">—</span>
+          </div>
+          <div class="stat">
+            <span class="stat-label">Sync</span>
+            <span class="stat-value mono" id="btcSync">—</span>
+          </div>
+          <div class="stat">
+            <span class="stat-label">Peers</span>
+            <span class="stat-value mono" id="btcPeers">—</span>
+          </div>
+        </div>
+        <div class="progress-wrap">
+          <div class="progress-bar"><div class="progress-fill" id="btcProgress"></div></div>
+          <span class="progress-label mono" id="btcProgressLabel">0%</span>
+        </div>
+        <div class="btn-row">
+          <button type="button" class="btn btn-secondary" id="btnBtcStart">Démarrer bitcoind</button>
+          <button type="button" class="btn btn-ghost" id="btnBtcStop">Arrêter</button>
+        </div>
+        <div class="form-msg" id="btcMsg"></div>
+      </section>
+
+      <!-- Snapshot UTXO -->
+      <section class="card">
+        <div class="card-header">
+          <h2>Snapshot UTXO</h2>
+          <div class="status-badge" id="snapBadge">
+            <span class="dot"></span>
+            <span id="snapBadgeText">—</span>
+          </div>
+        </div>
+        <div class="stats-grid compact">
+          <div class="stat">
+            <span class="stat-label">Âge</span>
+            <span class="stat-value mono" id="snapAge">—</span>
+          </div>
+          <div class="stat">
+            <span class="stat-label">Taille</span>
+            <span class="stat-value mono" id="snapSize">—</span>
+          </div>
+          <div class="stat">
+            <span class="stat-label">Max âge</span>
+            <span class="stat-value mono" id="snapMaxAge">—</span>
+          </div>
+          <div class="stat">
+            <span class="stat-label">Index chargé</span>
+            <span class="stat-value mono" id="indexLoaded">—</span>
+          </div>
+        </div>
+        <p class="path mono" id="snapPath">—</p>
+        <div class="btn-row">
+          <button type="button" class="btn btn-secondary" id="btnSnapRefresh">
+            Régénérer le snapshot
+          </button>
+        </div>
+        <div class="form-msg" id="snapMsg"></div>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <span>BTC Solver Dashboard · local only · ne pas exposer sur internet</span>
+      <span id="footerHealth">—</span>
+    </footer>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>
