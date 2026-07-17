@@ -436,6 +436,18 @@ fn parse_private_key(s: &str, network: Network) -> Result<(PrivateKey, &'static 
         }
     }
 
+    // Prefer pure hex (64 hex chars) over WIF — some valid hex keys start with 'c'/'5'/etc.
+    let hex_candidate = s.strip_prefix("0x").unwrap_or(s);
+    if hex_candidate.len() == 64 && hex_candidate.chars().all(|c| c.is_ascii_hexdigit()) {
+        let bytes = hex::decode(hex_candidate).context("Hex invalide")?;
+        if bytes.len() != 32 {
+            bail!("Clé hex doit faire 32 octets.");
+        }
+        let pk = PrivateKey::from_slice(&bytes, network)
+            .context("Impossible de créer la clé privée depuis les octets")?;
+        return Ok((pk, "HEX (32 octets)"));
+    }
+
     if s.len() > 50 && (s.starts_with('5') || s.starts_with('K') || s.starts_with('L') || s.starts_with('9') || s.starts_with('c')) {
         // Likely WIF
         let pk = PrivateKey::from_wif(s).context("WIF invalide ou corrompu (checksum?)")?;
@@ -447,18 +459,10 @@ fn parse_private_key(s: &str, network: Network) -> Result<(PrivateKey, &'static 
         let kind = if pk.compressed { "WIF (compressée)" } else { "WIF (non compressée - legacy)" };
         Ok((pk, kind))
     } else {
-        // Hex
-        let hex_clean = s.strip_prefix("0x").unwrap_or(s);
-        if hex_clean.len() != 64 {
-            bail!("Clé hex invalide : doit faire exactement 64 caractères (32 octets).");
-        }
-        let bytes = hex::decode(hex_clean).context("Hex invalide")?;
-        if bytes.len() != 32 {
-            bail!("Clé hex doit faire 32 octets.");
-        }
-        let pk = PrivateKey::from_slice(&bytes, network)
-            .context("Impossible de créer la clé privée depuis les octets")?;
-        Ok((pk, "HEX (32 octets)"))
+        bail!(
+            "Clé non reconnue (attendu: WIF, hex 64 chars, ou mnémonique BIP39 12/24 mots). Reçu len={}",
+            s.len()
+        );
     }
 }
 

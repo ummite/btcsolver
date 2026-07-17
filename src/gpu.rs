@@ -37,16 +37,30 @@ struct GpuFuncs {
     pub derive_lookup_single: Option<FnDeriveLookupSingle>,
 }
 
-/// Find the CUDA DLL
+/// Find the CUDA DLL (exe dir, cwd, project paths, stable bin)
 fn find_dll() -> Option<PathBuf> {
+    let mut cands: Vec<PathBuf> = Vec::new();
     if let Ok(exe) = std::env::current_exe() {
         if let Some(parent) = exe.parent() {
-            let p = parent.join("libsecp_gpu.dll");
-            if p.exists() { return Some(p); }
+            cands.push(parent.join("libsecp_gpu.dll"));
+            // target/release -> repo root
+            if let Some(grand) = parent.parent().and_then(|p| p.parent()) {
+                cands.push(grand.join("libsecp_gpu.dll"));
+            }
         }
     }
-    let cwd_dll = std::env::current_dir().ok()?.join("libsecp_gpu.dll");
-    if cwd_dll.exists() { return Some(cwd_dll); }
+    if let Ok(cwd) = std::env::current_dir() {
+        cands.push(cwd.join("libsecp_gpu.dll"));
+        cands.push(cwd.join("target").join("release").join("libsecp_gpu.dll"));
+    }
+    cands.push(PathBuf::from(r"Y:\btcsolver\libsecp_gpu.dll"));
+    cands.push(PathBuf::from(r"Y:\btcsolver\target\release\libsecp_gpu.dll"));
+    cands.push(PathBuf::from(r"C:\btcsolver-bin\libsecp_gpu.dll"));
+    for p in cands {
+        if p.exists() {
+            return Some(p);
+        }
+    }
     None
 }
 

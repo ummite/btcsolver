@@ -3,251 +3,555 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>BTC Solver — Dashboard</title>
-  <link rel="stylesheet" href="/static/style.css" />
+  <title>BTC Solver — Clés</title>
+  <link rel="stylesheet" href="/static/style.css?v=20260717explorer" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
 </head>
 <body>
+  <!-- Flash plein écran quand un hit (clé avec solde/activité) apparaît -->
+  <div id="hitFlashOverlay" class="hit-flash-overlay" aria-hidden="true"></div>
+  <div id="hitFlashBanner" class="hit-flash-banner" aria-live="assertive" role="alert">
+    <span class="hit-flash-icon">⚡</span>
+    <span id="hitFlashText">HIT — clé trouvée</span>
+  </div>
   <div class="app">
-    <!-- Header -->
     <header class="header">
       <div class="header-left">
         <div class="logo">
           <span class="logo-icon">₿</span>
           <div>
             <h1>BTC Solver</h1>
-            <span class="subtitle">Private Key Scanner Dashboard</span>
+            <span class="subtitle">Trouver des clés · 100% local</span>
           </div>
         </div>
       </div>
       <div class="header-right">
         <div class="ws-status" id="wsStatus">
           <span class="dot" id="wsDot"></span>
-          <span id="wsLabel">Connexion…</span>
+          <span id="wsLabel">…</span>
         </div>
         <div class="clock" id="clock">--:--:--</div>
       </div>
     </header>
 
-    <!-- Main grid -->
-    <main class="grid">
-      <!-- Row 1: Live stats -->
-      <section class="card card-wide" id="scanStatusCard">
-        <div class="card-header">
-          <h2>Scan en direct</h2>
-          <div class="status-badge" id="scanBadge">
-            <span class="dot"></span>
-            <span id="scanBadgeText">Arrêté</span>
-          </div>
-        </div>
-        <div class="stats-grid">
-          <div class="stat">
-            <span class="stat-label">Clés / sec</span>
-            <span class="stat-value mono" id="keysPerSec">—</span>
-          </div>
-          <div class="stat">
-            <span class="stat-label">Clés testées</span>
-            <span class="stat-value mono" id="keysTested">—</span>
-          </div>
-          <div class="stat">
-            <span class="stat-label">Matches</span>
-            <span class="stat-value mono highlight" id="matchesFound">0</span>
-          </div>
-          <div class="stat">
-            <span class="stat-label">Durée</span>
-            <span class="stat-value mono" id="elapsed">—</span>
-          </div>
-          <div class="stat">
-            <span class="stat-label">GPU</span>
-            <span class="stat-value mono" id="gpuUtil">—</span>
-          </div>
-          <div class="stat">
-            <span class="stat-label">Temp GPU</span>
-            <span class="stat-value mono" id="gpuTemp">—</span>
-          </div>
-          <div class="stat">
-            <span class="stat-label">VRAM</span>
-            <span class="stat-value mono" id="gpuVram">—</span>
-          </div>
-          <div class="stat">
-            <span class="stat-label">RAM</span>
-            <span class="stat-value mono" id="ramMb">—</span>
-          </div>
-        </div>
-        <div class="position-bar">
-          <span class="stat-label">Position actuelle</span>
-          <code class="position mono" id="currentPosition">—</code>
-        </div>
-      </section>
+    <!-- État simple toujours visible -->
+    <div class="status-bar" id="statusBar">
+      <div class="status-bar-main">
+        <span class="pill" id="pillScan" title="Scan">Scan …</span>
+        <span class="pill" id="pillHits" title="Hits">Hits 0</span>
+        <span class="pill" id="pillUtxo" title="UTXO">UTXO …</span>
+        <span class="pill" id="pillReady" title="Index">Idx …</span>
+        <span class="pill" id="pillCore" title="Core">Core …</span>
+        <span class="pill" id="pillSync" title="Chaîne">Chaîne …</span>
+        <span class="status-bar-msg mono" id="statusBarMsg">—</span>
+      </div>
+      <div class="status-bar-actions">
+        <button type="button" class="btn btn-primary btn-sm" id="btnBarRestart">Relancer Core</button>
+        <button type="button" class="btn btn-secondary btn-sm" id="btnBarReloadIndex">Charger index</button>
+        <button type="button" class="btn btn-ghost btn-sm" id="btnBarRefresh">Rafraîchir</button>
+      </div>
+    </div>
 
-      <!-- Scan control -->
-      <section class="card">
-        <div class="card-header">
-          <h2>Contrôle du scan</h2>
+    <!-- Bandeau clair: hits + UTXO source -->
+    <div class="info-strip" id="infoStrip">
+      <div class="info-tile hit-tile">
+        <span class="info-kicker">Clés avec solde</span>
+        <span class="info-big mono" id="infoHitsBig">0</span>
+        <span class="info-sub" id="infoHitsSub">aucune clé avec activité on-chain pour l’instant</span>
+      </div>
+      <div class="info-tile utxo-tile" id="utxoStatusTile">
+        <span class="info-kicker">Index UTXO (référence des soldes)</span>
+        <div class="status-badges" id="utxoStatusBadges">
+          <span class="status-badge" id="badgeCore" title="État de Bitcoin Core">Core · …</span>
+          <span class="status-badge" id="badgeUtxo" title="Fraîcheur de l’index UTXO vs tip">UTXO · …</span>
         </div>
-        <form id="scanForm" class="form">
-          <div class="field">
-            <label for="startKey">Clé de départ (hex, optionnel)</label>
-            <input type="text" id="startKey" class="mono" placeholder="Laisser vide pour reprendre la position sauvegardée" spellcheck="false" />
-            <p class="hint">64 caractères hex. Vide = resume depuis le fichier de progression.</p>
+        <span class="info-big mono" id="infoUtxoBlock" title="Hauteur exacte de l’index UTXO (pas de raccourci K)">bloc —</span>
+        <span class="info-sub mono" id="infoUtxoVsCore" title="Comparaison index UTXO vs tip Bitcoin Core">Core tip: —</span>
+        <span class="info-sub mono" id="infoUtxoDate">date bloc: —</span>
+        <span class="info-sub mono" id="infoUtxoBuilt">généré: —</span>
+        <span class="info-sub mono hex-full" id="infoUtxoHash" title="">hash: —</span>
+      </div>
+      <div class="info-tile scan-tile">
+        <span class="info-kicker">Scan en cours</span>
+        <span class="info-big mono" id="infoScanRate">— /s</span>
+        <span class="info-sub mono" id="infoScanTested">testées: —</span>
+        <span class="info-sub mono" id="infoScanMode">mode: —</span>
+      </div>
+    </div>
+
+    <div class="alert-banner warn-banner" style="border-color:rgba(61,214,140,0.4);color:var(--green);background:var(--green-dim)">
+      <strong>24/7 :</strong> le scan de fond (brute) tourne tout seul.
+      Tu peux coller d’autres mots ici <strong>sans l’arrêter</strong> — onglet <strong>1. Tester une clé</strong>.
+      Hits communs : <code>found-keys.json</code> + coffre « Clés trouvées ».
+    </div>
+
+    <div id="spendWarn" class="alert-banner warn-banner tip-critical tip-stale" role="alert">
+      <strong>UTXO : évaluation fraîcheur…</strong>
+      <div class="tip-warn-body" id="tipWarnBody">
+        Règle : index UTXO <strong>valable pour les tests</strong> s’il a moins de <strong>24 h</strong> de retard sur le tip.
+        Au-delà : hits = candidats seulement (pas de solde garanti).
+      </div>
+      <div class="tip-warn-meta mono" id="tipWarnMeta">index: — · core: —</div>
+    </div>
+
+    <nav class="tabs" id="tabs">
+      <button class="tab active" data-tab="hunt">1. Tester une clé</button>
+      <button class="tab" data-tab="dict">2. Scan listes</button>
+      <button class="tab" data-tab="found">3. Clés trouvées</button>
+      <button class="tab" data-tab="auto">4. Scans auto</button>
+      <button class="tab" data-tab="system">Système</button>
+    </nav>
+
+    <main>
+      <!-- ═══ HUNT ═══ -->
+      <section class="panel active" id="panel-hunt">
+        <div class="card card-wide hero-card">
+          <div class="card-header">
+            <h2>Colle n’importe quoi → on teste le max de dérivations</h2>
           </div>
-          <div class="field-row">
+          <p class="hint">Hex · WIF · seed BIP39 · phrase brainwallet · plusieurs lignes = lot</p>
+          <form id="keyForm" class="form">
             <div class="field">
-              <label for="count">Nombre de clés (0 = illimité)</label>
-              <input type="number" id="count" value="0" min="0" />
+              <textarea id="keyInput" class="mono" rows="5" placeholder="Exemples:&#10;L1aW4aubDFB7yfras2S1mN3bqg9nwySY8nkoLmJebSLD5BWv3ENZ&#10;abandon abandon ... about&#10;correct horse battery staple&#10;mon mot de passe 2013" spellcheck="false"></textarea>
             </div>
-            <div class="field">
-              <label for="threads">Threads CPU</label>
-              <input type="number" id="threads" value="23" min="1" max="128" />
+            <div class="field-row">
+              <div class="field">
+                <label for="keyFormat">Type</label>
+                <select id="keyFormat">
+                  <option value="">Auto (recommandé)</option>
+                  <option value="hex">Hex 64</option>
+                  <option value="wif">WIF</option>
+                  <option value="bip39">BIP39</option>
+                  <option value="brainwallet">Brainwallet / phrase</option>
+                </select>
+              </div>
+              <div class="field">
+                <label for="passphrase">Passphrase BIP39 (si tu l’as oubliée, teste des variantes en lot)</label>
+                <input type="text" id="passphrase" placeholder="vide = aucune" autocomplete="off" />
+              </div>
             </div>
-          </div>
-          <div class="field-row">
-            <div class="field">
-              <label for="batchSize">Batch size</label>
-              <input type="number" id="batchSize" value="256000" min="1000" step="1000" />
-            </div>
-            <div class="field checkbox-field">
-              <label class="checkbox-label">
-                <input type="checkbox" id="useGpu" checked />
-                <span>Utiliser le GPU (CUDA)</span>
+
+            <div class="preset-row">
+              <button type="button" class="btn btn-primary" id="btnModeMax">Mode MAX (toutes méthodes)</button>
+              <button type="button" class="btn btn-secondary" id="btnModeFast">Mode rapide</button>
+              <label class="checkbox-label inline-check">
+                <input type="checkbox" id="matchesOnly" checked />
+                <span>Seulement soldes &gt; 0</span>
               </label>
             </div>
-          </div>
-          <div class="field">
-            <label for="addrTypes">Types d'adresses</label>
-            <input type="text" id="addrTypes" value="legacy,segwit,wrapped,taproot" class="mono" />
-          </div>
-          <div class="btn-row">
-            <button type="submit" class="btn btn-primary" id="btnStart">
-              <span class="btn-icon">▶</span> Démarrer
-            </button>
-            <button type="button" class="btn btn-danger" id="btnStop" disabled>
-              <span class="btn-icon">■</span> Arrêter
-            </button>
-          </div>
-          <div class="form-msg" id="scanMsg"></div>
-        </form>
-      </section>
 
-      <!-- Key checker -->
-      <section class="card">
-        <div class="card-header">
-          <h2>Vérifier une clé</h2>
-        </div>
-        <form id="keyForm" class="form">
-          <div class="field">
-            <label for="keyInput">Clé privée</label>
-            <textarea id="keyInput" class="mono" rows="3" placeholder="Hex (64 chars) · WIF · BIP39 (12/24 mots) · brainwallet" spellcheck="false"></textarea>
-          </div>
-          <div class="field-row">
-            <div class="field">
-              <label for="keyFormat">Format</label>
-              <select id="keyFormat">
-                <option value="">Auto-détecter</option>
-                <option value="hex">Hex</option>
-                <option value="wif">WIF</option>
-                <option value="bip39">BIP39</option>
-                <option value="brainwallet">Brainwallet</option>
-              </select>
+            <details class="details" id="methodsBox">
+              <summary>Méthodes activées (Mode MAX coche tout)</summary>
+              <div class="checks method-tooltips">
+                <label title="Hash SHA-256 de la phrase → 32 octets = clé privée. Ex. SHA256(&quot;satoshi&quot;). Méthode brainwallet classique."><input type="checkbox" id="optSha256" checked /> SHA256(phrase)</label>
+                <label title="Double SHA-256 : SHA256(SHA256(phrase)) → clé privée. Variante moins courante que SHA256 simple."><input type="checkbox" id="optDouble" checked /> Double SHA256</label>
+                <label title="MD5(phrase) sur 16 octets, puis padding de 16 zéros → 32 octets. Ancienne variante brainwallet peu sûre mais parfois vue."><input type="checkbox" id="optMd5" checked /> MD5 paddé</label>
+                <label title="Inverse l’ordre des caractères. Ex. &quot;bitcoin&quot; → &quot;nioctib&quot; puis hash."><input type="checkbox" id="optRevChars" checked /> Reverse caractères</label>
+                <label title="Inverse l’ordre des mots (séparés par espaces). Ex. &quot;hello world&quot; → &quot;world hello&quot;."><input type="checkbox" id="optRevWords" checked /> Reverse mots</label>
+                <label title="Met toute la phrase en minuscules avant le hash. Ex. &quot;Bitcoin&quot; → &quot;bitcoin&quot;."><input type="checkbox" id="optLower" checked /> Lowercase</label>
+                <label title="Met toute la phrase en MAJUSCULES avant le hash. Ex. &quot;bitcoin&quot; → &quot;BITCOIN&quot;."><input type="checkbox" id="optUpper" checked /> Uppercase</label>
+                <label title="Supprime tous les espaces. Ex. &quot;hello world&quot; → &quot;helloworld&quot; puis hash."><input type="checkbox" id="optNoSpace" checked /> Sans espaces</label>
+                <label title="Enlève ponctuation et symboles (. , ; ! ? ' &quot; @ # $ % …). Garde lettres, chiffres et espaces. Ex. &quot;hi, world!&quot; → &quot;hi world&quot; et aussi &quot;hiworld&quot;."><input type="checkbox" id="optStripSym" checked /> Sans symboles (.,;!?…)</label>
+                <label title="Ajoute des suffixes à la phrase (minuscules) puis hash chaque variante. Suffixes testés : « bitcoin », « btc », « wallet », « private key », « key », « 123 », « 2024 », « 2025 », « 2026 ». Ex. &quot;satoshi&quot; → &quot;satoshi bitcoin&quot;, &quot;satoshi btc&quot;…"><input type="checkbox" id="optSuffix" checked /> Suffixes (bitcoin, key…)</label>
+                <label title="Ajoute des préfixes à la phrase (minuscules) puis hash. Préfixes : « my », « the », « bitcoin », « my bitcoin », « wallet ». Ex. &quot;satoshi&quot; → &quot;my satoshi&quot;, &quot;the satoshi&quot;…"><input type="checkbox" id="optPrefix" checked /> Préfixes (my, the…)</label>
+                <label title="Pour une seed BIP39 : dérive plusieurs chemins standards BIP44 (legacy), BIP49 (P2SH-segwit), BIP84 (native segwit), BIP86 (taproot), pas seulement le premier chemin."><input type="checkbox" id="optBipAll" checked /> BIP39 multi-chemins (44/49/84/86)</label>
+              </div>
+              <div class="field-row">
+                <div class="field">
+                  <label for="bipCount">Nb adresses BIP39 par chemin</label>
+                  <input type="number" id="bipCount" value="10" min="1" max="50" />
+                </div>
+              </div>
+            </details>
+
+            <div class="btn-row">
+              <button type="submit" class="btn btn-primary" id="btnCheck">Chercher un solde</button>
+              <button type="button" class="btn btn-ghost" id="btnClearKey">Effacer</button>
             </div>
-            <div class="field">
-              <label for="passphrase">Passphrase BIP39 (optionnel)</label>
-              <input type="password" id="passphrase" placeholder="Optionnel" autocomplete="off" />
+          </form>
+          <div class="form-msg" id="keyMsg"></div>
+        </div>
+
+        <div class="card card-wide">
+          <div class="card-header">
+            <h2>Résultats</h2>
+            <button type="button" class="btn btn-ghost btn-sm" id="btnSaveHits">Sauver les hits dans « Clés trouvées »</button>
+          </div>
+          <div id="keyResult" class="key-result">Aucun test pour l’instant.</div>
+        </div>
+      </section>
+
+      <!-- ═══ DICT ═══ -->
+      <section class="panel" id="panel-dict">
+        <div class="grid two">
+          <div class="card">
+            <div class="card-header"><h2>Scan une liste de phrases</h2></div>
+            <p class="hint">Corpus du repo ou colle ta liste. Chaque ligne → variantes + hashes → check UTXO.</p>
+            <form id="dictForm" class="form">
+              <div class="field">
+                <label for="dictCorpus">Liste prête (projet)</label>
+                <select id="dictCorpus"><option value="">— coller des phrases ou choisir —</option></select>
+              </div>
+              <div class="field">
+                <label for="dictPhrases">Ou colle ici (1 phrase / ligne)</label>
+                <textarea id="dictPhrases" class="mono" rows="10" placeholder="password&#10;satoshi&#10;bitcoin 2011" spellcheck="false"></textarea>
+              </div>
+              <div class="preset-row">
+                <button type="button" class="btn btn-secondary btn-sm" id="btnDictMax">Max méthodes</button>
+                <button type="button" class="btn btn-ghost btn-sm" id="btnDictFast">Rapide</button>
+              </div>
+              <div class="checks method-tooltips">
+                <label title="Hash SHA-256 de chaque phrase → clé privée. Ex. SHA256(&quot;satoshi&quot;)."><input type="checkbox" id="dSha256" checked /> SHA256</label>
+                <label title="Double SHA-256 : SHA256(SHA256(phrase)) → clé privée."><input type="checkbox" id="dDouble" checked /> SHA256d</label>
+                <label title="MD5(phrase) 16 octets + 16 zéros de padding → 32 octets (clé)."><input type="checkbox" id="dMd5" checked /> MD5</label>
+                <label title="Inverse les caractères. Ex. &quot;bitcoin&quot; → &quot;nioctib&quot;."><input type="checkbox" id="dRevC" checked /> Reverse chars</label>
+                <label title="Inverse l’ordre des mots. Ex. &quot;hello world&quot; → &quot;world hello&quot;."><input type="checkbox" id="dRevW" checked /> Reverse words</label>
+                <label title="Minuscules avant hash. Ex. &quot;Bitcoin&quot; → &quot;bitcoin&quot;."><input type="checkbox" id="dLower" checked /> Lower</label>
+                <label title="Enlève . , ; ! ? ' &quot; @ # $ % … Garde lettres/chiffres/espaces. Ex. &quot;hi, world!&quot; → &quot;hi world&quot;."><input type="checkbox" id="dStripSym" checked /> Sans symboles (.,;!?…)</label>
+                <label title="Supprime les espaces. Ex. &quot;hello world&quot; → &quot;helloworld&quot;."><input type="checkbox" id="dNoSpace" /> Sans espaces</label>
+                <label title="Ajoute des suffixes puis hash. Suffixes : « bitcoin », « btc », « wallet », « private key », « key », « 123 », « 2024 », « 2025 », « 2026 ». Ex. &quot;satoshi&quot; → &quot;satoshi bitcoin&quot;, &quot;satoshi key&quot;…"><input type="checkbox" id="dSuffix" checked /> Suffixes</label>
+                <label title="Ajoute des préfixes puis hash. Préfixes : « my », « the », « bitcoin », « my bitcoin », « wallet ». Ex. &quot;satoshi&quot; → &quot;my satoshi&quot;, &quot;the satoshi&quot;…"><input type="checkbox" id="dPrefix" checked /> Préfixes</label>
+                <label title="Dérivation + lookup sur toutes les cartes CUDA. Threads CPU à 0 = GPU only. Env: BTC_GPU_LAUNCH=8388608 (threads/kernel, max 32M)."><input type="checkbox" id="dUseGpu" checked /> GPU multi (CUDA)</label>
+                <label title="Index UTXO en VRAM — lookup on-device (min CPU). Recommandé pour max GPU."><input type="checkbox" id="dGpuFull" checked /> Index FULL en VRAM</label>
+              </div>
+              <div class="card-header" style="margin-top:0.75rem"><h3 style="font-size:0.95rem;margin:0">Préfixe / suffixe — tous caractères</h3></div>
+              <p class="hint">Charset ASCII <code>!&quot;#$…0-9A-Za-z…~</code> (94 car.). Ex. <code>Patate</code> + pref&amp;suf <strong>1</strong> → <code>!Patate!</code>, <code>!Patate?</code>… Longueur <strong>2</strong> = 94² préfixes en <strong>boucle</strong> (pas de limite artificielle) : le total est calculé, les essais sont générés à la volée sans tout stocker en RAM.</p>
+              <div class="field-row">
+                <div class="field">
+                  <label for="dCharPrefixLen" title="Ajoute devant la phrase toutes les chaînes de N caractères du charset. 0 = désactivé.">Préfixe (tous car.)</label>
+                  <select id="dCharPrefixLen">
+                    <option value="0" selected>off</option>
+                    <option value="1">1 caractère</option>
+                    <option value="2">2 caractères</option>
+                  </select>
+                </div>
+                <div class="field">
+                  <label for="dCharSuffixLen" title="Ajoute derrière la phrase toutes les chaînes de N caractères du charset. 0 = désactivé.">Suffixe (tous car.)</label>
+                  <select id="dCharSuffixLen">
+                    <option value="0" selected>off</option>
+                    <option value="1">1 caractère</option>
+                    <option value="2">2 caractères</option>
+                  </select>
+                </div>
+              </div>
+              <p class="hint mono" id="dAffixEst" style="margin:0.25rem 0 0.5rem">affixes : off</p>
+              <div class="card-header" style="margin-top:0.75rem"><h3 style="font-size:0.95rem;margin:0">Mots → permutations / combinaisons</h3></div>
+              <p class="hint">Les tokens de ta zone (1 mot/ligne ou phrases splitées) forment un sac. Ex. <code>alice bob</code> → ordres + sous-ensembles, avec/sans espaces, puis hashes.</p>
+              <div class="checks method-tooltips">
+                <label title="Tous les ordres possibles des mots (n!). Ex. alice bob → « alice bob » et « bob alice »."><input type="checkbox" id="dPerms" /> Permutations (tous les ordres)</label>
+                <label title="Tous les sous-ensembles non vides (2^n − 1). Ex. alice bob → alice ; bob ; alice bob."><input type="checkbox" id="dCombos" /> Combinaisons (tous sous-ensembles)</label>
+                <label title="Joint les mots avec un espace. Ex. alice + bob → « alice bob »."><input type="checkbox" id="dJoinSpace" checked /> Avec espaces</label>
+                <label title="Joint les mots sans espace. Ex. alice + bob → « alicebob »."><input type="checkbox" id="dJoinNoSpace" checked /> Sans espaces</label>
+              </div>
+              <div class="field-row">
+                <div class="field">
+                  <label for="dictMaxWords">Max mots dans le sac (1–10)</label>
+                  <input type="number" id="dictMaxWords" value="7" min="1" max="10" />
+                </div>
+                <div class="field">
+                  <label>Estimation</label>
+                  <p class="hint mono" id="dictPermEst">— active les options pour estimer</p>
+                </div>
+              </div>
+              <div class="field-row">
+                <div class="field">
+                  <label for="dictThreads" title="Avec GPU : 0 = GPU only (recommandé, min CPU). Sans GPU : 0 = 50 % des cœurs.">Threads CPU (0 = GPU only)</label>
+                  <input type="number" id="dictThreads" value="0" min="0" max="128" />
+                </div>
+                <div class="field">
+                  <label for="dictMin">Ignorer dust sous (sats)</label>
+                  <input type="number" id="dictMin" value="1" min="0" />
+                </div>
+              </div>
+              <div class="btn-row">
+                <button type="submit" class="btn btn-primary" id="btnDictStart">Lancer</button>
+                <button type="button" class="btn btn-danger" id="btnDictStop">Stop</button>
+              </div>
+              <div class="form-msg" id="dictMsg"></div>
+            </form>
+          </div>
+          <div class="card">
+            <div class="card-header"><h2>Progression</h2></div>
+            <div class="stats-grid compact">
+              <div class="stat"><span class="stat-label">Testées</span><span class="stat-value mono" id="dictTested">—</span></div>
+              <div class="stat"><span class="stat-label">Variantes</span><span class="stat-value mono" id="dictVariants">—</span></div>
+              <div class="stat"><span class="stat-label">Vitesse totale</span><span class="stat-value mono" id="dictRate">—</span></div>
+              <div class="stat"><span class="stat-label">Hits</span><span class="stat-value mono highlight" id="dictMatches">0</span></div>
+            </div>
+            <p class="hint mono" id="dictRateDetail" style="margin:0.35rem 0;word-break:break-word" title="Débit par GPU et par workers CPU">—</p>
+            <div class="progress-wrap">
+              <div class="progress-bar"><div class="progress-fill" id="dictProgress"></div></div>
+              <span class="progress-label mono" id="dictProgressLabel">0%</span>
+            </div>
+            <p class="path mono" id="dictLast">—</p>
+            <div id="dictResults" class="key-result"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ═══ FOUND ═══ -->
+      <section class="panel" id="panel-found">
+        <div class="card card-wide">
+          <div class="card-header">
+            <h2>Coffre local — clés candidates / hits</h2>
+            <div class="btn-row">
+              <button type="button" class="btn btn-secondary btn-sm" id="btnExportFound">Exporter JSON</button>
+              <button type="button" class="btn btn-ghost btn-sm" id="btnClearFound">Vider le coffre</button>
             </div>
           </div>
-          <div class="btn-row">
-            <button type="submit" class="btn btn-primary" id="btnCheck">
-              Vérifier
-            </button>
-          </div>
-        </form>
-        <div id="keyResult" class="key-result hidden"></div>
+          <p class="hint">Stocké dans ce navigateur (localStorage). Boutons : <strong class="txt-priv">Copier PRIV</strong> (rouge, <em>local only</em>) · <strong class="txt-addr">Copier ADDR</strong> (vert) · <strong>Vérifier solde ↗</strong> (ouvre <a href="https://www.blockchain.com/explorer/addresses/btc/" target="_blank" rel="noopener noreferrer">blockchain.com</a> avec l’<strong>adresse publique uniquement</strong>) · <strong>Copier PUB hex</strong>. <strong>Ne jamais coller une clé privée / WIF / seed dans un site web.</strong></p>
+          <div id="foundList" class="key-result">Aucune clé sauvée pour l’instant.</div>
+        </div>
       </section>
 
-      <!-- Bitcoin Core -->
-      <section class="card">
-        <div class="card-header">
-          <h2>Bitcoin Core</h2>
-          <div class="status-badge" id="btcBadge">
-            <span class="dot"></span>
-            <span id="btcBadgeText">—</span>
+      <!-- ═══ AUTO ═══ -->
+      <section class="panel" id="panel-auto">
+        <div class="card card-wide range-card">
+          <div class="card-header">
+            <h2>Scan auto — plage en cours</h2>
+            <span class="pill" id="scanModePill">mode: —</span>
+          </div>
+          <p class="hint" id="autoScanPolicy">Tourne en GPU dès que le scan listes est arrêté. Un scan listes (GPU) met le brute en pause pour libérer les cartes.</p>
+          <p class="hint mono" id="rangeSummary" style="margin:0.35rem 0;font-weight:600">—</p>
+          <div class="range-display">
+            <div class="range-block">
+              <span class="range-label" id="rangeStartLabel">De (départ fenêtre — hex complet)</span>
+              <code class="range-hex mono hex-full" id="rangeStart">—</code>
+              <button type="button" class="btn btn-ghost btn-sm btn-copy-inline" id="btnCopyRangeStart" style="display:none">Copier</button>
+            </div>
+            <div class="range-arrow" aria-hidden="true">→</div>
+            <div class="range-block">
+              <span class="range-label" id="rangeEndLabel">À (fin fenêtre — hex complet)</span>
+              <code class="range-hex mono hex-full" id="rangeEnd">—</code>
+              <button type="button" class="btn btn-ghost btn-sm btn-copy-inline" id="btnCopyRangeEnd" style="display:none">Copier</button>
+            </div>
+          </div>
+          <div class="field" style="margin-top:0.75rem">
+            <label for="rangeStartEdit">Modifier le départ (hex 64) à la main</label>
+            <div class="field-row" style="gap:0.5rem;align-items:stretch">
+              <input type="text" id="rangeStartEdit" class="mono hex-full" spellcheck="false" placeholder="0000000000000000000000000000000000000000000000000000000000000001" style="flex:1;font-size:0.75rem" />
+              <button type="button" class="btn btn-primary btn-sm" id="btnApplyStart">Appliquer départ</button>
+              <button type="button" class="btn btn-ghost btn-sm" id="btnApplyStartRestart" title="Applique et relance le scan sur ce départ">Appliquer + relancer</button>
+            </div>
+          </div>
+          <div class="field-row" style="margin-top:0.5rem;gap:1rem;flex-wrap:wrap">
+            <div class="field" style="min-width:14rem">
+              <label for="rangeStep">Pas d’extension à la fin (À atteint) — défaut 2^30</label>
+              <div class="field-row" style="gap:0.5rem;align-items:center">
+                <input type="number" id="rangeStep" min="1" step="1" value="1073741824" style="width:11rem" />
+                <span class="hint mono" id="rangeStepHint">= 2^30 = 1 073 741 824 clés</span>
+              </div>
+              <button type="button" class="btn btn-ghost btn-sm" id="btnApplyStep" style="margin-top:0.35rem">Enregistrer le pas</button>
+            </div>
+            <div class="field" style="flex:1;min-width:12rem">
+              <label>Plages déjà testées (journal)</label>
+              <p class="hint mono" id="rangesDoneLabel">0 plage(s)</p>
+            </div>
+          </div>
+          <div class="position-bar" style="margin-top:0.5rem">
+            <span class="range-label">Journal des plages testées (ne seront pas retestées)</span>
+            <div class="mono" id="rangesLogList" style="font-size:0.72rem;max-height:10rem;overflow:auto;word-break:break-all;opacity:0.95">—</div>
+          </div>
+          <p class="hint mono" id="rangeHint">Séquentiel = fenêtre De→À (pas 2^30) · curseur live ci-dessous · journal = pas de retest</p>
+          <div class="stats-grid compact">
+            <div class="stat"><span class="stat-label">k/s (live)</span><span class="stat-value mono" id="keysPerSec">—</span></div>
+            <div class="stat"><span class="stat-label">Testées</span><span class="stat-value mono" id="keysTested">—</span></div>
+            <div class="stat"><span class="stat-label">Clés actives (solde ou historique)</span><span class="stat-value mono highlight" id="matchesFound">0</span></div>
+            <div class="stat"><span class="stat-label">GPU util</span><span class="stat-value mono" id="gpuUtil">—</span></div>
+            <div class="stat"><span class="stat-label">Dernière MAJ vitesse</span><span class="stat-value mono" id="statsUpdatedAt">—</span></div>
+            <div class="stat"><span class="stat-label">Moyenne k/s</span><span class="stat-value mono" id="keysPerSecAvg">—</span></div>
+          </div>
+          <p class="hint mono" id="scanRateDetail" style="margin:0.25rem 0;font-size:0.8rem;word-break:break-word">—</p>
+          <div class="utxo-meta-box" id="utxoMetaBox">
+            <div class="utxo-meta-row"><span class="label">Bloc UTXO (index)</span><span class="value mono" id="utxoBlockHeight">—</span></div>
+            <div class="utxo-meta-row"><span class="label">Tip Bitcoin Core</span><span class="value mono" id="utxoCoreTip">—</span></div>
+            <div class="utxo-meta-row"><span class="label">Retard (blocs)</span><span class="value mono" id="utxoBlockLag">—</span></div>
+            <div class="utxo-meta-row"><span class="label">Date du bloc</span><span class="value mono" id="utxoBlockDate">—</span></div>
+            <div class="utxo-meta-row"><span class="label">Index généré le</span><span class="value mono" id="utxoBuiltAt">—</span></div>
+            <div class="utxo-meta-row"><span class="label">Hash du bloc</span><span class="value mono hex-full" id="utxoBlockHash">—</span></div>
+            <div class="utxo-meta-row"><span class="label">Scripts / UTXOs</span><span class="value mono" id="utxoCounts">—</span></div>
+          </div>
+          <div class="position-bar">
+            <span class="range-label">Position / curseur (hex complet)</span>
+            <code class="position mono hex-full" id="currentPosition">—</code>
+          </div>
+          <div class="position-bar">
+            <span class="range-label">Échantillon clés threads (live)</span>
+            <div class="mono" id="threadKeysSample" style="font-size:0.75rem;word-break:break-all;opacity:0.9">—</div>
+          </div>
+          <div class="position-bar">
+            <span class="range-label">Variantes actives</span>
+            <div class="active-transforms" id="activeTransforms">—</div>
           </div>
         </div>
-        <div class="stats-grid compact">
-          <div class="stat">
-            <span class="stat-label">Blocs</span>
-            <span class="stat-value mono" id="btcBlocks">—</span>
+
+        <div class="grid two">
+          <div class="card">
+            <div class="card-header"><h2>Brute-force hex GPU</h2></div>
+            <p class="hint">Scan de l’espace des clés privées. Chaque base key peut générer plusieurs variantes (checkboxes).</p>
+            <form id="scanForm" class="form">
+              <div class="field">
+                <label for="startKey">Départ hex séquentiel (vide = 00…01 ou resume)</label>
+                <input type="text" id="startKey" class="mono" spellcheck="false" placeholder="0000000000000000000000000000000000000000000000000000000000000001" />
+              </div>
+              <div class="field">
+                <label for="scanCpuPct">CPU — % des cœurs (défaut 50 %)</label>
+                <div class="field-row" style="align-items:center;gap:0.75rem">
+                  <input type="range" id="scanCpuPct" min="0" max="100" value="50" step="5" style="flex:1;min-width:8rem" />
+                  <input type="number" id="scanCpuPctNum" min="0" max="100" value="50" step="1" style="width:4.5rem" title="% exact" />
+                  <span class="mono" id="scanCpuPctLabel">50 %</span>
+                </div>
+                <p class="hint mono" id="scanCpuThreadsHint">→ workers calculés au chargement…</p>
+              </div>
+              <div class="field-row">
+                <div class="field">
+                  <label for="threads" title="0 = utiliser le % ci-dessus (recommandé). N > 0 force un nombre exact.">Threads fixes (0 = auto %)</label>
+                  <input type="number" id="threads" value="0" min="0" max="128" />
+                </div>
+                <div class="field checkbox-field">
+                  <label class="checkbox-label"><input type="checkbox" id="useGpu" checked /><span>GPU CUDA</span></label>
+                </div>
+                <div class="field checkbox-field">
+                  <label class="checkbox-label" title="Décoché = séquentiel (De→À clair). Coché = random (fenêtre threads)."><input type="checkbox" id="scanRandom" /><span>Mode random</span></label>
+                </div>
+              </div>
+
+              <div class="field">
+                <label>Variantes appliquées à chaque clé de base</label>
+                <div class="checks transform-checks" id="transformChecks">
+                  <label><input type="checkbox" id="tfIdentity" checked /> identity (clé brute)</label>
+                  <label><input type="checkbox" id="tfRevBytes" /> reverse bytes</label>
+                  <label><input type="checkbox" id="tfRevBits" /> reverse bits</label>
+                  <label><input type="checkbox" id="tfRotl8" /> rotation gauche 8 bits</label>
+                  <label><input type="checkbox" id="tfRotr8" /> rotation droite 8 bits</label>
+                  <label><input type="checkbox" id="tfSha256" /> SHA256(clé)</label>
+                  <label><input type="checkbox" id="tfDouble" /> double SHA256</label>
+                </div>
+                <p class="hint">Plusieurs cases = N tests par clé (ralentit d’autant). Requiert un redémarrage du scan.</p>
+              </div>
+
+              <input type="hidden" id="count" value="0" />
+              <input type="hidden" id="batchSize" value="4194304" />
+              <div class="btn-row">
+                <button type="submit" class="btn btn-primary" id="btnStart">Start brute</button>
+                <button type="button" class="btn btn-danger" id="btnStop" disabled>Stop</button>
+              </div>
+              <div class="form-msg" id="scanMsg"></div>
+            </form>
           </div>
-          <div class="stat">
-            <span class="stat-label">Headers</span>
-            <span class="stat-value mono" id="btcHeaders">—</span>
-          </div>
-          <div class="stat">
-            <span class="stat-label">Sync</span>
-            <span class="stat-value mono" id="btcSync">—</span>
-          </div>
-          <div class="stat">
-            <span class="stat-label">Peers</span>
-            <span class="stat-value mono" id="btcPeers">—</span>
+          <div class="card">
+            <div class="card-header"><h2>Idées qui maximisent les chances</h2></div>
+            <ul class="ideas" id="ideasList">
+              <li>Brainwallet: SHA256 + reverse + lower/upper + suffixes année</li>
+              <li>BIP39: multi-chemins + plusieurs index + passphrase oubliée</li>
+              <li>11 mots connus + bruteforce du 12e (find-12th-word)</li>
+              <li>Phrases perso: emails, pets, dates, villes, « bitcoin 2011 »</li>
+              <li>WIF / hex récupérés de vieux backups / screenshots</li>
+              <li>Electrum old / minikeys (outils CLI du repo)</li>
+              <li>Toujours vérifier on-chain quand Core sera à jour</li>
+            </ul>
           </div>
         </div>
-        <div class="progress-wrap">
-          <div class="progress-bar"><div class="progress-fill" id="btcProgress"></div></div>
-          <span class="progress-label mono" id="btcProgressLabel">0%</span>
-        </div>
-        <div class="btn-row">
-          <button type="button" class="btn btn-secondary" id="btnBtcStart">Démarrer bitcoind</button>
-          <button type="button" class="btn btn-ghost" id="btnBtcStop">Arrêter</button>
-        </div>
-        <div class="form-msg" id="btcMsg"></div>
       </section>
 
-      <!-- Snapshot UTXO -->
-      <section class="card">
-        <div class="card-header">
-          <h2>Snapshot UTXO</h2>
-          <div class="status-badge" id="snapBadge">
-            <span class="dot"></span>
-            <span id="snapBadgeText">—</span>
+      <!-- ═══ SYSTEM ═══ -->
+      <section class="panel" id="panel-system">
+        <div class="grid two">
+          <div class="card">
+            <div class="card-header">
+              <h2>Bitcoin Core</h2>
+              <div class="status-badge" id="btcBadge"><span class="dot"></span><span id="btcBadgeText">—</span></div>
+            </div>
+            <p class="path mono" id="btcDatadir">W:\Bitcoin</p>
+            <p class="hint mono" id="btcMsgLine">—</p>
+            <div class="stats-grid compact">
+              <div class="stat"><span class="stat-label">Blocs</span><span class="stat-value mono" id="btcBlocks">—</span></div>
+              <div class="stat"><span class="stat-label">Headers</span><span class="stat-value mono" id="btcHeaders">—</span></div>
+              <div class="stat"><span class="stat-label">Peers</span><span class="stat-value mono" id="btcPeers">—</span></div>
+              <div class="stat"><span class="stat-label">IBD</span><span class="stat-value mono" id="btcIbd">—</span></div>
+            </div>
+            <div class="progress-wrap">
+              <div class="progress-bar"><div class="progress-fill" id="btcProgress"></div></div>
+              <span class="progress-label mono" id="btcProgressLabel">0%</span>
+            </div>
+            <div class="btn-row">
+              <button type="button" class="btn btn-primary" id="btnBtcRestart">Relancer</button>
+              <button type="button" class="btn btn-secondary" id="btnBtcStart">Démarrer</button>
+              <button type="button" class="btn btn-ghost" id="btnBtcStop">Arrêter</button>
+              <button type="button" class="btn btn-ghost" id="btnBtcRefresh">Rafraîchir</button>
+            </div>
+            <div class="form-msg" id="btcMsg"></div>
+            <!-- hidden fields kept for JS compatibility -->
+            <span id="btcBehind" class="hidden"></span>
+            <span id="btcSync" class="hidden"></span>
+            <span id="btcVerif" class="hidden"></span>
+            <span id="btcChain" class="hidden"></span>
+            <span id="btcDiff" class="hidden"></span>
+            <span id="btcDisk" class="hidden"></span>
+            <span id="btcPruned" class="hidden"></span>
+            <span id="btcMedian" class="hidden"></span>
+            <span id="btcHashps" class="hidden"></span>
+            <span id="btcBest" class="hidden"></span>
+            <span id="btcWork" class="hidden"></span>
+            <span id="btcWarn" class="hidden"></span>
+            <span id="btcPeersIO" class="hidden"></span>
+            <span id="btcNetActive" class="hidden"></span>
+            <span id="btcUptime" class="hidden"></span>
+            <span id="btcVersion" class="hidden"></span>
+            <span id="btcProto" class="hidden"></span>
+            <span id="btcRecv" class="hidden"></span>
+            <span id="btcSent" class="hidden"></span>
+            <span id="btcPid" class="hidden"></span>
+            <span id="btcRss" class="hidden"></span>
+            <span id="btcOffset" class="hidden"></span>
+            <span id="btcRelay" class="hidden"></span>
+            <span id="btcSubver" class="hidden"></span>
+            <span id="btcServices" class="hidden"></span>
+            <span id="btcMemSize" class="hidden"></span>
+            <span id="btcMemBytes" class="hidden"></span>
+            <span id="btcMemUsage" class="hidden"></span>
+            <span id="btcMemMax" class="hidden"></span>
+            <span id="btcMemFee" class="hidden"></span>
+            <span id="btcMemTotalFee" class="hidden"></span>
+            <span id="btcMemUnb" class="hidden"></span>
+            <span id="btcMemLoaded" class="hidden"></span>
+            <span id="btcLockUsed" class="hidden"></span>
+            <span id="btcLockFree" class="hidden"></span>
+            <span id="btcLockTotal" class="hidden"></span>
+            <span id="btcAuth" class="hidden"></span>
+            <div id="btcDownBanner" class="hidden"></div>
+            <tbody id="btcPeersBody" class="hidden"></tbody>
+            <pre id="btcRaw" class="hidden"></pre>
+          </div>
+          <div class="card">
+            <div class="card-header"><h2>Index UTXO (pour savoir s’il y a un solde)</h2></div>
+            <div class="stats-grid compact">
+              <div class="stat"><span class="stat-label">Âge</span><span class="stat-value mono" id="snapAge">—</span></div>
+              <div class="stat"><span class="stat-label">Taille</span><span class="stat-value mono" id="snapSize">—</span></div>
+              <div class="stat"><span class="stat-label">Chargé</span><span class="stat-value mono" id="indexLoaded">—</span></div>
+              <div class="stat"><span class="stat-label">Scripts</span><span class="stat-value mono" id="indexScripts">—</span></div>
+            </div>
+            <p class="path mono" id="snapPath">—</p>
+            <div class="btn-row">
+              <button type="button" class="btn btn-secondary" id="btnSnapReload">Recharger index</button>
+              <button type="button" class="btn btn-ghost" id="btnSnapRefresh">Rebuild (long)</button>
+            </div>
+            <div class="form-msg" id="snapMsg"></div>
+            <div class="status-badge hidden" id="snapBadge"><span class="dot"></span><span id="snapBadgeText">—</span></div>
+            <pre class="log mono" id="healthBox">—</pre>
           </div>
         </div>
-        <div class="stats-grid compact">
-          <div class="stat">
-            <span class="stat-label">Âge</span>
-            <span class="stat-value mono" id="snapAge">—</span>
-          </div>
-          <div class="stat">
-            <span class="stat-label">Taille</span>
-            <span class="stat-value mono" id="snapSize">—</span>
-          </div>
-          <div class="stat">
-            <span class="stat-label">Max âge</span>
-            <span class="stat-value mono" id="snapMaxAge">—</span>
-          </div>
-          <div class="stat">
-            <span class="stat-label">Index chargé</span>
-            <span class="stat-value mono" id="indexLoaded">—</span>
-          </div>
-        </div>
-        <p class="path mono" id="snapPath">—</p>
-        <div class="btn-row">
-          <button type="button" class="btn btn-secondary" id="btnSnapRefresh">
-            Régénérer le snapshot
-          </button>
-        </div>
-        <div class="form-msg" id="snapMsg"></div>
       </section>
     </main>
 
     <footer class="footer">
-      <span>BTC Solver Dashboard · local only · ne pas exposer sur internet</span>
+      <span>Local only · ne partage jamais tes clés</span>
       <span id="footerHealth">—</span>
     </footer>
   </div>
-
   <div id="toast" class="toast hidden"></div>
-  <script src="/static/app.js"></script>
+  <script src="/static/app.js?v=20260717explorer"></script>
 </body>
 </html>

@@ -1,0 +1,24 @@
+[FRESHNESS] Snapshot: Y:\btcsolver\data\utxo-day-935000.snapshot
+[FRESHNESS] File age: 129232s (35.9h, 1.5 days)
+[FRESHNESS] OK — age check disabled
+Loading UTXO index from Y:\btcsolver\data\utxo-day-935000.snapshot...
+  Decompressed snapshot: 3299.4 MB -> 4314.7 MB (1.3:1 ratio)
+  Loaded 57997970 scripts, 57997970 UTXOs from Y:\btcsolver\data\utxo-day-935000.snapshot
+  Loaded from snapshot (FlatIndex)!
+Index loaded in 40.7171458s!
+  Blockchain coverage: snapshot file
+  CPU workers: 12 (forcé --threads, 24 cœurs logiques)
+  GPU acceleration: ENABLED (CUDA)
+
+Starting brute-force...
+  Mode: SEQUENTIAL keys from 00000000000000000000000000000000000000000000000000000000645c0010
+  Keys to test: 1000000
+  Batch size: 4194304
+  Address types: legacy,segwit
+  Transforms: identity
+  Live stats: Y:\btcsolver\brute-force-stats.json (every 3s)
+  Progress file: Y:\btcsolver\brute-force-progress.json (every 10s)
+
+    GPU 0: NVIDIA GeForce RTX 5090
+    GPU 1: NVIDIA GeForce RTX 5090
+    GPU 2: NVIDIA GeForce RTX 3090

@@ -1,0 +1,7 @@
+  FlatIndex: 57997970 scripts, 57997970 UTXOs, 4867.8 MB RAM
+[RANGE] --no-resume : départ forcé 00000000000000000000000000000000000000000000000000000000645c0010
+[RANGE] end exclusive: 00000000000000000000000000000000000000000000000000000000a45c0010
+[GPU] Using device IDs: [0, 1, 2]
+[GPU] FULL auto — loading FlatIndex (~4647 MB/GPU: entries 774 + data 1549 + utxo 2434)...
+[GPU] Full index loaded — derive+lookup ON DEVICE + CPU auxiliaire
+[GPU] multi-GPU + CPU: hosts_gpu=3 cpu_workers=12 stride=15 batch/GPU=4194304 devices=[0, 1, 2]

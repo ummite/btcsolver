@@ -27,7 +27,8 @@
  * ============================================================ */
 
 #define FE_LIMBS 8
-#define BLOCK_SIZE 256
+/* Max threads/block (hardware 1024). Plus de threads/block = mieux occupe les SM. */
+#define BLOCK_SIZE 1024
 
 /* secp256k1 prime: p = 2^256 - 2^32 - 977 */
 __device__ __constant__ uint32_t CONST_P[FE_LIMBS] = {
@@ -450,7 +451,8 @@ __device__ __forceinline__ void pt_to_affine(fe *ox, fe *oy, const point_t *p) {
  * ============================================================ */
 
 struct dev_prec {
-    point_t table[8];  /* table[i] = (2i+1)*G in affine coords */
+    /* table[i] = (i+1)*G affine → 1G..16G for 4-bit window scalar mult */
+    point_t table[16];
     int done;
 };
 
@@ -467,7 +469,6 @@ __device__ __constant__ uint32_t CONST_Gy[FE_LIMBS] = {
 __global__ void precompute_kernel(struct dev_prec *prec) {
     if (threadIdx.x != 0 || blockIdx.x != 0) return;
 
-    /* Load G in affine coords */
     point_t g;
     for (int i = 0; i < FE_LIMBS; i++) {
         g.x.v[i] = CONST_Gx[i];
@@ -475,138 +476,77 @@ __global__ void precompute_kernel(struct dev_prec *prec) {
     }
     fe_set1(&g.z);
 
-    /* table[0] = G */
     fe_copy(&prec->table[0].x, &g.x);
     fe_copy(&prec->table[0].y, &g.y);
     fe_set1(&prec->table[0].z);
 
-    /* 2G */
-    point_t p2;
-    pt_dbl(&p2, &g);
-    fe x2g, y2g;
-    pt_to_affine(&x2g, &y2g, &p2);
-
-    /* table[1] = 3G = 2G + G */
-    point_t a3, b3, r3;
-    fe_copy(&a3.x, &x2g); fe_copy(&a3.y, &y2g); fe_set1(&a3.z);
-    fe_copy(&b3.x, &g.x); fe_copy(&b3.y, &g.y); fe_set1(&b3.z);
-    pt_add(&r3, &a3, &b3);
-    fe x3g, y3g;
-    pt_to_affine(&x3g, &y3g, &r3);
-    fe_copy(&prec->table[1].x, &x3g);
-    fe_copy(&prec->table[1].y, &y3g);
-    fe_set1(&prec->table[1].z);
-
-    /* 4G = 2*(2G) */
-    point_t p4;
-    fe_copy(&p4.x, &x2g); fe_copy(&p4.y, &y2g); fe_set1(&p4.z);
-    pt_dbl(&p4, &p4);
-    fe x4g, y4g;
-    pt_to_affine(&x4g, &y4g, &p4);
-
-    /* table[2] = 5G = 4G + G */
-    point_t a5, b5, r5;
-    fe_copy(&a5.x, &x4g); fe_copy(&a5.y, &y4g); fe_set1(&a5.z);
-    fe_copy(&b5.x, &g.x); fe_copy(&b5.y, &g.y); fe_set1(&b5.z);
-    pt_add(&r5, &a5, &b5);
-    fe x5g, y5g;
-    pt_to_affine(&x5g, &y5g, &r5);
-    fe_copy(&prec->table[2].x, &x5g);
-    fe_copy(&prec->table[2].y, &y5g);
-    fe_set1(&prec->table[2].z);
-
-    /* 6G = 2*(3G) */
-    point_t p6;
-    fe_copy(&p6.x, &x3g); fe_copy(&p6.y, &y3g); fe_set1(&p6.z);
-    pt_dbl(&p6, &p6);
-    fe x6g, y6g;
-    pt_to_affine(&x6g, &y6g, &p6);
-
-    /* table[3] = 7G = 6G + G */
-    point_t a7, b7, r7;
-    fe_copy(&a7.x, &x6g); fe_copy(&a7.y, &y6g); fe_set1(&a7.z);
-    fe_copy(&b7.x, &g.x); fe_copy(&b7.y, &g.y); fe_set1(&b7.z);
-    pt_add(&r7, &a7, &b7);
-    fe x7g, y7g;
-    pt_to_affine(&x7g, &y7g, &r7);
-    fe_copy(&prec->table[3].x, &x7g);
-    fe_copy(&prec->table[3].y, &y7g);
-    fe_set1(&prec->table[3].z);
-
-    /* Continue for 9G, 11G, 13G, 15G */
-    /* 8G = 2*(4G) */
-    point_t p8;
-    fe_copy(&p8.x, &x4g); fe_copy(&p8.y, &y4g); fe_set1(&p8.z);
-    pt_dbl(&p8, &p8);
-    fe x8g, y8g;
-    pt_to_affine(&x8g, &y8g, &p8);
-
-    /* table[4] = 9G = 8G + G */
-    point_t a9, b9, r9;
-    fe_copy(&a9.x, &x8g); fe_copy(&a9.y, &y8g); fe_set1(&a9.z);
-    fe_copy(&b9.x, &g.x); fe_copy(&b9.y, &g.y); fe_set1(&b9.z);
-    pt_add(&r9, &a9, &b9);
-    fe x9g, y9g;
-    pt_to_affine(&x9g, &y9g, &r9);
-    fe_copy(&prec->table[4].x, &x9g);
-    fe_copy(&prec->table[4].y, &y9g);
-    fe_set1(&prec->table[4].z);
-
-    /* 10G = 2*(5G) */
-    point_t p10;
-    fe_copy(&p10.x, &x5g); fe_copy(&p10.y, &y5g); fe_set1(&p10.z);
-    pt_dbl(&p10, &p10);
-    fe x10g, y10g;
-    pt_to_affine(&x10g, &y10g, &p10);
-
-    /* table[5] = 11G = 10G + G */
-    point_t a11, b11, r11;
-    fe_copy(&a11.x, &x10g); fe_copy(&a11.y, &y10g); fe_set1(&a11.z);
-    fe_copy(&b11.x, &g.x); fe_copy(&b11.y, &g.y); fe_set1(&b11.z);
-    pt_add(&r11, &a11, &b11);
-    fe x11g, y11g;
-    pt_to_affine(&x11g, &y11g, &r11);
-    fe_copy(&prec->table[5].x, &x11g);
-    fe_copy(&prec->table[5].y, &y11g);
-    fe_set1(&prec->table[5].z);
-
-    /* 12G = 2*(6G) */
-    point_t p12;
-    fe_copy(&p12.x, &x6g); fe_copy(&p12.y, &y6g); fe_set1(&p12.z);
-    pt_dbl(&p12, &p12);
-    fe x12g, y12g;
-    pt_to_affine(&x12g, &y12g, &p12);
-
-    /* table[6] = 13G = 12G + G */
-    point_t a13, b13, r13;
-    fe_copy(&a13.x, &x12g); fe_copy(&a13.y, &y12g); fe_set1(&a13.z);
-    fe_copy(&b13.x, &g.x); fe_copy(&b13.y, &g.y); fe_set1(&b13.z);
-    pt_add(&r13, &a13, &b13);
-    fe x13g, y13g;
-    pt_to_affine(&x13g, &y13g, &r13);
-    fe_copy(&prec->table[6].x, &x13g);
-    fe_copy(&prec->table[6].y, &y13g);
-    fe_set1(&prec->table[6].z);
-
-    /* 14G = 2*(7G) */
-    point_t p14;
-    fe_copy(&p14.x, &x7g); fe_copy(&p14.y, &y7g); fe_set1(&p14.z);
-    pt_dbl(&p14, &p14);
-    fe x14g, y14g;
-    pt_to_affine(&x14g, &y14g, &p14);
-
-    /* table[7] = 15G = 14G + G */
-    point_t a15, b15, r15;
-    fe_copy(&a15.x, &x14g); fe_copy(&a15.y, &y14g); fe_set1(&a15.z);
-    fe_copy(&b15.x, &g.x); fe_copy(&b15.y, &g.y); fe_set1(&b15.z);
-    pt_add(&r15, &a15, &b15);
-    fe x15g, y15g;
-    pt_to_affine(&x15g, &y15g, &r15);
-    fe_copy(&prec->table[7].x, &x15g);
-    fe_copy(&prec->table[7].y, &y15g);
-    fe_set1(&prec->table[7].z);
-
+    for (int k = 1; k < 16; k++) {
+        point_t a, b, r;
+        fe_copy(&a.x, &prec->table[k - 1].x);
+        fe_copy(&a.y, &prec->table[k - 1].y);
+        fe_set1(&a.z);
+        fe_copy(&b.x, &g.x);
+        fe_copy(&b.y, &g.y);
+        fe_set1(&b.z);
+        pt_add(&r, &a, &b);
+        fe xr, yr;
+        pt_to_affine(&xr, &yr, &r);
+        fe_copy(&prec->table[k].x, &xr);
+        fe_copy(&prec->table[k].y, &yr);
+        fe_set1(&prec->table[k].z);
+    }
     prec->done = 1;
+}
+
+__device__ __forceinline__ int sk_bit(const uint32_t sk[FE_LIMBS], int b) {
+    return (int)((sk[b >> 5] >> (b & 31)) & 1u);
+}
+
+/* P = sk * G, 4-bit window, table[0..15] = 1G..16G */
+__device__ __forceinline__ void scalar_mul_g(
+    point_t *acc,
+    const uint32_t sk[FE_LIMBS],
+    const point_t *table)
+{
+    int msb = -1;
+    for (int i = FE_LIMBS - 1; i >= 0; i--) {
+        if (sk[i] != 0) {
+            for (int b = 31; b >= 0; b--) {
+                if ((sk[i] >> b) & 1u) { msb = i * 32 + b; goto found_msb_sm; }
+            }
+        }
+    }
+found_msb_sm:
+    if (msb < 0) {
+        fe_zero(&acc->x); fe_zero(&acc->y); fe_set1(&acc->z);
+        return;
+    }
+    int first_len = (msb % 4) + 1;
+    int digit = 0;
+    for (int i = 0; i < first_len; i++)
+        digit = (digit << 1) | sk_bit(sk, msb - i);
+    if (digit <= 0) {
+        fe_zero(&acc->x); fe_zero(&acc->y); fe_set1(&acc->z);
+    } else {
+        fe_copy(&acc->x, &table[digit - 1].x);
+        fe_copy(&acc->y, &table[digit - 1].y);
+        fe_set1(&acc->z);
+    }
+    int bit = msb - first_len;
+    while (bit >= 0) {
+        pt_dbl(acc, acc); pt_dbl(acc, acc); pt_dbl(acc, acc); pt_dbl(acc, acc);
+        digit = 0;
+        for (int i = 0; i < 4; i++)
+            digit = (digit << 1) | sk_bit(sk, bit - i);
+        if (digit > 0) {
+            point_t tp;
+            fe_copy(&tp.x, &table[digit - 1].x);
+            fe_copy(&tp.y, &table[digit - 1].y);
+            fe_set1(&tp.z);
+            pt_add(acc, acc, &tp);
+        }
+        bit -= 4;
+    }
 }
 
 /* ============================================================
@@ -881,40 +821,14 @@ __global__ void derive_pubkey_kernel(
     uint32_t sk[FE_LIMBS];
     for (int i = 0; i < FE_LIMBS; i++) sk[i] = sk32[i];
 
-    /* Scalar multiplication: P = sk * G */
-    point_t acc;
-    fe_zero(&acc.x); fe_zero(&acc.y); fe_set1(&acc.z);
-
-    int msb = -1;
-    for (int i = FE_LIMBS - 1; i >= 0; i--) {
-        if (sk[i] != 0) {
-            for (int b = 31; b >= 0; b--) {
-                if ((sk[i] >> b) & 1) { msb = i*32+b; goto found_msb; }
-            }
-        }
-    }
-found_msb:
-
     uint8_t *out = output + idx * OUT_STRIDE;
-    if (msb < 0) { for (int i = 0; i < OUT_STRIDE; i++) out[i] = 0; return; }
-
-    /* Double-and-add */
-    fe_copy(&acc.x, &base_table[0].x);
-    fe_copy(&acc.y, &base_table[0].y);
-    fe_set1(&acc.z);
-
-    point_t tp;
-    for (int bit = msb - 1; bit >= 0; bit--) {
-        pt_dbl(&acc, &acc);
-        int limb = bit / 32;
-        int pos  = bit % 32;
-        if ((sk[limb] >> pos) & 1) {
-            fe_copy(&tp.x, &base_table[0].x);
-            fe_copy(&tp.y, &base_table[0].y);
-            fe_set1(&tp.z);
-            pt_add(&acc, &acc, &tp);
-        }
+    {
+        int sk0 = 1;
+        for (int i = 0; i < FE_LIMBS; i++) if (sk[i]) { sk0 = 0; break; }
+        if (sk0) { for (int i = 0; i < OUT_STRIDE; i++) out[i] = 0; return; }
     }
+    point_t acc;
+    scalar_mul_g(&acc, sk, base_table);
 
     /* Convert to affine */
     fe ox, oy;
@@ -975,39 +889,13 @@ __global__ void derive_lookup_kernel(
     uint32_t sk[FE_LIMBS];
     for (int i = 0; i < FE_LIMBS; i++) sk[i] = sk32[i];
 
-    /* Scalar multiplication: P = sk * G (same as derive_pubkey_kernel) */
+    {
+        int sk0 = 1;
+        for (int i = 0; i < FE_LIMBS; i++) if (sk[i]) { sk0 = 0; break; }
+        if (sk0) { total_values[idx] = 0; return; }
+    }
     point_t acc;
-    fe_zero(&acc.x); fe_zero(&acc.y); fe_set1(&acc.z);
-
-    int msb = -1;
-    for (int i = FE_LIMBS - 1; i >= 0; i--) {
-        if (sk[i] != 0) {
-            for (int b = 31; b >= 0; b--) {
-                if ((sk[i] >> b) & 1) { msb = i*32+b; goto found_msb2; }
-            }
-        }
-    }
-found_msb2:
-
-    if (msb < 0) { total_values[idx] = 0; return; }
-
-    /* Double-and-add */
-    fe_copy(&acc.x, &base_table[0].x);
-    fe_copy(&acc.y, &base_table[0].y);
-    fe_set1(&acc.z);
-
-    point_t tp;
-    for (int bit = msb - 1; bit >= 0; bit--) {
-        pt_dbl(&acc, &acc);
-        int limb = bit / 32;
-        int pos  = bit % 32;
-        if ((sk[limb] >> pos) & 1) {
-            fe_copy(&tp.x, &base_table[0].x);
-            fe_copy(&tp.y, &base_table[0].y);
-            fe_set1(&tp.z);
-            pt_add(&acc, &acc, &tp);
-        }
-    }
+    scalar_mul_g(&acc, sk, base_table);
 
     /* Convert to affine */
     fe ox, oy;
@@ -1088,7 +976,7 @@ typedef struct {
     cudaStream_t    stream;
     uint8_t        *d_privkeys;
     uint8_t        *d_pubkeys;
-    point_t         base_table[8];
+    point_t         base_table[16];
     size_t          alloc_size;
     int             initialized;
     char            name[128];

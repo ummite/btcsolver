@@ -51,6 +51,24 @@ impl FlatIndex {
         }
     }
 
+    /// Pack script_entries for GPU upload (12 B each, no Rust padding).
+    pub fn serialize_script_entries_for_gpu(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(self.script_entries.len() * 12);
+        for entry in &self.script_entries {
+            buf.extend_from_slice(&entry.script_offset.to_le_bytes());
+            buf.extend_from_slice(&entry.script_len.to_le_bytes());
+            buf.extend_from_slice(&entry.utxo_offset.to_le_bytes());
+            buf.extend_from_slice(&entry.utxo_count.to_le_bytes());
+        }
+        buf
+    }
+
+    /// Approximate VRAM needed to hold this index on one GPU (bytes).
+    pub fn gpu_index_bytes(&self) -> u64 {
+        let entries = self.script_entries.len() as u64 * 12;
+        entries + self.all_data.len() as u64 + self.utxo_data.len() as u64
+    }
+
     /// Build from a HashMap (for migration from v1 format).
     pub fn from_hashmap(
         map: &std::collections::HashMap<Vec<u8>, Vec<(bitcoin::Txid, u32, u64)>>,

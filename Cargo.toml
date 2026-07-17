@@ -1,6 +1,6 @@
 [package]
 name = "btcsolver"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 
 [dependencies]
@@ -73,6 +73,10 @@ path = "src/bin/timestamp_scan.rs"
 [[bin]]
 name = "bible_pattern_generator"
 path = "src/bin/bible_pattern_generator.rs"
+
+[[bin]]
+name = "dump_to_flat"
+path = "src/bin/dump_to_flat.rs"
 
 [[bin]]
 name = "btcsolver_dashboard"

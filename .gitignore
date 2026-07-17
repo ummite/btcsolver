@@ -42,6 +42,7 @@ utxo-index.redb.bak*
 utxo-index.snapshot
 utxo-index.snapshot.*
 *.redb.bak*
+*.snapshot
 *.snapshot.bak
 *.bak
 

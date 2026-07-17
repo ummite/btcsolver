@@ -1,0 +1,12 @@
+{
+  "base_block_hash": "0000000000000000000147034958af1652b2b91bba607beacc5e72a56f0fb5ee",
+  "block_height": 935000,
+  "block_time_unix": 1770215102,
+  "block_time_utc": "2026-02-04 14:25:02 UTC",
+  "built_at": "2026-07-16T01:42:50.473450+00:00",
+  "mempool_space": "https://mempool.space/block/0000000000000000000147034958af1652b2b91bba607beacc5e72a56f0fb5ee",
+  "min_value_sats": 1,
+  "num_scripts": 57997970,
+  "num_utxos_source": 164241311,
+  "source": "W:\\Temp\\utxo-935000.dat"
+}

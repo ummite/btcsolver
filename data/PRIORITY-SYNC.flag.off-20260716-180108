@@ -1,0 +1,4 @@
+PRIORITY-SYNC active
+Goal: Bitcoin Core tip + UTXO tip first. Key hunting DISABLED until flag removed.
+Created: 2026-07-16
+Remove this file (or run Disable-PrioritySync.ps1) only when Core is at tip AND UTXO lag < 24h.
