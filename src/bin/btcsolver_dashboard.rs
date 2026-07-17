@@ -159,7 +159,7 @@ async fn main() -> Result<()> {
         auto_restart_bitcoind: cli.auto_restart_bitcoind,
         auto_restart_check_secs: cli.auto_restart_check_secs.max(10),
         default_threads: (num_cpus::get().saturating_sub(1)).max(1),
-        default_batch_size: 256000,
+        default_batch_size: 25_600_000,
     };
 
     let state = DashboardState::new(config.clone());
@@ -381,7 +381,7 @@ async fn main() -> Result<()> {
                 cfg.start_key = None;
                 cfg.end_key = None;
                 cfg.count = 0; // → range_step
-                cfg.batch_size = cfg.batch_size.max(2_097_152);
+                cfg.batch_size = cfg.batch_size.max(209_715_200);
                 let cpu_n = cfg.resolve_cpu_threads();
                 match ScanManager::start(&dash, &cfg).await {
                     Ok(pid) => {

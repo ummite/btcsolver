@@ -11,6 +11,14 @@
     "https://www.blockchain.com/explorer/addresses/btc/";
   let lastHits = [];
 
+  /** Block lag → human-readable time estimate (10 min/block average) */
+  function formatLagTime(blocks) {
+    if (!blocks || blocks <= 0) return "";
+    const hours = (blocks * 10) / 60;
+    if (hours >= 24) return ` (~${formatNumber(hours)} h / ~${(hours / 24).toFixed(1)} j)`;
+    return ` (~${hours.toFixed(1)} h)`;
+  }
+
   /** Compact (K/M/G) — pour débits, hits, etc. PAS pour hauteurs de bloc. */
   function formatNumber(n) {
     if (n == null || Number.isNaN(n)) return "—";
@@ -114,14 +122,14 @@
         if (kind === "pub" && !t) {
           const priv = b.getAttribute("data-priv") || "";
           if (!priv) {
-            toast("Pas de clé privée pour dériver la pub", "error");
+            toast("No private key to derive public key", "error");
             return;
           }
           b.disabled = true;
           try {
             const d = await derivePubkey(priv);
             if (!d?.pubkey_hex) {
-              toast("Dérivation pub impossible", "error");
+              toast("Cannot derive public key", "error");
               return;
             }
             t = d.pubkey_hex;
@@ -141,14 +149,14 @@
             const row = b.closest(".match-item")?.querySelector("[data-pub-value]");
             if (row) row.textContent = t;
           } catch (err) {
-            toast(err.message || "Erreur dérivation pub", "error");
+            toast(err.message || "Public key derivation error", "error");
             return;
           } finally {
             b.disabled = false;
           }
         }
         if (!t) {
-          toast("Rien à copier", "error");
+          toast("Nothing to copy", "error");
           return;
         }
         const okMsg =
@@ -428,11 +436,36 @@
 
   // ── Clock ───────────────────────────────────────────────────────────────
   function tickClock() {
+    const now = new Date();
     if ($("clock"))
-      $("clock").textContent = new Date().toLocaleTimeString("fr-FR", { hour12: false });
+      $("clock").textContent = now.toLocaleTimeString("fr-FR", { hour12: false });
+    if ($("clockUtc"))
+      $("clockUtc").textContent = now.toLocaleTimeString("fr-FR", { hour12: false, timeZone: "UTC" }) + " (UTC)";
+    updateBlockTime();
   }
   setInterval(tickClock, 1000);
   tickClock();
+
+  // ── Block time display ──────────────────────────────────────────────────
+  function updateBlockTime() {
+    const el = $("blockTime");
+    if (!el) return;
+    const btc = window.__lastBtc;
+    if (!btc || !btc.block_time) {
+      el.innerHTML = "bloc — · --:--:--";
+      return;
+    }
+    const height = btc.blocks != null ? formatHeight(btc.blocks) : "—";
+    const blockDt = new Date(Number(btc.block_time) * 1000);
+    const blockStr = blockDt.toLocaleTimeString("fr-FR", { hour12: false });
+    const now = Date.now() / 1000;
+    const lagSec = now - Number(btc.block_time);
+    let lagStr = "";
+    if (lagSec < 60) lagStr = `il y a ${Math.round(lagSec)}s`;
+    else if (lagSec < 3600) lagStr = `il y a ${Math.round(lagSec / 60)}min`;
+    else lagStr = `il y a ${Math.round(lagSec / 3600)}h${Math.round((lagSec % 3600) / 60)}`;
+    el.innerHTML = `<span class="bt-height">${height}</span> · <span class="bt-time">${blockStr}</span> <span class="bt-lag">(${lagStr})</span>`;
+  }
 
   // ── Found vault ─────────────────────────────────────────────────────────
   function loadFound() {
@@ -983,20 +1016,65 @@
     const rpc = !!s?.rpc_ok;
     const synced = !!s?.is_synced;
     const indexOk = !!(health?.index_loaded);
-    const scanOn = !!(health?.scan?.running || health?.scan_bg);
+    const bruteOn = !!(health?.scan?.running || health?.scan_bg);
+    const dictOn = !!health?.dict?.running;
+    const anyScanOn = bruteOn || dictOn;
 
-    if (scanOn) {
-      const rate = health?.scan?.keys_per_sec;
-      const label =
-        rate != null ? `Scan ${formatCompact(rate)}/s` : "Scan ON";
-      setPill("pillScan", label, "ok", `Scan actif · ${formatNumber(rate)} keys/s`);
+    // Aggregate GPU + CPU speeds from all scan sources (brute + dict)
+    const scanData = health?.scan || {};
+    const dictData = health?.dict || {};
+    let gpuTotal = 0, cpuTotal = 0;
+    const gpuParts = [];
+
+    // Brute-force scan GPU rates
+    if (Array.isArray(scanData.gpu_rates)) {
+      for (const g of scanData.gpu_rates) {
+        const r = Number(g.keys_per_sec || g.keys_per_sec_avg || 0);
+        gpuTotal += r;
+        gpuParts.push(`GPU${g.id}: ${formatCompact(r)}/s`);
+      }
+    }
+    cpuTotal += Number(scanData.cpu_keys_per_sec || 0);
+
+    // Dict scan GPU rates
+    if (Array.isArray(dictData.gpu_rates)) {
+      for (const g of dictData.gpu_rates) {
+        const r = Number(g.keys_per_sec || g.keys_per_sec_avg || 0);
+        gpuTotal += r;
+        gpuParts.push(`GPU${g.id}: ${formatCompact(r)}/s (dict)`);
+      }
+    }
+    cpuTotal += Number(dictData.cpu_keys_per_sec || 0);
+
+    const totalRate = gpuTotal + cpuTotal;
+    const totalTested = Math.max(dictData.keys_tested || 0, scanData.keys_tested || 0);
+
+    // Pill: simple ON/OFF
+    if (anyScanOn || totalRate > 0) {
+      setPill("pillScan", "Scan ON", "ok", `${formatCompact(totalRate)}/s · ${formatNumber(totalTested)} testées`);
     } else {
-      setPill("pillScan", "Scan off", "warn", "Scan de fond arrêté");
+      setPill("pillScan", "Scan OFF", "warn", "Scan de fond arrêté");
     }
 
-    if (!running) setPill("pillCore", "Core STOP", "bad", s?.simple_status || "Core arrêté");
-    else if (!rpc) setPill("pillCore", "Core busy", "warn", s?.simple_status || "RPC occupé");
-    else setPill("pillCore", "Core OK", "ok", s?.simple_status || "Core en ligne");
+    // Update "Scan en cours" tile with GPU/CPU breakdown
+    if ($("infoScanRate")) {
+      $("infoScanRate").textContent = totalRate > 0 ? `${formatCompact(totalRate)} /s` : "— /s";
+    }
+    if ($("infoScanTested")) {
+      $("infoScanTested").textContent = totalTested > 0 ? `testées: ${formatNumber(totalTested)}` : "testées: —";
+    }
+    if ($("infoScanMode")) {
+      const modeLabel = [];
+      if (bruteOn) modeLabel.push("brute");
+      if (dictOn) modeLabel.push("dict");
+      $("infoScanMode").textContent = modeLabel.length ? `mode: ${modeLabel.join(" + ")}` : "mode: —";
+    }
+    // GPU/CPU detail line in the scan section
+    if ($("scanRateDetail")) {
+      const detailParts = [...gpuParts];
+      if (cpuTotal > 0) detailParts.push(`CPU: ${formatCompact(cpuTotal)}/s`);
+      $("scanRateDetail").textContent = detailParts.length ? detailParts.join(" · ") : "—";
+    }
 
     if (synced) setPill("pillSync", "Chaîne OK", "ok", "Chaîne à jour");
     else if (running) setPill("pillSync", "Chaîne sync", "warn", s?.simple_status || "Sync en cours");
@@ -1133,7 +1211,7 @@
           tip != null && lag.idxH != null ? Math.max(0, tip - lag.idxH) : null;
         parts.push(
           `index UTXO bloc ${formatHeight(lag.idxH)} / Core tip ${formatHeight(tip)}` +
-            (lagB != null ? ` (retard ${formatHeight(lagB)} blocs)` : "")
+            (lagB != null ? ` (retard ${formatHeight(lagB)} blocs${formatLagTime(lagB)})` : "")
         );
       } else if (lag.idxH != null) {
         parts.push(
@@ -1165,7 +1243,7 @@
         );
       }
       if (lag.blockLag != null && lag.blockLag > 0) {
-        parts.push(`${formatHeight(lag.blockLag)} blocs derrière le tip`);
+        parts.push(`${formatHeight(lag.blockLag)} blocs derrière le tip${formatLagTime(lag.blockLag)}`);
       }
       meta.textContent = parts.join("  ·  ");
     }
@@ -1536,7 +1614,7 @@
 
   /**
    * Badges Core / UTXO dans la tuile index :
-   * - Core : vert si bitcoind roule, rouge si arrêté
+   * - Core : vert si bitcoind roule + tip frais; jaune si > 1 h de retard; rouge si arrêté
    * - UTXO : vert si retard < 24 h ; jaune si ≥ 24 h mais rebuild en cours ;
    *          rouge si ≥ 24 h et PAS de rebuild
    */
@@ -1547,6 +1625,7 @@
     idxH,
     coreTip,
     rebuildInProgress,
+    coreTipAgeSec,
   }) {
     const badgeCore = $("badgeCore");
     const badgeUtxo = $("badgeUtxo");
@@ -1560,14 +1639,25 @@
 
     // --- Core ---
     if (coreRunning === true) {
-      setBadge(
-        badgeCore,
-        "is-green",
-        coreTip != null ? `Core ON · ${formatHeight(coreTip)}` : "Core ON",
-        coreTip != null
-          ? `Bitcoin Core en marche · tip bloc ${coreTip}`
-          : "Bitcoin Core en marche"
-      );
+      const coreStale = coreTipAgeSec != null && coreTipAgeSec > 3600;
+      if (coreStale) {
+        const lagH = (coreTipAgeSec / 3600).toFixed(1);
+        setBadge(
+          badgeCore,
+          "is-yellow",
+          coreTip != null ? `Core lent · ${formatHeight(coreTip)}` : "Core lent",
+          `Tip Core il y a ${lagH} h (dernier bloc > 1 h)`
+        );
+      } else {
+        setBadge(
+          badgeCore,
+          "is-green",
+          coreTip != null ? `Core ON · ${formatHeight(coreTip)}` : "Core ON",
+          coreTip != null
+            ? `Bitcoin Core en marche · tip bloc ${coreTip}`
+            : "Bitcoin Core en marche"
+        );
+      }
     } else if (coreRunning === false) {
       setBadge(
         badgeCore,
@@ -1609,7 +1699,7 @@
             : "UTXO vieux (≥ 24 h)";
         utxoTitle =
           `Retard ≈ ${lagHours.toFixed(1)} h (≥ ${UTXO_VALID_HOURS} h) et aucune recréation en cours` +
-          (blockLag != null ? ` · ${blockLag} blocs` : "");
+          (blockLag != null ? ` · ${formatHeight(blockLag)} blocs${formatLagTime(blockLag)}` : "");
       }
     } else if (blockLag != null) {
       // fallback sans heures : ~144 blocs ≈ 24 h
@@ -1619,14 +1709,14 @@
           idxH != null
             ? `UTXO OK · ${formatHeight(idxH)}`
             : "UTXO OK";
-        utxoTitle = `Retard ${blockLag} blocs (< ~24 h)`;
+        utxoTitle = `Retard ${formatHeight(blockLag)} blocs${formatLagTime(blockLag)} (< ~24 h)`;
       } else {
         utxoCls = "is-red";
         utxoTxt =
           idxH != null
             ? `UTXO vieux · ${formatHeight(idxH)}`
             : "UTXO vieux";
-        utxoTitle = `Retard ${blockLag} blocs (≥ ~24 h), pas de rebuild`;
+        utxoTitle = `Retard ${formatHeight(blockLag)} blocs${formatLagTime(blockLag)} (≥ ~24 h), pas de rebuild`;
       }
     }
 
@@ -1674,6 +1764,9 @@
           : alwaysOn?.blocks != null
             ? Number(alwaysOn.blocks)
             : null;
+      const coreTipAgeSec1 = btc?.block_time
+        ? (Date.now() / 1000 - Number(btc.block_time))
+        : null;
       applyUtxoStatusBadges({
         coreRunning,
         lagHours:
@@ -1684,6 +1777,7 @@
         idxH: alwaysOn?.utxo_height != null ? Number(alwaysOn.utxo_height) : null,
         coreTip,
         rebuildInProgress: isUtxoRebuildInProgress(health, alwaysOn),
+        coreTipAgeSec: coreTipAgeSec1,
       });
       return;
     }
@@ -1733,6 +1827,9 @@
       lagHours = lagEst.hours;
     }
     const rebuildInProgress = isUtxoRebuildInProgress(health, alwaysOn);
+    const coreTipAgeSec2 = btc?.block_time
+      ? (Date.now() / 1000 - Number(btc.block_time))
+      : null;
 
     applyUtxoStatusBadges({
       coreRunning,
@@ -1741,6 +1838,7 @@
       idxH: height,
       coreTip,
       rebuildInProgress,
+      coreTipAgeSec: coreTipAgeSec2,
     });
 
     let blockDate =
@@ -1765,13 +1863,13 @@
       if ($("infoUtxoBlock")) {
         $("infoUtxoBlock").title =
           `Index UTXO = bloc ${height} · Bitcoin Core tip = bloc ${coreTip}` +
-          (blockLag != null ? ` · retard ${blockLag} blocs` : "");
+          (blockLag != null ? ` · retard ${formatHeight(blockLag)} blocs${formatLagTime(blockLag)}` : "");
       }
       setText(
         "infoUtxoVsCore",
         `index ${formatHeight(height)} · Core tip ${formatHeight(coreTip)}` +
           (blockLag != null && blockLag > 0
-            ? ` · retard ${formatHeight(blockLag)} blocs`
+            ? ` · retard ${formatHeight(blockLag)} blocs${formatLagTime(blockLag)}`
             : blockLag === 0
               ? " · au tip"
               : "")
@@ -1840,7 +1938,7 @@
     const tip = [
       height != null ? `index bloc ${height}` : null,
       coreTip != null ? `Core tip ${coreTip}` : null,
-      blockLag != null ? `retard ${blockLag} blocs` : null,
+      blockLag != null ? `retard ${formatHeight(blockLag)} blocs${formatLagTime(blockLag)}` : null,
       snap.block_time_utc || null,
       ageH != null ? `âge fichier ${Number(ageH).toFixed(1)} h` : null,
       snap.path || null,
@@ -1865,12 +1963,14 @@
         : s.keys_with_balance != null
           ? s.keys_with_balance
           : s.matches_found || 0;
-    const live =
-      s.keys_per_sec_live != null && s.keys_per_sec_live > 0
+    const live = run
+      ? (s.keys_per_sec_live != null && s.keys_per_sec_live > 0
         ? s.keys_per_sec_live
-        : s.keys_per_sec;
-    const avg =
-      s.keys_per_sec_avg != null ? s.keys_per_sec_avg : s.keys_per_sec;
+        : s.keys_per_sec)
+      : 0;
+    const avg = run
+      ? (s.keys_per_sec_avg != null ? s.keys_per_sec_avg : s.keys_per_sec)
+      : 0;
     setText("keysPerSec", formatNumber(live));
     setText("keysTested", formatNumber(s.keys_tested));
     setText(
@@ -2063,11 +2163,23 @@
           ? `${rs || "?"} → ${re || "?"}`
           : s.current_position || "";
       const majTip = maj ? `MAJ ${maj}` : null;
+      // GPU + CPU breakdown for tooltip
+      const gpuParts = [];
+      if (Array.isArray(s.gpu_rates)) {
+        for (const g of s.gpu_rates) {
+          gpuParts.push(`GPU${g.id}: ${formatCompact(g.keys_per_sec || g.keys_per_sec_avg || 0)}/s`);
+        }
+      }
+      const cpuRate = Number(s.cpu_keys_per_sec || 0);
+      const hwParts = [];
+      if (gpuParts.length) hwParts.push(gpuParts.join(" + "));
+      if (cpuRate > 0) hwParts.push(`CPU: ${formatCompact(cpuRate)}/s`);
       setPill(
         "pillScan",
         rate != null ? `Scan ${formatCompact(rate)}/s` : "Scan ON",
         "ok",
         [
+          ...hwParts,
           rate != null ? `${formatNumber(rate)} keys/s live` : null,
           s.keys_tested != null ? `${formatNumber(s.keys_tested)} testées` : null,
           majTip,

@@ -148,11 +148,46 @@ body {
   background: var(--text-dim);
 }
 
+.clock-group {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 1px;
+}
+
 .clock {
   font-family: var(--mono);
   font-size: 0.9rem;
   color: var(--text-muted);
   letter-spacing: 0.04em;
+}
+
+.clock-utc {
+  font-family: var(--mono);
+  font-size: 0.75rem;
+  color: var(--text-dim);
+  letter-spacing: 0.04em;
+}
+
+.block-time {
+  font-family: var(--mono);
+  font-size: 0.7rem;
+  color: var(--text-dim);
+  letter-spacing: 0.03em;
+}
+
+.block-time .bt-height {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.block-time .bt-time {
+  color: var(--text-muted);
+}
+
+.block-time .bt-lag {
+  color: var(--text-dim);
+  font-size: 0.65rem;
 }
 
 /* Sticky simple status — fixed pill widths (no layout jump) */
@@ -215,6 +250,46 @@ body {
 #pillReady { width: 9.5rem;  max-width: 9.5rem; }
 #pillCore  { width: 6.5rem;  max-width: 6.5rem; }
 #pillSync  { width: 8rem;    max-width: 8rem; }
+
+/* Scan toggle button — clickable status pill */
+.scan-toggle-btn {
+  font-family: var(--mono);
+  font-size: 0.85rem;
+  font-weight: 600;
+  padding: 0.35rem 0.75rem;
+  border: 2px solid;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  background: transparent;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  white-space: nowrap;
+  flex: 0 0 auto;
+}
+.scan-toggle-btn.is-on {
+  color: #3dd68c;
+  border-color: #3dd68c;
+}
+.scan-toggle-btn.is-on:hover {
+  background: rgba(61, 214, 140, 0.1);
+}
+.scan-toggle-btn.is-off {
+  color: #f0b429;
+  border-color: #f0b429;
+}
+.scan-toggle-btn.is-off:hover {
+  background: rgba(240, 180, 41, 0.1);
+}
+.scan-toggle-btn.is-error {
+  color: #f05252;
+  border-color: #f05252;
+  animation: pulse-error 2s infinite;
+}
+@keyframes pulse-error {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.6; }
+}
 
 .pill.ok {
   background: var(--green-dim);

@@ -57,7 +57,7 @@ fn default_true_gpu() -> bool {
 }
 
 fn default_max_phrases() -> usize {
-    500_000
+    50_000_000
 }
 fn default_true_join() -> bool {
     true

@@ -1,0 +1,10 @@
+{
+    "base_block_hash":  "00000000000000000000cb91c1bc84511afd6e3ee4e154cc3826101065ee893e",
+    "num_scripts":  59426905,
+    "source":  "W:\\Temp\\utxo-tip.dat",
+    "dumptxoutset":  true,
+    "built_at":  "2026-07-17T14:41:15.2659579Z",
+    "block_height":  958424,
+    "block_time_unix":  1784298624,
+    "block_time_utc":  "2026-07-17 14:30:24 UTC"
+}

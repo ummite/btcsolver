@@ -1,22 +1,19 @@
 {
-    "updated_at_utc":  "2026-07-17T14:07:02.3629944Z",
+    "updated_at_utc":  "2026-07-17T15:55:01.8249578Z",
     "core_running":  true,
     "core_pid":  3904,
     "core_started_now":  false,
-    "blocks":  958422,
-    "headers":  958422,
+    "blocks":  958432,
+    "headers":  958432,
     "verification_pct":  100,
     "initialblockdownload":  false,
     "at_tip":  true,
-    "utxo_valid_for_tests":  false,
-    "utxo_lag_hours":  3912,
-    "utxo_height":  935000,
+    "utxo_valid_for_tests":  true,
+    "utxo_lag_hours":  1,
+    "utxo_height":  958424,
     "utxo_max_age_hours":  24,
-    "active_snapshot":  "Y:\\btcsolver\\data\\utxo-day-935000.snapshot",
-    "last_refresh":  {
-                         "ok":  false,
-                         "reason":  "in_progress"
-                     },
+    "active_snapshot":  "Y:\\btcsolver\\data\\utxo-tip.snapshot",
+    "last_refresh":  null,
     "priority_sync":  false,
-    "message":  "Core tip - refresh UTXO en cours ou a lancer (dumptxoutset)"
+    "message":  "OK: Core tip + UTXO frais (\u003c24h) - pret pour chercher des cles"
 }

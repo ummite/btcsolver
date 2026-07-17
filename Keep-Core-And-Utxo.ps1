@@ -147,25 +147,50 @@ function Test-CoreAtTip($info) {
 function Get-ActiveSnapMeta {
     $metas = @(
         "$Project\data\utxo-tip.snapshot.meta.json",
-        "$Project\data\utxo-day-935000.snapshot.meta.json",
-        "$Project\data\utxo-active.snapshot.meta.json"
+        "$Project\data\utxo-active.snapshot.meta.json",
+        "$Project\data\utxo-day-935000.snapshot.meta.json"
     )
+    $best = $null
     foreach ($m in $metas) {
         if (Test-Path $m) {
-            try { return Get-Content $m -Raw | ConvertFrom-Json } catch {}
+            # Skip empty/corrupt metas (0 bytes or unparseable)
+            if ((Get-Item $m).Length -lt 10) { continue }
+            try {
+                $parsed = Get-Content $m -Raw | ConvertFrom-Json
+                # Must have block_height to be useful
+                if ($parsed.block_height) {
+                    if (-not $best -or $parsed.block_height -gt $best.block_height) {
+                        $best = $parsed
+                    }
+                }
+            } catch {}
         }
     }
-    return $null
+    return $best
 }
 
 function Refresh-UtxoFromTip {
+    # --- stale marker recovery ---
     if (Test-Path $MarkerBuilding) {
         $age = (Get-Date) - (Get-Item $MarkerBuilding).LastWriteTime
         if ($age.TotalHours -lt 6) {
-            Write-Log "UTXO rebuild already in progress (marker age $($age.TotalMinutes) min)"
-            return @{ ok = $false; reason = "in_progress" }
+            # Check if another instance is actually working (pid file or recent dump activity)
+            $realPid = $null
+            if (Test-Path "$MarkerBuilding.pid") {
+                try { $realPid = Get-Process -Id ([int](Get-Content "$MarkerBuilding.pid")) -ErrorAction SilentlyContinue } catch {}
+            }
+            if ($realPid) {
+                Write-Log "UTXO rebuild already in progress (PID $($realPid.Id), marker age $($age.TotalMinutes) min)"
+                return @{ ok = $false; reason = "in_progress" }
+            }
+            Write-Log "STALE marker detected (age $($age.TotalMinutes) min, no owner PID) - removing and continuing"
+            Remove-Item $MarkerBuilding -Force -ErrorAction SilentlyContinue
+            Remove-Item "$MarkerBuilding.pid" -Force -ErrorAction SilentlyContinue
+        } else {
+            Write-Log "Expired marker (age $($age.TotalHours)h) - removing"
+            Remove-Item $MarkerBuilding -Force -ErrorAction SilentlyContinue
+            Remove-Item "$MarkerBuilding.pid" -Force -ErrorAction SilentlyContinue
         }
-        Remove-Item $MarkerBuilding -Force -ErrorAction SilentlyContinue
     }
 
     $dumpTool = Find-DumpToFlat
@@ -174,37 +199,72 @@ function Refresh-UtxoFromTip {
         return @{ ok = $false; reason = "no_dump_to_flat" }
     }
 
+    # Safety check: if a valid snapshot already exists (fresh meta + recent height), skip rebuild
+    $existingMeta = Get-ActiveSnapMeta
+    $refreshInfo = Get-CoreInfo
+    if ($existingMeta -and $existingMeta.block_height) {
+        $existingH = [int64]$existingMeta.block_height
+        $tipH = if ($refreshInfo) { [int64]$refreshInfo.blocks } else { 0 }
+        $existingLagBlocks = if ($tipH -gt 0) { $tipH - $existingH } else { 0 }
+        if ($existingLagBlocks -le 10) {
+            Write-Log "UTXO snapshot already fresh (height=$existingH, tip=$tipH, lag=$existingLagBlocks blocks) - skipping rebuild"
+            # Activate the existing snapshot
+            if (Test-Path $SnapLive) {
+                Copy-Item $SnapLive $SnapActive -Force -ErrorAction SilentlyContinue
+                Copy-Item $SnapLive "$Project\utxo-index.snapshot" -Force -ErrorAction SilentlyContinue
+            }
+            return @{ ok = $true; height = $existingH; path = $SnapLive }
+        }
+    }
+
+    # Create marker + write our PID so other ticks can verify we're alive
     New-Item -ItemType File -Path $MarkerBuilding -Force | Out-Null
+    $PID | Set-Content "$MarkerBuilding.pid" -Encoding UTF8
     try {
-        Write-Log "UTXO refresh: dumptxoutset -> $UtxoDump"
+        # --- Step 1: dumptxoutset (skip if valid dump already exists) ---
+        $needDump = $false
         if (Test-Path $UtxoDump) {
-            Remove-Item $UtxoDump -Force -ErrorAction SilentlyContinue
+            $existingSize = (Get-Item $UtxoDump).Length
+            if ($existingSize -gt 1GB) {
+                Write-Log "UTXO refresh: existing dump OK ($([math]::Round($existingSize/1GB,2)) GB) - skipping dumptxoutset"
+            } else {
+                Write-Log "UTXO refresh: existing dump too small ($([math]::Round($existingSize/1MB,1)) MB) - regenerating"
+                $needDump = $true
+            }
+        } else {
+            $needDump = $true
         }
 
-        # Bitcoin Core 26+: dumptxoutset path type
-        # IMPORTANT: passer -datadir en argument string explicite (évite "$Datadir" littéral
-        # quand le script est invoqué depuis certaines tâches planifiées / wrappers).
-        $dumpOk = $false
-        $datadirArg = "-datadir=$Datadir"
-        # dumptxoutset est long (souvent 10–40+ min) : pas de timeout RPC client
-        $timeoutArg = "-rpcclienttimeout=0"
-        Write-Log "UTXO refresh: cli=$Cli $datadirArg $timeoutArg dumptxoutset $UtxoDump latest"
-        & $Cli $datadirArg $timeoutArg dumptxoutset $UtxoDump latest 2>&1 | ForEach-Object { Write-Log "cli: $_" }
-        if ((Test-Path $UtxoDump) -and ((Get-Item $UtxoDump).Length -gt 1GB)) {
-            $dumpOk = $true
-        } else {
-            Write-Log "UTXO refresh: retry without 'latest' type"
-            & $Cli $datadirArg $timeoutArg dumptxoutset $UtxoDump 2>&1 | ForEach-Object { Write-Log "cli2: $_" }
+        if ($needDump) {
+            Write-Log "UTXO refresh: dumptxoutset -> $UtxoDump"
+            Remove-Item $UtxoDump -Force -ErrorAction SilentlyContinue
+
+            # Bitcoin Core 26+: dumptxoutset path type
+            # IMPORTANT: passer -datadir en argument string explicite (évite "$Datadir" littéral
+            # quand le script est invoqué depuis certaines tâches planifiées / wrappers).
+            $dumpOk = $false
+            $datadirArg = "-datadir=$Datadir"
+            # dumptxoutset est long (souvent 10–40+ min) : pas de timeout RPC client
+            $timeoutArg = "-rpcclienttimeout=0"
+            Write-Log "UTXO refresh: cli=$Cli $datadirArg $timeoutArg dumptxoutset $UtxoDump latest"
+            & $Cli $datadirArg $timeoutArg dumptxoutset $UtxoDump latest 2>&1 | ForEach-Object { Write-Log "cli: $_" }
             if ((Test-Path $UtxoDump) -and ((Get-Item $UtxoDump).Length -gt 1GB)) {
                 $dumpOk = $true
+            } else {
+                Write-Log "UTXO refresh: retry without 'latest' type"
+                & $Cli $datadirArg $timeoutArg dumptxoutset $UtxoDump 2>&1 | ForEach-Object { Write-Log "cli2: $_" }
+                if ((Test-Path $UtxoDump) -and ((Get-Item $UtxoDump).Length -gt 1GB)) {
+                    $dumpOk = $true
+                }
+            }
+
+            if (-not $dumpOk) {
+                Write-Log "ERROR: dumptxoutset failed or file too small"
+                return @{ ok = $false; reason = "dumptxoutset_failed" }
             }
         }
 
-        if (-not $dumpOk) {
-            Write-Log "ERROR: dumptxoutset failed or file too small"
-            return @{ ok = $false; reason = "dumptxoutset_failed" }
-        }
-
+        # --- Step 2: dump_to_flat conversion ---
         $info = Get-CoreInfo
         $height = if ($info) { [int64]$info.blocks } else { 0 }
         $hash = if ($info) { $info.bestblockhash } else { "" }
@@ -213,16 +273,39 @@ function Refresh-UtxoFromTip {
         $dumpGb = [math]::Round(((Get-Item $UtxoDump).Length / 1GB), 2)
         Write-Log ("UTXO refresh: dump_to_flat size_gb=" + $dumpGb)
         $tmpSnap = "$Project\data\utxo-tip.building.snapshot"
-        & $dumpTool --snapshot $UtxoDump --output $tmpSnap 2>&1 | ForEach-Object { Write-Log "flat: $_" }
+
+        # Remove stale building snapshot if any
+        if (Test-Path $tmpSnap) { Remove-Item $tmpSnap -Force -ErrorAction SilentlyContinue }
+
+        Write-Log "UTXO refresh: launching dump_to_flat --snapshot $UtxoDump --output $tmpSnap"
+        $flatProc = Start-Process -FilePath $dumpTool `
+            -ArgumentList "--snapshot `"$UtxoDump`" --output `"$tmpSnap`"" `
+            -RedirectStandardOutput "$Project\data\dump_to_flat.out" `
+            -RedirectStandardError "$Project\data\dump_to_flat.err" `
+            -Wait -PassThru -NoNewWindow
+        Write-Log "UTXO refresh: dump_to_flat exited with code $($flatProc.ExitCode)"
+
+        # Log the output files
+        if (Test-Path "$Project\data\dump_to_flat.out") {
+            Get-Content "$Project\data\dump_to_flat.out" | ForEach-Object { Write-Log "flat-out: $_" }
+        }
+        if (Test-Path "$Project\data\dump_to_flat.err") {
+            Get-Content "$Project\data\dump_to_flat.err" | ForEach-Object { Write-Log "flat-err: $_" }
+        }
+
         if (-not (Test-Path $tmpSnap)) {
-            Write-Log "ERROR: dump_to_flat produced no snapshot"
+            Write-Log "ERROR: dump_to_flat produced no snapshot (exit code $($flatProc.ExitCode))"
             return @{ ok = $false; reason = "flat_failed" }
         }
 
+        # --- Step 3: activate snapshot ---
         Move-Item $tmpSnap $SnapLive -Force
         Copy-Item $SnapLive $SnapActive -Force -ErrorAction SilentlyContinue
         # Also update default path used by many tools
         Copy-Item $SnapLive "$Project\utxo-index.snapshot" -Force -ErrorAction SilentlyContinue
+
+        $snapGb = [math]::Round(((Get-Item $SnapLive).Length / 1GB), 2)
+        Write-Log "UTXO refresh: snapshot activated ($snapGb GB)"
 
         $meta = @{
             base_block_hash   = $hash
@@ -236,13 +319,14 @@ function Refresh-UtxoFromTip {
             num_scripts       = $null
             dumptxoutset      = $true
         }
-        $meta | ConvertTo-Json | Set-Content $SnapMeta -Encoding UTF8
+        $meta | ConvertTo-Json -Depth 4 | Set-Content $SnapMeta -Encoding UTF8
         Copy-Item $SnapMeta "$Project\data\utxo-active.snapshot.meta.json" -Force -ErrorAction SilentlyContinue
 
-        Write-Log "UTXO refresh OK height=$height hash=$hash size=$((Get-Item $SnapLive).Length)"
+        Write-Log "UTXO refresh OK height=$height hash=$hash size=$snapGb GB"
         return @{ ok = $true; height = $height; path = $SnapLive }
     } finally {
         Remove-Item $MarkerBuilding -Force -ErrorAction SilentlyContinue
+        Remove-Item "$MarkerBuilding.pid" -Force -ErrorAction SilentlyContinue
     }
 }
 

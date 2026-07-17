@@ -812,6 +812,13 @@ impl BitcoindManager {
         let mediantime = info.median_time;
         let chainwork_hex = hex::encode(&info.chain_work);
 
+        // Actual tip block time (not mediantime which lags by ~30-60 min)
+        let tip_block_time = client
+            .get_block_header_info(&info.best_block_hash)
+            .ok()
+            .map(|h| h.time as u64)
+            .unwrap_or(mediantime);
+
         let raw = serde_json::json!({
             "blockchain": {
                 "chain": info.chain.to_string(),
@@ -858,8 +865,8 @@ impl BitcoindManager {
             chainwork: chainwork_hex,
             mediantime,
             mediantime_utc: Self::utc_from_unix(mediantime),
-            block_time: mediantime,
-            block_time_utc: Self::utc_from_unix(mediantime),
+            block_time: tip_block_time,
+            block_time_utc: Self::utc_from_unix(tip_block_time),
             verification_progress: info.verification_progress * 100.0,
             initialblockdownload: info.initial_block_download,
             pruned: info.pruned,
