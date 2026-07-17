@@ -1,12 +1,12 @@
 /**
- * BTC Solver — UI orientée "trouver des clés avec solde"
+ * BTC Solver — UI focused on "finding keys with balance"
  */
 (() => {
   "use strict";
 
   const $ = (id) => document.getElementById(id);
   const FOUND_KEY = "btcsolver_found_keys_v1";
-  /** Explorateur public — adresse BTC uniquement, JAMAIS de clé privée dans l’URL */
+  /** Explorateur public — address BTC uniquement, JAMAIS de clé privée dans l’URL */
   const BLOCKCHAIN_EXPLORER_ADDR =
     "https://www.blockchain.com/explorer/addresses/btc/";
   let lastHits = [];
@@ -15,8 +15,8 @@
   function formatLagTime(blocks) {
     if (!blocks || blocks <= 0) return "";
     const hours = (blocks * 10) / 60;
-    if (hours >= 24) return ` (~${formatNumber(hours)} h / ~${(hours / 24).toFixed(1)} j)`;
-    return ` (~${hours.toFixed(1)} h)`;
+    if (hours >= 24) return ` (~${formatNumber(hours)}h / ~${(hours / 24).toFixed(1)}d)`;
+    return ` (~${hours.toFixed(1)}h)`;
   }
 
   /** Compact (K/M/G) — pour débits, hits, etc. PAS pour hauteurs de bloc. */
@@ -30,12 +30,12 @@
   }
 
   /**
-   * Entier exact (hauteurs de bloc UTXO / Core) — jamais de raccourci K/M.
-   * Espaces fins fr-FR pour lisibilité : 935000 → "935 000"
+   * Exact integer (UTXO / Core block heights) — never K/M shortcut.
+   * en-US locale for readability: 935000 → "935,000"
    */
   function formatHeight(n) {
     if (n == null || n === "" || Number.isNaN(Number(n))) return "—";
-    return Math.round(Number(n)).toLocaleString("fr-FR");
+    return Math.round(Number(n)).toLocaleString("en-US");
   }
 
   function formatDuration(seconds) {
@@ -66,8 +66,8 @@
     toast._t = setTimeout(() => el.classList.add("hidden"), 4500);
   }
 
-  /** Bouton copier à droite d'une valeur (adresse / hex). */
-  function copyBtn(text, label = "Copier", kind = "text") {
+  /** Copy button to the right of a value (address / hex). */
+  function copyBtn(text, label = "Copy", kind = "text") {
     if (!text || text === "—" || text === "error") return "";
     return `<button type="button" class="btn btn-ghost btn-sm btn-copy-inline" data-copy="${esc(
       text
@@ -110,7 +110,7 @@
     if (!root) return;
     root.querySelectorAll("[data-copy]").forEach((b) => {
       b.addEventListener("click", async (e) => {
-        e.preventDefault();
+        e.preventFromfault();
         e.stopPropagation();
         let t = b.getAttribute("data-copy") || "";
         const kind = b.getAttribute("data-copy-kind") || "text";
@@ -161,17 +161,17 @@
         }
         const okMsg =
           kind === "pub"
-            ? "Clé publique copiée"
+            ? "Public key copied"
             : kind === "priv"
-              ? "Clé privée copiée"
+              ? "Private key copied"
               : kind === "addr"
-                ? "Adresse copiée"
-                : "Copié";
+                ? "Address copied"
+                : "Copied";
         try {
           await copyTextToClipboard(t);
           toast(okMsg, "success");
         } catch (_) {
-          toast("Copie impossible", "error");
+          toast("Cannot copy", "error");
         }
       });
     });
@@ -186,7 +186,7 @@
     const force = !!opts.force;
     if (!force && (value == null || value === "")) return "";
     const full = value == null || value === "" ? "" : String(value);
-    // Affichage court pour les longs hex / adresses — copie = valeur complète
+    // Affichage court pour les longs hex / addresss — copie = valeur complète
     const display =
       full === ""
         ? "—"
@@ -195,12 +195,12 @@
           : full;
     const btnLabel =
       kind === "pub"
-        ? "Copier pub"
+        ? "Copy pub"
         : kind === "priv"
-          ? "Copier priv"
+          ? "Copy priv"
           : kind === "addr"
-            ? "Copier addr"
-            : "Copier";
+            ? "Copy addr"
+            : "Copy";
     const privAttr =
       kind === "pub" && opts.priv
         ? ` data-priv="${esc(opts.priv)}"`
@@ -212,12 +212,12 @@
         full
       )}" data-copy-kind="${esc(kind)}"${privAttr} title="${esc(full)}">${esc(btnLabel)}</button>`;
     } else if (kind === "pub" && opts.priv) {
-      btn = `<button type="button" class="btn btn-ghost btn-sm btn-copy-inline" data-copy="" data-copy-kind="pub"${privAttr} title="Dériver puis copier la pub compressée">Copier pub</button>`;
+      btn = `<button type="button" class="btn btn-ghost btn-sm btn-copy-inline" data-copy="" data-copy-kind="pub"${privAttr} title="Fromrive then copy compressed pub">Copy pub</button>`;
     }
-    // Lien explorateur uniquement pour les adresses publiques (jamais priv / pub hex)
+    // Lien explorateur uniquement pour les addresss publiques (jamais priv / pub hex)
     const explorer =
       kind === "addr" && isBtcPublicAddress(full)
-        ? explorerLinkHtml(full, "Vérifier solde")
+        ? explorerLinkHtml(full, "Check balance")
         : "";
     return `<div class="result-row result-row-copy">
       <span class="label">${esc(label)}</span>
@@ -234,7 +234,7 @@
     return t.slice(0, head) + "…" + t.slice(-tail);
   }
 
-  /** Vraie adresse BTC publique (legacy / P2SH / bech32) — pas de priv / WIF / hex. */
+  /** Vraie address BTC publique (legacy / P2SH / bech32) — pas de priv / WIF / hex. */
   function isBtcPublicAddress(a) {
     const s = String(a || "").trim();
     if (!s || s === "—") return false;
@@ -245,7 +245,7 @@
   }
 
   /**
-   * URL blockchain.com pour une adresse publique uniquement.
+   * URL blockchain.com pour une public address uniquement.
    * Ne jamais y coller priv / WIF / seed.
    */
   function explorerAddrUrl(addr) {
@@ -253,16 +253,16 @@
     return BLOCKCHAIN_EXPLORER_ADDR + encodeURIComponent(String(addr).trim());
   }
 
-  /** Lien « vérifier solde » — target=_blank, rel=noopener (adresse publique seule). */
-  function explorerLinkHtml(addr, label = "Vérifier solde") {
+  /** Lien « vérifier solde » — target=_blank, rel=noopener (public address seule). */
+  function explorerLinkHtml(addr, label = "Check balance") {
     const url = explorerAddrUrl(addr);
     if (!url) return "";
-    return `<a class="btn btn-explorer btn-sm" href="${esc(url)}" target="_blank" rel="noopener noreferrer" title="Ouvre blockchain.com avec l’adresse PUBLIQUE uniquement — aucune clé privée n’est envoyée">${esc(label)} ↗</a>`;
+    return `<a class="btn btn-explorer btn-sm" href="${esc(url)}" target="_blank" rel="noopener noreferrer" title="Opens blockchain.com with PUBLIC address only — no private key is sent">${esc(label)} ↗</a>`;
   }
 
   /**
    * Adresse publique « format court » pour explorers :
-   * priorité à l’adresse du hit, sinon la plus courte parmi legacy / segwit / wrapped / taproot.
+   * priorité à l’address du hit, sino la plus courte parmi legacy / segwit / wrapped / taproot.
    * (1… et 3… sont souvent plus courts que bc1p…)
    */
   function preferredShortAddress(m) {
@@ -279,11 +279,11 @@
     if (!pool.length) return "";
     // Dédup
     const uniq = [...new Set(pool)];
-    // Si le hit est une vraie adresse BTC, on le garde (c’est celle du solde trouvé)
+    // Si le hit est une vraie address BTC, on le garde (c’est celle du solde trouvé)
     if (hit && isBtcPublicAddress(hit)) {
       return hit;
     }
-    // Sinon la plus courte (format « court ») parmi les adresses valides
+    // Sino la plus courte (format « court ») parmi les addresss valides
     const valid = uniq.filter(isBtcPublicAddress);
     if (!valid.length) return uniq[0] || "";
     return valid.slice().sort((a, b) => a.length - b.length || a.localeCompare(b))[0];
@@ -297,24 +297,24 @@
   }
 
   /**
-   * Barre coffre : PRIV (rouge) + ADRESSE publique courte (vert) + PUB compressée (vert clair).
+   * Vault bar: PRIV (red) + short public ADDR (green) + compressed PUB (light green).
    */
   function vaultKeyActions(priv, addr, pub) {
     const p = priv || "";
     const a = addr || "";
     const u = ensureCompressedPub(pub) || pub || "";
-    const explor = explorerLinkHtml(a, "Vérifier solde on-chain");
+    const explor = explorerLinkHtml(a, "Check balance on-chain");
     return `<div class="vault-key-actions">
       <button type="button" class="btn btn-copy-priv-lg" data-copy="${esc(p)}" data-copy-kind="priv" ${
         p ? "" : "disabled"
-      } title="Copier la clé privée (hex 64) — rester en local, ne jamais coller dans un navigateur web">⬛ Copier PRIV</button>
+      } title="Copy private key (hex 64) — stay local, never paste into a web browser">⬛ Copy PRIV</button>
       <button type="button" class="btn btn-copy-addr-lg" data-copy="${esc(a)}" data-copy-kind="addr" ${
         a ? "" : "disabled"
-      } title="Copier l’adresse publique (format court pour explorers)">🟩 Copier ADDR</button>
+      } title="Copy public address (short format for explorers)">🟩 Copy ADDR</button>
       <button type="button" class="btn btn-copy-pub-lg" data-copy="${esc(u)}" data-copy-kind="pub" data-priv="${esc(
       p
-    )}" ${p || u ? "" : "disabled"} title="Clé publique compressée courte (02/03…, 33 octets)">Copier PUB hex</button>
-      ${explor || `<span class="hint" style="align-self:center">pas d’adresse publique pour explorer</span>`}
+    )}" ${p || u ? "" : "disabled"} title="Short compressed public key (02/03…, 33 bytes)">Copy PUB hex</button>
+      ${explor || `<span class="hint" style="align-self:center">no public address to explore</span>`}
     </div>`;
   }
 
@@ -380,6 +380,23 @@
     el.title = title != null && title !== "" ? String(title) : String(text || "");
   }
 
+  /**
+   * Update the scan toggle button (#pillScan) with state, text, and tooltip.
+   * state: "on" | "off" | "error"
+   * errorReason: optional string shown in the tile error element
+   */
+  function setScanPill(state, text, title, errorReason) {
+    const el = $("pillScan");
+    if (!el) return;
+    el.textContent = text;
+    el.className = "scan-toggle-btn is-" + state;
+    el.title = title != null && title !== "" ? String(title) : String(text || "");
+    const errEl = $("infoScanError");
+    if (errEl) {
+      errEl.textContent = errorReason || "";
+    }
+  }
+
   /** Compact fixed-width number: always like "199K" / "1.2M" (no spaces) */
   function formatCompact(n) {
     if (n == null || Number.isNaN(Number(n))) return "—";
@@ -407,14 +424,14 @@
       try {
         data = text ? JSON.parse(text) : {};
       } catch (pe) {
-        throw new Error(`JSON invalide (${path}): ${text.slice(0, 120)}`);
+        throw new Error(`Invalid JSON (${path}): ${text.slice(0, 120)}`);
       }
       // Only treat TOP-LEVEL API failures as errors (not nested bitcoind.message)
       if (!res.ok) {
         throw new Error(data.error || data.message || `HTTP ${res.status} ${path}`);
       }
       if (data.success === false) {
-        throw new Error(data.error || data.message || "échec API");
+        throw new Error(data.error || data.message || "API failure");
       }
       return data;
     } finally {
@@ -438,9 +455,9 @@
   function tickClock() {
     const now = new Date();
     if ($("clock"))
-      $("clock").textContent = now.toLocaleTimeString("fr-FR", { hour12: false });
+      $("clock").textContent = now.toLocaleTimeString("en-US", { hour12: false });
     if ($("clockUtc"))
-      $("clockUtc").textContent = now.toLocaleTimeString("fr-FR", { hour12: false, timeZone: "UTC" }) + " (UTC)";
+      $("clockUtc").textContent = now.toLocaleTimeString("en-US", { hour12: false, timeZone: "UTC" }) + " (UTC)";
     updateBlockTime();
   }
   setInterval(tickClock, 1000);
@@ -452,18 +469,18 @@
     if (!el) return;
     const btc = window.__lastBtc;
     if (!btc || !btc.block_time) {
-      el.innerHTML = "bloc — · --:--:--";
+      el.innerHTML = "block — · --:--:--";
       return;
     }
     const height = btc.blocks != null ? formatHeight(btc.blocks) : "—";
     const blockDt = new Date(Number(btc.block_time) * 1000);
-    const blockStr = blockDt.toLocaleTimeString("fr-FR", { hour12: false });
+    const blockStr = blockDt.toLocaleTimeString("en-US", { hour12: false });
     const now = Date.now() / 1000;
     const lagSec = now - Number(btc.block_time);
     let lagStr = "";
-    if (lagSec < 60) lagStr = `il y a ${Math.round(lagSec)}s`;
-    else if (lagSec < 3600) lagStr = `il y a ${Math.round(lagSec / 60)}min`;
-    else lagStr = `il y a ${Math.round(lagSec / 3600)}h${Math.round((lagSec % 3600) / 60)}`;
+    if (lagSec < 60) lagStr = `${Math.round(lagSec)}s ago`;
+    else if (lagSec < 3600) lagStr = `${Math.round(lagSec / 60)}min ago`;
+    else lagStr = `${Math.round(lagSec / 3600)}h${Math.round((lagSec % 3600) / 60)} ago`;
     el.innerHTML = `<span class="bt-height">${height}</span> · <span class="bt-time">${blockStr}</span> <span class="bt-lag">(${lagStr})</span>`;
   }
 
@@ -551,12 +568,12 @@
   async function renderFound() {
     const box = $("foundList");
     if (!box) return;
-    box.innerHTML = `<p class="hint">Préparation des clés publiques…</p>`;
+    box.innerHTML = `<p class="hint">Preparing public keys…</p>`;
     await enrichFoundPubkeys();
     const list = loadFound().map(normalizeVaultEntry);
     if (!list.length) {
       box.innerHTML =
-        "Aucune clé sauvée. Fais un test qui trouve un solde, puis « Sauver les hits ». Les pubkeys sont dérivées auto pour coller sur un explorer.";
+        "No keys saved. Run a test that finds a balance, then « Save hits ». Pubkeys are auto-derived to paste into an explorer.";
       return;
     }
     box.innerHTML = list
@@ -573,16 +590,16 @@
           <div class="result-balance">${bal} BTC</div>
           <div class="method-tag">${esc(m.method || m.input_format || "")}</div>
           ${vaultKeyActions(priv, addrShort, pub)}
-          <div class="result-row"><span class="label">entrée</span><span class="value">${esc(m.input || m.phrase || "")}</span></div>
-          ${rowCopy("adresse publique", addrShort, "addr", { force: true, short: false })}
+          <div class="result-row"><span class="label">input</span><span class="value">${esc(m.input || m.phrase || "")}</span></div>
+          ${rowCopy("public address", addrShort, "addr", { force: true, short: false })}
           ${rowCopy("priv hex", priv, "priv", { force: true, head: 10, tail: 8 })}
-          ${rowCopy("pub hex (comp courte)", pub, "pub", { force: true, priv, head: 10, tail: 8 })}
+          ${rowCopy("pub hex (short comp)", pub, "pub", { force: true, priv, head: 10, tail: 8 })}
           ${m.addresses?.legacy && m.addresses.legacy !== addrShort ? rowCopy("legacy", m.addresses.legacy, "addr", { short: false }) : ""}
           ${m.addresses?.segwit && m.addresses.segwit !== addrShort ? rowCopy("segwit", m.addresses.segwit, "addr", { short: false }) : ""}
           ${m.addresses?.wrapped && m.addresses.wrapped !== addrShort ? rowCopy("wrapped", m.addresses.wrapped, "addr", { short: false }) : ""}
           ${m.addresses?.taproot && m.addresses.taproot !== addrShort ? rowCopy("taproot", m.addresses.taproot, "addr", { short: false }) : ""}
-          <div class="result-row"><span class="label">sauvé</span><span class="value">${esc(m.saved_at || "")}</span></div>
-          <button type="button" class="btn btn-ghost btn-sm" data-rm="${i}">Retirer</button>
+          <div class="result-row"><span class="label">saved</span><span class="value">${esc(m.saved_at || "")}</span></div>
+          <button type="button" class="btn btn-ghost btn-sm" data-rm="${i}">Remove</button>
         </div>`;
       })
       .join("");
@@ -664,17 +681,17 @@
 
   $("btnModeMax")?.addEventListener("click", () => {
     setHuntMethods(true);
-    toast("Mode MAX activé", "success");
+    toast("MAX mode activated", "success");
   });
   $("btnModeFast")?.addEventListener("click", () => {
     setHuntMethods(false);
-    toast("Mode rapide", "");
+    toast("Fast mode", "");
   });
   $("btnDictMax")?.addEventListener("click", () => setDictMethods(true));
   $("btnDictFast")?.addEventListener("click", () => setDictMethods(false));
   $("btnClearKey")?.addEventListener("click", () => {
     if ($("keyInput")) $("keyInput").value = "";
-    if ($("keyResult")) $("keyResult").innerHTML = "Aucun test pour l’instant.";
+    if ($("keyResult")) $("keyResult").innerHTML = "No test yet.";
   });
 
   // ── Key check (single or multi-line batch) ──────────────────────────────
@@ -682,16 +699,16 @@
     const box = $("keyResult");
     if (!box) return;
     if (data.error) {
-      box.innerHTML = `<div class="result-row"><span class="label">Erreur</span><span class="value">${esc(data.error)}</span></div>`;
+      box.innerHTML = `<div class="result-row"><span class="label">Error</span><span class="value">${esc(data.error)}</span></div>`;
       return;
     }
     const results = data.results || [];
     lastHits = results.filter((r) => (r.total_balance_sats || 0) > 0);
     if (!results.length) {
-      box.innerHTML = `<p class="hint">0 hit affiché (candidats: ${data.candidates || 0}). Décoche « Seulement soldes > 0 » pour voir les adresses à 0.</p>`;
+      box.innerHTML = `<p class="hint">0 hit shown (candidates: ${data.candidates || 0}). Uncheck « Only balances > 0 » to see zero-balance addresses.</p>`;
       return;
     }
-    let html = `<p class="hint">${data.candidates || results.length} candidats · total ${data.total_balance_btc || 0} BTC · hits ${lastHits.length}</p>`;
+    let html = `<p class="hint">${data.candidates || results.length} candidates · total ${data.total_balance_btc || 0} BTC · hits ${lastHits.length}</p>`;
     for (const r of results.slice(0, 60)) {
       const bal = r.total_balance_sats > 0;
       const priv = r.privkey_hex || "";
@@ -701,10 +718,10 @@
       if (bal)
         html += `<div class="result-balance">${r.total_balance_btc} BTC (${formatNumber(r.total_balance_sats)} sats)</div>`;
       else html += `<div class="type">0 BTC</div>`;
-      html += `<div class="result-row"><span class="label">entrée</span><span class="value hex-full">${esc(r.input)}</span></div>`;
+      html += `<div class="result-row"><span class="label">input</span><span class="value hex-full">${esc(r.input)}</span></div>`;
       html += rowCopy("priv hex (64)", priv, "priv");
       // Clé publique compressée (hex) — bouton dédié « Copier pub » (pas la privée)
-      html += rowCopy("clé publique (pub hex)", pub || "", "pub");
+      html += rowCopy("public key (pub hex)", pub || "", "pub");
       if (r.addresses) {
         html += rowCopy("legacy", r.addresses.legacy, "addr");
         html += rowCopy("segwit", r.addresses.segwit, "addr");
@@ -714,7 +731,7 @@
       if (r.matches?.length) {
         for (const m of r.matches) {
           html += `<div class="type">${esc(m.address_type)} · ${m.value_btc} BTC</div>`;
-          html += rowCopy("adresse", m.address, "addr");
+          html += rowCopy("address", m.address, "addr");
         }
       }
       html += `</div>`;
@@ -725,14 +742,14 @@
   }
 
   $("keyForm")?.addEventListener("submit", async (e) => {
-    e.preventDefault();
+    e.preventFromfault();
     const raw = ($("keyInput")?.value || "").trim();
-    if (!raw) return setMsg("keyMsg", "Vide", "error");
+    if (!raw) return setMsg("keyMsg", "Empty", "error");
     const lines = raw
       .split(/\r?\n/)
       .map((l) => l.trim())
       .filter((l) => l && !l.startsWith("#"));
-    setMsg("keyMsg", lines.length > 1 ? `Lot de ${lines.length}…` : "Test…");
+    setMsg("keyMsg", lines.length > 1 ? `Batch of ${lines.length}…` : "Testing…");
     try {
       let data;
       if (lines.length === 1) {
@@ -763,7 +780,7 @@
       const hits = (data.results || []).filter((r) => (r.total_balance_sats || 0) > 0);
       setMsg(
         "keyMsg",
-        `${data.candidates || data.count || 0} candidats · ${hits.length} hit(s)`,
+        `${data.candidates || data.count || 0} candidates · ${hits.length} hit(s)`,
         hits.length ? "success" : ""
       );
       if (hits.length) {
@@ -780,7 +797,7 @@
 
   $("btnSaveHits")?.addEventListener("click", () => {
     const n = addFound(lastHits);
-    toast(n ? `${n} clé(s) ajoutée(s) au coffre` : "Rien de nouveau à sauver", n ? "success" : "");
+    toast(n ? `${n} key(s) added to vault` : "Nothing new to save", n ? "success" : "");
     renderFound();
   });
   $("btnExportFound")?.addEventListener("click", () => {
@@ -791,7 +808,7 @@
     a.click();
   });
   $("btnClearFound")?.addEventListener("click", () => {
-    if (confirm("Vider le coffre local ?")) {
+    if (confirm("Empty the local vault?")) {
       saveFound([]);
       renderFound();
     }
@@ -806,7 +823,7 @@
       for (const c of r.corpora || []) {
         const o = document.createElement("option");
         o.value = c.path;
-        o.textContent = `${c.name} (${c.size_mb} Mo)`;
+        o.textContent = `${c.name} (${c.size_mb} MB)`;
         sel.appendChild(o);
       }
     } catch (_) {}
@@ -861,8 +878,8 @@
           <div class="result-balance">${m.value_btc} BTC</div>
           <div class="method-tag">${esc(m.method)}</div>
           <div class="value">${esc(m.phrase)}</div>
-          ${rowCopy("adresse", m.address, "addr")}
-          ${m.pubkey_hex ? rowCopy("clé publique", m.pubkey_hex, "pub") : ""}
+          ${rowCopy("address", m.address, "addr")}
+          ${m.pubkey_hex ? rowCopy("public key", m.pubkey_hex, "pub") : ""}
           ${rowCopy("priv hex", m.privkey_hex, "priv")}
         </div>`
         )
@@ -923,8 +940,8 @@
       count = (1 << n) - 1;
     }
     count *= joins;
-    const warn = count > 100000 ? " ⚠ volumineux" : count > 10000 ? " · moyen" : " · léger";
-    el.textContent = `~${count.toLocaleString("fr-FR")} phrases base (n=${n} mots)${warn} + hashes`;
+    const warn = count > 100000 ? " ⚠ large" : count > 10000 ? " · medium" : " · light";
+    el.textContent = `~${count.toLocaleString("en-US")} base phrases (n=${n} words)${warn} + hashes`;
   }
 
   /** Estimation affixes tous-caractères (94 ASCII) par phrase de base. */
@@ -934,7 +951,7 @@
     const pre = Math.min(2, Math.max(0, parseInt($("dCharPrefixLen")?.value || "0", 10) || 0));
     const suf = Math.min(2, Math.max(0, parseInt($("dCharSuffixLen")?.value || "0", 10) || 0));
     if (pre === 0 && suf === 0) {
-      el.textContent = "affixes : off";
+      el.textContent = "affixes: off";
       return;
     }
     const C = 94;
@@ -943,11 +960,11 @@
     const perBase = nPre * nSuf;
     const note =
       perBase > 5e6
-        ? " · très long (streaming, pas de plafond)"
+        ? " · very long (streaming, no ceiling)"
         : perBase > 50000
-          ? " · long (boucles streaming)"
+          ? " · long (streaming loops)"
           : " · ok";
-    el.textContent = `affixes : ~${perBase.toLocaleString("fr-FR")} × bases × hashes / phrase (pref ${pre} × suf ${suf})${note}`;
+    el.textContent = `affixes: ~${perBase.toLocaleString("en-US")} × bases × hashes / phrase (pref ${pre} × suf ${suf})${note}`;
   }
 
   ["dictPhrases", "dPerms", "dCombos", "dJoinSpace", "dJoinNoSpace", "dictMaxWords"].forEach(
@@ -963,7 +980,7 @@
   estimateAffix();
 
   $("dictForm")?.addEventListener("submit", async (e) => {
-    e.preventDefault();
+    e.preventFromfault();
     const body = {
       phrases: $("dictPhrases")?.value || "",
       corpus_path: $("dictCorpus")?.value || null,
@@ -995,11 +1012,11 @@
         bip39_address_count: 1,
       },
     };
-    setMsg("dictMsg", "Démarrage…");
+    setMsg("dictMsg", "Starting…");
     try {
       await api("/api/dict/start", { method: "POST", body: JSON.stringify(body) });
-      setMsg("dictMsg", "Scan lancé", "success");
-      toast("Scan dictionnaire démarré", "success");
+      setMsg("dictMsg", "Scan started", "success");
+      toast("Dictionary scan started", "success");
     } catch (err) {
       setMsg("dictMsg", err.message, "error");
       toast(err.message, "error");
@@ -1007,7 +1024,7 @@
   });
   $("btnDictStop")?.addEventListener("click", async () => {
     await api("/api/dict/stop", { method: "POST", body: "{}" });
-    setMsg("dictMsg", "Arrêt demandé");
+    setMsg("dictMsg", "Stop requested");
   });
 
   // ── Status / Core ───────────────────────────────────────────────────────
@@ -1049,11 +1066,11 @@
     const totalRate = gpuTotal + cpuTotal;
     const totalTested = Math.max(dictData.keys_tested || 0, scanData.keys_tested || 0);
 
-    // Pill: simple ON/OFF
+    // Scan toggle button: ON/OFF
     if (anyScanOn || totalRate > 0) {
-      setPill("pillScan", "Scan ON", "ok", `${formatCompact(totalRate)}/s · ${formatNumber(totalTested)} testées`);
+      setScanPill("on", "SCAN ON", `${formatCompact(totalRate)}/s · ${formatNumber(totalTested)} tested`);
     } else {
-      setPill("pillScan", "Scan OFF", "warn", "Scan de fond arrêté");
+      setScanPill("off", "SCAN OFF", "Background scan stopped");
     }
 
     // Update "Scan en cours" tile with GPU/CPU breakdown
@@ -1061,7 +1078,7 @@
       $("infoScanRate").textContent = totalRate > 0 ? `${formatCompact(totalRate)} /s` : "— /s";
     }
     if ($("infoScanTested")) {
-      $("infoScanTested").textContent = totalTested > 0 ? `testées: ${formatNumber(totalTested)}` : "testées: —";
+      $("infoScanTested").textContent = totalTested > 0 ? `tested: ${formatNumber(totalTested)}` : "tested: —";
     }
     if ($("infoScanMode")) {
       const modeLabel = [];
@@ -1076,9 +1093,24 @@
       $("scanRateDetail").textContent = detailParts.length ? detailParts.join(" · ") : "—";
     }
 
-    if (synced) setPill("pillSync", "Chaîne OK", "ok", "Chaîne à jour");
-    else if (running) setPill("pillSync", "Chaîne sync", "warn", s?.simple_status || "Sync en cours");
-    else setPill("pillSync", "Chaîne off", "warn", "Core arrêté");
+    // Error display in scan tile
+    if ($("infoScanError")) {
+      const scanErr = scanData.error || scanData.message;
+      const dictErr = dictData.error || dictData.message;
+      const errMsg = scanErr || dictErr || "";
+      $("infoScanError").textContent = errMsg;
+    }
+
+    // GPU/CPU detail line in the scan tile (compact)
+    if ($("infoScanDetail")) {
+      const tileParts = [...gpuParts];
+      if (cpuTotal > 0) tileParts.push(`CPU: ${formatCompact(cpuTotal)}/s`);
+      $("infoScanDetail").textContent = tileParts.length ? tileParts.join(" · ") : "";
+    }
+
+    if (synced) setPill("pillSync", "Chain OK", "ok", "Chain up to date");
+    else if (running) setPill("pillSync", "Chain syncing", "warn", s?.simple_status || "Sync in progress");
+    else setPill("pillSync", "Chain off", "warn", "Core stopped");
 
     if (indexOk) {
       const n = health.index_scripts || 0;
@@ -1086,13 +1118,13 @@
         "pillReady",
         `Idx ${formatCompact(n)}`,
         "ok",
-        `Index chargé · ${formatNumber(n)} scripts`
+        `Index loaded · ${formatNumber(n)} scripts`
       );
     } else {
-      setPill("pillReady", "Idx …", "warn", "Index en chargement");
+      setPill("pillReady", "Idx …", "warn", "Index loading");
     }
 
-    const msg = s?.simple_status || s?.message || "Tester des mots = onglet 1";
+    const msg = s?.simple_status || s?.message || "Test words = tab 1";
     setText("statusBarMsg", msg);
     if ($("statusBarMsg")) $("statusBarMsg").title = msg;
 
@@ -1210,21 +1242,21 @@
         const lagB =
           tip != null && lag.idxH != null ? Math.max(0, tip - lag.idxH) : null;
         parts.push(
-          `index UTXO bloc ${formatHeight(lag.idxH)} / Core tip ${formatHeight(tip)}` +
-            (lagB != null ? ` (retard ${formatHeight(lagB)} blocs${formatLagTime(lagB)})` : "")
+          `UTXO index block ${formatHeight(lag.idxH)} / Core tip ${formatHeight(tip)}` +
+            (lagB != null ? ` (lag ${formatHeight(lagB)} blocks${formatLagTime(lagB)})` : "")
         );
       } else if (lag.idxH != null) {
         parts.push(
-          `index UTXO: bloc ${formatHeight(lag.idxH)}${
+          `UTXO index: block ${formatHeight(lag.idxH)}${
             snap?.block_time_utc ? " · " + snap.block_time_utc : ""
           }`
         );
       } else {
-        parts.push("index UTXO: hauteur inconnue");
+        parts.push("UTXO index: unknown height");
       }
       if (coreBlocks != null) {
         parts.push(
-          `Core: ${formatHeight(coreBlocks)} blocs` +
+          `Core: ${formatHeight(coreBlocks)} blocks` +
             (coreHeaders != null ? ` / ${formatHeight(coreHeaders)} headers` : "") +
             (btc?.initialblockdownload ? " · reindex/IBD" : "")
         );
@@ -1238,12 +1270,12 @@
             : `${lag.hours.toFixed(1)} h`;
         parts.push(
           validForTests
-            ? `retard ≈ ${hLabel} (< ${UTXO_VALID_HOURS}h → tests OK)`
-            : `retard ≈ ${hLabel} (> ${UTXO_VALID_HOURS}h → tests non fiables)`
+            ? `lag ≈ ${hLabel} (< ${UTXO_VALID_HOURS}h → tests OK)`
+            : `lag ≈ ${hLabel} (> ${UTXO_VALID_HOURS}h → tests unreliable)`
         );
       }
       if (lag.blockLag != null && lag.blockLag > 0) {
-        parts.push(`${formatHeight(lag.blockLag)} blocs derrière le tip${formatLagTime(lag.blockLag)}`);
+        parts.push(`${formatHeight(lag.blockLag)} blocks behind tip${formatLagTime(lag.blockLag)}`);
       }
       meta.textContent = parts.join("  ·  ");
     }
@@ -1257,8 +1289,8 @@
       warn.classList.remove("tip-stale");
       if (strong) {
         strong.textContent = atExactTip
-          ? "✓ UTXO au tip — soldes fiables pour les tests"
-          : `✓ UTXO valable pour les tests (< ${UTXO_VALID_HOURS} h du tip)`;
+          ? "✓ UTXO at tip — balances reliable for tests"
+          : `✓ UTXO valid for tests (< ${UTXO_VALID_HOURS} h of tip)`;
       }
       if (body) {
         const hLabel =
@@ -1275,11 +1307,11 @@
               ? formatHeight(lag.tipH)
               : "—";
         body.innerHTML =
-          `Index UTXO au bloc <strong>${idxL}</strong> · tip Core <strong>${tipL}</strong>. ` +
-          `L’index est à <strong>moins de ${UTXO_VALID_HOURS} h</strong> du tip estimé ` +
-          `(retard ≈ <strong>${hLabel}</strong>). ` +
-          `Tu peux t’en servir pour tester des clés / brainwallets. ` +
-          `Vérifie quand même on-chain avant toute dépense.`;
+          `UTXO index at block <strong>${idxL}</strong> · tip Core <strong>${tipL}</strong>. ` +
+          `The index is <strong>less than ${UTXO_VALID_HOURS} h</strong> of estimated tip ` +
+          `(lag ≈ <strong>${hLabel}</strong>). ` +
+          `You can use it to test keys / brainwallets. ` +
+          `Verify on-chain before any spending.`;
       }
       // UTXO pill: green when valid
       if ($("pillUtxo") && lag.idxH != null) {
@@ -1290,7 +1322,7 @@
             ? `UTXO ${formatHeight(lag.idxH)} / ${formatHeight(tipN)}`
             : `UTXO ${formatHeight(lag.idxH)}`,
           "ok",
-          `Index bloc ${formatHeight(lag.idxH)} · Core ${formatHeight(tipN)} · valable tests (<${UTXO_VALID_HOURS}h)`
+          `Index block ${formatHeight(lag.idxH)} · Core ${formatHeight(tipN)} · valid for tests (<${UTXO_VALID_HOURS}h)`
         );
       }
     } else {
@@ -1309,14 +1341,14 @@
 
       if (strong) {
         if (!coreRunning) {
-          strong.textContent = "⚠ Bitcoin Core arrêté — redémarrage automatique…";
+          strong.textContent = "⚠ Bitcoin Core stopped — auto-restarting…";
         } else if (
           coreIbd ||
           (coreBlocksStale != null &&
             coreHeadersStale != null &&
             coreBlocksStale < coreHeadersStale - 3)
         ) {
-          strong.textContent = "⏳ Core synchronise la chaîne — UTXO tip en attente (normal)";
+          strong.textContent = "⏳ Core syncing chain — UTXO tip pending (normal)";
         } else {
           const idxS = lag.idxH != null ? formatHeight(lag.idxH) : "?";
           const tipS =
@@ -1325,12 +1357,12 @@
               : lag.tipH != null
                 ? formatHeight(lag.tipH)
                 : "?";
-          strong.textContent = `⚠ UTXO bloc ${idxS} / Core ${tipS} — trop vieux pour des soldes fiables`;
+          strong.textContent = `⚠ UTXO block ${idxS} / Core ${tipS} — too stale for reliable balances`;
         }
       }
       if (body) {
         const hLabel =
-          lag.hours != null ? `${lag.hours.toFixed(1)} h` : "inconnu";
+          lag.hours != null ? `${lag.hours.toFixed(1)} h` : "unknown";
         const idxFull = lag.idxH != null ? formatHeight(lag.idxH) : "—";
         const tipFull =
           coreBlocksStale != null
@@ -1352,8 +1384,8 @@
         let html = "";
         if (!coreRunning) {
           html =
-            "Le watchdog <code>Keep-Core-And-Utxo</code> doit relancer bitcoind sous peu. " +
-            "S’il reste arrêté : lance <code>Install-AlwaysOn.bat</code> ou <code>Launch-BitcoinCore.ps1</code>.";
+            "The watchdog <code>Keep-Core-And-Utxo</code> will restart bitcoind shortly. " +
+            "If it stays stopped: run <code>Install-AlwaysOn.bat</code> or <code>Launch-BitcoinCore.ps1</code>.";
         } else if (
           coreIbd ||
           (coreBlocksStale != null &&
@@ -1361,24 +1393,24 @@
             coreBlocksStale < coreHeadersStale - 3)
         ) {
           html =
-            `<strong>Bitcoin Core fonctionne</strong> et rattrape le tip : ` +
-            `<strong>${formatHeight(coreBlocksStale)}</strong> / <strong>${formatHeight(coreHeadersStale)}</strong> blocs` +
+            `<strong>Bitcoin Core is running</strong> and catching up to tip: ` +
+            `<strong>${formatHeight(coreBlocksStale)}</strong> / <strong>${formatHeight(coreHeadersStale)}</strong> blocks` +
             (pct != null ? ` · ~${pct.toFixed(2)} %` : "") +
             `. ` +
-            `Index UTXO actuel : bloc <strong>${idxFull}</strong>. ` +
-            `L’index UTXO offline ne peut être régénéré au tip <em>que</em> quand Core a fini (IBD = non). ` +
-            `Auto-refresh : tâche <code>BTCSolver-Core-Utxo</code> (dumptxoutset dès le tip). ` +
-            `<br>En attendant : tests = <em>candidats seulement</em> (retard UTXO ≈ <strong>${hLabel}</strong>). ` +
-            `<strong>Ne coupe pas bitcoind.</strong>`;
+            `Current UTXO index: block <strong>${idxFull}</strong>. ` +
+            `The offline UTXO index can be regenerated at tip <em>only</em> when Core has finished (IBD = false). ` +
+            `Auto-refresh: task <code>BTCSolver-Core-Utxo</code> (dumptxoutset at tip). ` +
+            `<br>In the meantime: tests = <em>candidates only</em> (lag UTXO ≈ <strong>${hLabel}</strong>). ` +
+            `<strong>Do not stop bitcoind.</strong>`;
         } else {
           html =
-            `Index UTXO au bloc <strong>${idxFull}</strong> · tip Bitcoin Core <strong>${tipFull}</strong>` +
-            ` · retard <strong>${lagFull}</strong> blocs (≈ <strong>${hLabel}</strong>).<br>` +
-            `Règle : index UTXO <strong>valable pour les tests</strong> seulement s’il a ` +
-            `<strong>&lt; ${UTXO_VALID_HOURS} h</strong> de retard sur le tip. ` +
-            `Actuellement retard ≈ <strong>${hLabel}</strong>. ` +
-            `Les hits restent des <em>candidats</em>. ` +
-            `<br>Refresh auto au tip via <code>Keep-Core-And-Utxo.ps1</code>.`;
+            `UTXO index at block <strong>${idxFull}</strong> · tip Bitcoin Core <strong>${tipFull}</strong>` +
+            ` · lag <strong>${lagFull}</strong> blocks (≈ <strong>${hLabel}</strong>).<br>` +
+            `Rule: UTXO index <strong>valid for tests</strong> only if it has ` +
+            `<strong>&lt; ${UTXO_VALID_HOURS} h</strong> lag behind tip. ` +
+            `Current lag ≈ <strong>${hLabel}</strong>. ` +
+            `Hits remain <em>candidates</em>. ` +
+            `<br>Auto-refresh at tip via <code>Keep-Core-And-Utxo.ps1</code>.`;
         }
         body.innerHTML = html;
       }
@@ -1393,7 +1425,7 @@
       $("btcBadge").className = "status-badge " + (running ? "running" : "stopped");
       setText(
         "btcBadgeText",
-        running && rpc ? "En ligne" : running ? "Process" : "Arrêté"
+        running && rpc ? "Online" : running ? "Process" : "Stopped"
       );
     }
     // Hauteurs Core en entier exact (pas de K)
@@ -1403,7 +1435,7 @@
     setText("btcPeers", s.connections != null ? s.connections : "—");
     setText(
       "btcIbd",
-      s.initialblockdownload == null ? "—" : s.initialblockdownload ? "oui" : "non"
+      s.initialblockdownload == null ? "—" : s.initialblockdownload ? "yes" : "no"
     );
     setText("btcMsgLine", s.simple_status || s.message || "—");
     setText("btcDatadir", s.datadir || "W:\\Bitcoin");
@@ -1517,8 +1549,8 @@
     const text = $("hitFlashText");
     if (text) {
       text.textContent = isFirst
-        ? `HIT — ${count} clé trouvée !`
-        : `NOUVEAU HIT — ${count} clé(s) au total`;
+        ? `HIT — ${count} key found!`
+        : `NEW HIT — ${count} key(s) total`;
     }
     if (overlay) {
       overlay.classList.remove("is-on");
@@ -1548,8 +1580,8 @@
 
     toast(
       isFirst
-        ? `⚡ HIT ! ${count} clé avec activité/solde`
-        : `⚡ Nouveau hit — total ${count}`,
+        ? `⚡ HIT ! ${count} key with activity/balance`
+        : `⚡ New hit — total ${count}`,
       "success"
     );
 
@@ -1572,7 +1604,7 @@
   function updateHitsDisplay(n, archive) {
     const hits = Number(n) || 0;
     const archCount = archive?.count != null ? Number(archive.count) : hits;
-    // Priorité : clés avec solde ; sinon count archive (activité)
+    // Priorité : keys avec solde ; sino count archive (activité)
     const withBalNow =
       archive?.with_balance != null
         ? Number(archive.with_balance)
@@ -1597,8 +1629,8 @@
     if ($("infoHitsSub")) {
       $("infoHitsSub").textContent =
         archCount > 0
-          ? `${withBal} solde · ${actOnly} activité sans solde · archive data/keys-archive.json`
-          : "aucune clé avec activité on-chain pour l’instant";
+          ? `${withBal} balance · ${actOnly} activity without balance · archive data/keys-archive.json`
+          : "no key with on-chain activity yet";
     }
     const tile = document.querySelector(".hit-tile");
     if (tile) tile.classList.toggle("has-hits", archCount > 0);
@@ -1607,15 +1639,15 @@
       `Hits ${formatCompact(archCount)}`,
       archCount > 0 ? "ok" : "",
       archCount > 0
-        ? `${formatNumber(archCount)} clé(s) actives (solde ou historique) — data/keys-archive.json`
-        : "Aucune clé avec activité on-chain"
+        ? `${formatNumber(archCount)} active key(s) (balance or history) — data/keys-archive.json`
+        : "No key with on-chain activity"
     );
   }
 
   /**
    * Badges Core / UTXO dans la tuile index :
-   * - Core : vert si bitcoind roule + tip frais; jaune si > 1 h de retard; rouge si arrêté
-   * - UTXO : vert si retard < 24 h ; jaune si ≥ 24 h mais rebuild en cours ;
+   * - Core : vert si bitcoind roule + tip frais; jaune si > 1 h de lag; rouge si stopé
+   * - UTXO : vert si lag < 24 h ; jaune si ≥ 24 h mais rebuild en cours ;
    *          rouge si ≥ 24 h et PAS de rebuild
    */
   function applyUtxoStatusBadges({
@@ -1645,8 +1677,8 @@
         setBadge(
           badgeCore,
           "is-yellow",
-          coreTip != null ? `Core lent · ${formatHeight(coreTip)}` : "Core lent",
-          `Tip Core il y a ${lagH} h (dernier bloc > 1 h)`
+          coreTip != null ? `Core slow · ${formatHeight(coreTip)}` : "Core slow",
+          `Core tip from ${lagH} h ago (last block > 1h)`
         );
       } else {
         setBadge(
@@ -1654,8 +1686,8 @@
           "is-green",
           coreTip != null ? `Core ON · ${formatHeight(coreTip)}` : "Core ON",
           coreTip != null
-            ? `Bitcoin Core en marche · tip bloc ${coreTip}`
-            : "Bitcoin Core en marche"
+            ? `Bitcoin Core running · tip block ${coreTip}`
+            : "Bitcoin Core running"
         );
       }
     } else if (coreRunning === false) {
@@ -1663,17 +1695,17 @@
         badgeCore,
         "is-red",
         "Core OFF",
-        "Bitcoin Core arrêté — soldes/tip non fiables"
+        "Bitcoin Core stopped — balances/tip not reliable"
       );
     } else {
-      setBadge(badgeCore, "is-muted", "Core · ?", "État Core inconnu");
+      setBadge(badgeCore, "is-muted", "Core · ?", "Core status unknown");
     }
 
     // --- UTXO ---
-    // Priorité : rebuild en cours = jaune (même si très en retard)
+    // Priorité : rebuild en cours = jaune (même si très en lag)
     let utxoCls = "is-muted";
     let utxoTxt = "UTXO · ?";
-    let utxoTitle = "Fraîcheur UTXO inconnue";
+    let utxoTitle = "UTXO freshness unknown";
     if (rebuildInProgress) {
       utxoCls = "is-yellow";
       utxoTxt =
@@ -1681,7 +1713,7 @@
           ? `UTXO rebuild… · ${formatHeight(idxH)}`
           : "UTXO rebuild…";
       utxoTitle =
-        "Recréation de l’index en cours (dumptxoutset / dump_to_flat) — pas encore rouge";
+        "Index rebuild in progress (dumptxoutset / dump_to_flat) — not yet red";
     } else if (lagHours != null && Number.isFinite(lagHours)) {
       if (lagHours < UTXO_VALID_HOURS) {
         utxoCls = "is-green";
@@ -1689,34 +1721,34 @@
           idxH != null
             ? `UTXO OK · ${formatHeight(idxH)}`
             : "UTXO OK (< 24 h)";
-        utxoTitle = `Index à jour (< ${UTXO_VALID_HOURS} h du tip) · retard ≈ ${lagHours.toFixed(1)} h`;
+        utxoTitle = `Index up to date (< ${UTXO_VALID_HOURS} h of tip) · lag ≈ ${lagHours.toFixed(1)} h`;
       } else {
-        // ≥ 24 h et pas de rebuild → rouge
+        // ≥ 24 h et no rebuild → rouge
         utxoCls = "is-red";
         utxoTxt =
           idxH != null
-            ? `UTXO vieux · ${formatHeight(idxH)}`
-            : "UTXO vieux (≥ 24 h)";
+            ? `UTXO stale · ${formatHeight(idxH)}`
+            : "UTXO stale (≥ 24 h)";
         utxoTitle =
-          `Retard ≈ ${lagHours.toFixed(1)} h (≥ ${UTXO_VALID_HOURS} h) et aucune recréation en cours` +
-          (blockLag != null ? ` · ${formatHeight(blockLag)} blocs${formatLagTime(blockLag)}` : "");
+          `Lag ≈ ${lagHours.toFixed(1)} h (≥ ${UTXO_VALID_HOURS} h) and no rebuild in progress` +
+          (blockLag != null ? ` · ${formatHeight(blockLag)} blocks${formatLagTime(blockLag)}` : "");
       }
     } else if (blockLag != null) {
-      // fallback sans heures : ~144 blocs ≈ 24 h
+      // fallback sans heures : ~144 blocks ≈ 24 h
       if (blockLag < 144) {
         utxoCls = "is-green";
         utxoTxt =
           idxH != null
             ? `UTXO OK · ${formatHeight(idxH)}`
             : "UTXO OK";
-        utxoTitle = `Retard ${formatHeight(blockLag)} blocs${formatLagTime(blockLag)} (< ~24 h)`;
+        utxoTitle = `Lag ${formatHeight(blockLag)} blocks${formatLagTime(blockLag)} (< ~24 h)`;
       } else {
         utxoCls = "is-red";
         utxoTxt =
           idxH != null
-            ? `UTXO vieux · ${formatHeight(idxH)}`
-            : "UTXO vieux";
-        utxoTitle = `Retard ${formatHeight(blockLag)} blocs${formatLagTime(blockLag)} (≥ ~24 h), pas de rebuild`;
+            ? `UTXO stale · ${formatHeight(idxH)}`
+            : "UTXO stale";
+        utxoTitle = `Lag ${formatHeight(blockLag)} blocks${formatLagTime(blockLag)} (≥ ~24 h), no rebuild`;
       }
     }
 
@@ -1817,7 +1849,7 @@
     const blockLag =
       height != null && coreTip != null ? Math.max(0, coreTip - height) : null;
 
-    // Retard en heures (pipeline always-on ou estimation)
+    // Lag en heures (pipeline always-on ou estimation)
     let lagHours =
       alwaysOn?.utxo_lag_hours != null && Number.isFinite(Number(alwaysOn.utxo_lag_hours))
         ? Number(alwaysOn.utxo_lag_hours)
@@ -1849,7 +1881,7 @@
     const built =
       snap.built_at ||
       snap.file_modified_utc ||
-      (snap.age_hours != null ? `fichier ~${Number(snap.age_hours).toFixed(1)} h` : null);
+      (snap.age_hours != null ? `file ~${Number(snap.age_hours).toFixed(1)} h` : null);
     const hash = snap.base_block_hash || null;
     const scripts = snap.num_scripts ?? health?.index_scripts ?? snap.index_scripts;
     const utxos = snap.num_utxos;
@@ -1862,31 +1894,31 @@
       );
       if ($("infoUtxoBlock")) {
         $("infoUtxoBlock").title =
-          `Index UTXO = bloc ${height} · Bitcoin Core tip = bloc ${coreTip}` +
-          (blockLag != null ? ` · retard ${formatHeight(blockLag)} blocs${formatLagTime(blockLag)}` : "");
+          `UTXO index = block ${height} · Bitcoin Core tip = block ${coreTip}` +
+          (blockLag != null ? ` · lag ${formatHeight(blockLag)} blocks${formatLagTime(blockLag)}` : "");
       }
       setText(
         "infoUtxoVsCore",
         `index ${formatHeight(height)} · Core tip ${formatHeight(coreTip)}` +
           (blockLag != null && blockLag > 0
-            ? ` · retard ${formatHeight(blockLag)} blocs${formatLagTime(blockLag)}`
+            ? ` · lag ${formatHeight(blockLag)} blocks${formatLagTime(blockLag)}`
             : blockLag === 0
-              ? " · au tip"
+              ? " · at tip"
               : "")
       );
     } else if (height != null) {
-      setText("infoUtxoBlock", `bloc ${formatHeight(height)}`);
+      setText("infoUtxoBlock", `block ${formatHeight(height)}`);
       if ($("infoUtxoBlock")) {
-        $("infoUtxoBlock").title = `Index UTXO = bloc ${height} (tip Core inconnu)`;
+        $("infoUtxoBlock").title = `UTXO index = block ${height} (tip Core unknown)`;
       }
-      setText("infoUtxoVsCore", "Core tip: (inconnu — Core offline ?)");
+      setText("infoUtxoVsCore", "Core tip: (unknown — Core offline ?)");
     } else {
-      setText("infoUtxoBlock", "bloc —");
+      setText("infoUtxoBlock", "block —");
       setText("infoUtxoVsCore", "Core tip: —");
     }
 
-    setText("infoUtxoDate", blockDate ? `date du bloc: ${blockDate}` : "date du bloc: (indisponible — Core pas au tip / reindex)");
-    setText("infoUtxoBuilt", built ? `index généré: ${formatUtcLabel(built)}` : "index généré: —");
+    setText("infoUtxoDate", blockDate ? `block date: ${blockDate}` : "block date: (unavailable — Core not at tip / reindex)");
+    setText("infoUtxoBuilt", built ? `index generated: ${formatUtcLabel(built)}` : "index generated: —");
     setText("infoUtxoHash", hash ? `hash: ${hash}` : "hash: —");
     if ($("infoUtxoHash") && hash) $("infoUtxoHash").title = hash;
 
@@ -1911,7 +1943,7 @@
       "utxoBlockLag",
       blockLag != null
         ? blockLag === 0
-          ? "0 (au tip)"
+          ? "0 (at tip)"
           : formatHeight(blockLag)
         : "—"
     );
@@ -1936,11 +1968,11 @@
           ? `UTXO ${formatHeight(height)}`
           : "UTXO …";
     const tip = [
-      height != null ? `index bloc ${height}` : null,
+      height != null ? `index block ${height}` : null,
       coreTip != null ? `Core tip ${coreTip}` : null,
-      blockLag != null ? `retard ${formatHeight(blockLag)} blocs${formatLagTime(blockLag)}` : null,
+      blockLag != null ? `lag ${formatHeight(blockLag)} blocks${formatLagTime(blockLag)}` : null,
       snap.block_time_utc || null,
-      ageH != null ? `âge fichier ${Number(ageH).toFixed(1)} h` : null,
+      ageH != null ? `file age ${Number(ageH).toFixed(1)} h` : null,
       snap.path || null,
     ]
       .filter(Boolean)
@@ -1954,7 +1986,11 @@
   }
 
   function updateScan(s, health) {
-    if (!s || s.error) return;
+    if (!s) return;
+    if (s.error) {
+      setScanPill("error", "SCAN FAILED", "Error: " + s.error, s.error);
+      return;
+    }
     const run = !!s.running;
     const arch = health?.keys_archive || window.__lastHealth?.keys_archive || null;
     const hits =
@@ -1999,41 +2035,11 @@
         el.dataset.lastMaj = "";
       }
     }
-    // Détail par carte GPU + CPU
-    if ($("scanRateDetail")) {
-      const parts = [];
-      if (Array.isArray(s.gpu_rates) && s.gpu_rates.length) {
-        for (const g of s.gpu_rates) {
-          parts.push(
-            `GPU${g.id}: ${formatNumber(g.keys_per_sec || 0)}/s (${formatNumber(g.keys_tested || 0)})`
-          );
-        }
-      }
-      if (s.cpu_threads || s.cpu_keys_per_sec || s.cpu_keys_tested) {
-        parts.push(
-          `CPU×${s.cpu_threads || "?"} : ${formatNumber(s.cpu_keys_per_sec || 0)}/s (${formatNumber(s.cpu_keys_tested || 0)})`
-        );
-      }
-      $("scanRateDetail").textContent = parts.length
-        ? parts.join(" · ")
-        : run
-          ? "vitesses par carte en attente…"
-          : "—";
-    }
     updateHitsDisplay(hits, arch);
     setText("gpuUtil", s.gpu_util != null ? Number(s.gpu_util).toFixed(0) + "%" : "—");
     setText("currentPosition", s.current_position || s.range_end || "—");
 
-    setText(
-      "infoScanRate",
-      live != null ? `${formatNumber(live)} /s` : "— /s"
-    );
-    setText(
-      "infoScanTested",
-      s.keys_tested != null ? `testées: ${formatNumber(s.keys_tested)}` : "testées: —"
-    );
-
-    // Hex COMPLET (pas de raccourci …) pour De / À / curseur
+    // Hex COMPLET (pas de raccourci …) pour From / To / curseur
     const rs = s.range_start || s.start_key || null;
     const re = s.window_end || s.range_end || null;
     const rsShow = rs || "—";
@@ -2061,40 +2067,40 @@
     if (s.ranges_done != null) {
       setText(
         "rangesDoneLabel",
-        `${formatNumber(s.ranges_done)} plage(s) journalisée(s)`
+        `${formatNumber(s.ranges_done)} range(s) logged`
       );
     }
     if ($("btnCopyRangeStart")) {
-      $("btnCopyRangeStart").style.display = rs ? "inline-block" : "none";
+      $("btnCopyRangeStart").style.display = rs ? "inline-block" : "noe";
       $("btnCopyRangeStart").onclick = () => {
-        if (rs) copyTextToClipboard(rs).then(() => toast("De copié", "success"));
+        if (rs) copyTextToClipboard(rs).then(() => toast("From copied", "success"));
       };
     }
     if ($("btnCopyRangeEnd")) {
-      $("btnCopyRangeEnd").style.display = re ? "inline-block" : "none";
+      $("btnCopyRangeEnd").style.display = re ? "inline-block" : "noe";
       $("btnCopyRangeEnd").onclick = () => {
-        if (re) copyTextToClipboard(re).then(() => toast("À copié", "success"));
+        if (re) copyTextToClipboard(re).then(() => toast("To copied", "success"));
       };
     }
 
     if ($("rangeSummary")) {
       $("rangeSummary").textContent =
         s.range_summary ||
-        (run ? "Scan en cours…" : "Scan arrêté — se relance auto si GPU libre (pas de scan listes)");
+        (run ? "Scan in progress…" : "Scan stopped — auto-restarts if GPU free (no list scan)");
     }
 
     const mode = (s.mode || "").toLowerCase();
     if ($("rangeStartLabel")) {
       $("rangeStartLabel").textContent =
         mode === "sequential"
-          ? "De (départ fenêtre — hex complet)"
-          : "De (min threads — hex complet)";
+          ? "From (window start — full hex)"
+          : "From (min threads — full hex)";
     }
     if ($("rangeEndLabel")) {
       $("rangeEndLabel").textContent =
         mode === "sequential"
-          ? "À (fin fenêtre — hex complet)"
-          : "À (max threads — hex complet)";
+          ? "To (window end — full hex)"
+          : "To (max threads — full hex)";
     }
 
     // Échantillon threads — hex complets
@@ -2111,32 +2117,28 @@
 
     if ($("scanModePill")) {
       if (!run) {
-        setPill("scanModePill", "ARRÊTÉ (auto GPU idle)", "warn");
+        setPill("scanModePill", "STOPPED (auto GPU idle)", "warn");
         setText(
           "rangeHint",
-          "Pas de process brute — redémarrage auto ~15 s si pas de scan listes GPU"
+          "No brute process — auto-restart ~15s if no GPU list scan"
         );
-        setText("infoScanMode", "mode: off");
       } else if (mode === "random") {
         setPill("scanModePill", "RANDOM · live", "warn");
         setText(
           "rangeHint",
-          "Random : De/À = min→max des dernières clés des threads (échantillons, pas une plage continue)"
+          "Random: From/To = min→max of last thread keys (samples, not a continuous range)"
         );
-        setText("infoScanMode", "mode: RANDOM");
       } else if (mode === "sequential") {
-        setPill("scanModePill", "SÉQUENTIEL · live", "ok");
+        setPill("scanModePill", "SEQUENTIAL · live", "ok");
         const step = s.range_step || 1073741824;
         setText(
           "rangeHint",
           rs && re
-            ? `Séquentiel : fenêtre De → À (${formatNumber(step)} clés / pas). Curseur live plus bas. Journal = pas de retest.`
-            : "Séquentiel : départ fenêtre → fin fenêtre (pas 2^30 par défaut)"
+            ? `Sequential: window From → To (${formatNumber(step)} keys/step). Live cursor below. Log = no retest.`
+            : "Sequential: window start → window end (step 2^30 default)"
         );
-        setText("infoScanMode", "mode: SÉQUENTIEL");
       } else {
-        setPill("scanModePill", "actif", "ok");
-        setText("infoScanMode", "mode: actif");
+        setPill("scanModePill", "active", "ok");
       }
     }
 
@@ -2174,14 +2176,13 @@
       const hwParts = [];
       if (gpuParts.length) hwParts.push(gpuParts.join(" + "));
       if (cpuRate > 0) hwParts.push(`CPU: ${formatCompact(cpuRate)}/s`);
-      setPill(
-        "pillScan",
-        rate != null ? `Scan ${formatCompact(rate)}/s` : "Scan ON",
-        "ok",
+      setScanPill(
+        "on",
+        rate != null ? `SCAN ${formatCompact(rate)}/s` : "SCAN ON",
         [
           ...hwParts,
           rate != null ? `${formatNumber(rate)} keys/s live` : null,
-          s.keys_tested != null ? `${formatNumber(s.keys_tested)} testées` : null,
+          s.keys_tested != null ? `${formatNumber(s.keys_tested)} tested` : null,
           majTip,
           rangeTip || null,
         ]
@@ -2189,7 +2190,7 @@
           .join(" · ")
       );
     } else {
-      setPill("pillScan", "Scan off", "warn", "Scan de fond arrêté");
+      setScanPill("off", "SCAN OFF", "Background scan stopped");
     }
   }
 
@@ -2207,8 +2208,8 @@
       window.__lastSnap = s;
       setText("snapPath", s.path || "—");
       setText("snapAge", s.age_hours != null ? s.age_hours.toFixed(1) + " h" : "—");
-      setText("snapSize", s.size_mb != null ? s.size_mb.toFixed(0) + " Mo" : "—");
-      setText("indexLoaded", s.index_loaded ? "oui" : "non");
+      setText("snapSize", s.size_mb != null ? s.size_mb.toFixed(0) + " MB" : "—");
+      setText("indexLoaded", s.index_loaded ? "yes" : "no");
       setText(
         "indexScripts",
         s.num_scripts != null
@@ -2267,15 +2268,15 @@
           "pillReady",
           `Idx ${formatCompact(h.index_scripts || 0)}`,
           "ok",
-          `Index chargé · ${formatNumber(h.index_scripts || 0)} scripts`
+          `Index loaded · ${formatNumber(h.index_scripts || 0)} scripts`
         );
       } else {
-        setPill("pillReady", "Idx …", "warn", "Index en chargement");
+        setPill("pillReady", "Idx …", "warn", "Index loading");
       }
     } catch (e) {
       console.error("refreshHealth", e);
       setText("footerHealth", "API: " + (e.name === "AbortError" ? "timeout" : e.message || e));
-      setPill("pillReady", "API …", "warn", e.message || "API indisponible");
+      setPill("pillReady", "API …", "warn", e.message || "API unavailable");
     }
   }
 
@@ -2299,13 +2300,13 @@
   }
 
   $("btnBtcRestart")?.addEventListener("click", () =>
-    btcAction("/api/bitcoind/restart", "Relance")
+    btcAction("/api/bitcoind/restart", "Restart")
   );
   $("btnBtcStart")?.addEventListener("click", () => btcAction("/api/bitcoind/start", "Start"));
   $("btnBtcStop")?.addEventListener("click", () => btcAction("/api/bitcoind/stop", "Stop"));
   $("btnBtcRefresh")?.addEventListener("click", refreshBtc);
   $("btnBarRestart")?.addEventListener("click", () =>
-    btcAction("/api/bitcoind/restart", "Relance")
+    btcAction("/api/bitcoind/restart", "Restart")
   );
   $("btnBarRefresh")?.addEventListener("click", () => {
     refreshBtc();
@@ -2316,7 +2317,7 @@
     try {
       const r = await api("/api/snapshot/reload", { method: "POST", body: "{}" });
       toast(
-        r.success ? `Index: ${formatNumber(r.index_scripts)} scripts` : "Échec index",
+        r.success ? `Index: ${formatNumber(r.index_scripts)} scripts` : "Index failed",
         r.success ? "success" : "error"
       );
       refreshHealth();
@@ -2327,17 +2328,17 @@
   });
   $("btnSnapReload")?.addEventListener("click", () => $("btnBarReloadIndex")?.click());
   $("btnSnapRefresh")?.addEventListener("click", async () => {
-    if (!confirm("Rebuild UTXO (très long) ?")) return;
+    if (!confirm("Rebuild UTXO (very long)?")) return;
     setMsg("snapMsg", "Rebuild…");
     try {
       await api("/api/snapshot/refresh", { method: "POST", body: "{}" });
-      setMsg("snapMsg", "OK — recharge l’index", "success");
+      setMsg("snapMsg", "OK — reloading index", "success");
     } catch (e) {
       setMsg("snapMsg", e.message, "error");
     }
   });
 
-  // Brute — CPU % des cœurs (défaut 50), configurable
+  // Brute — CPU % ofs cores (défaut 50), configurable
   function logicalCores() {
     return (
       window.__scanLogicalCores ||
@@ -2368,10 +2369,10 @@
     if ($("scanCpuThreadsHint")) {
       $("scanCpuThreadsHint").textContent =
         fixed > 0
-          ? `→ ${workers} workers forcés (threads fixes) · ${cores} cœurs détectés`
+          ? `→ ${workers} forced workers (fixed threads) · ${cores} cores detected`
           : p === 0
-            ? `→ 0 worker CPU (GPU only) · ${cores} cœurs`
-            : `→ ${workers} workers CPU (${p}% de ${cores} cœurs) — actif par défaut`;
+            ? `→ 0 CPU worker (GPU only) · ${cores} cores`
+            : `→ ${workers} CPU workers (${p}% of ${cores} cores) — active par défaut`;
     }
   }
   function updateRangeStepHint(step) {
@@ -2383,7 +2384,7 @@
     }
     const exp = Math.log2(n);
     const expStr = Number.isInteger(exp) ? `2^${exp}` : `≈2^${exp.toFixed(2)}`;
-    $("rangeStepHint").textContent = `= ${expStr} = ${formatNumber(n)} clés`;
+    $("rangeStepHint").textContent = `= ${expStr} = ${formatNumber(n)} keys`;
   }
 
   async function refreshRangesLog() {
@@ -2392,12 +2393,12 @@
       const ranges = Array.isArray(log.ranges) ? log.ranges : [];
       setText(
         "rangesDoneLabel",
-        `${formatNumber(ranges.length)} plage(s) journalisée(s)`
+        `${formatNumber(ranges.length)} range(s) logged`
       );
       if ($("rangesLogList")) {
         if (!ranges.length) {
           $("rangesLogList").textContent =
-            "Aucune plage terminée — le journal se remplit quand un À est atteint.";
+            "No range completed — log fills when a To is reached.";
         } else {
           // plus récentes en haut
           const lines = ranges
@@ -2406,7 +2407,7 @@
             .slice(0, 40)
             .map((r, i) => {
               const n = ranges.length - i;
-              return `#${n} De ${r.start}\n    À ${r.end}\n    ${formatNumber(r.keys || 0)} clés · ${r.completed_at || ""}`;
+              return `#${n} From ${r.start}\n    To ${r.end}\n    ${formatNumber(r.keys || 0)} keys · ${r.completed_at || ""}`;
             });
           $("rangesLogList").textContent = lines.join("\n\n");
         }
@@ -2419,7 +2420,7 @@
         $("rangeStartEdit").value = log.manual_start;
       }
       if (log.current?.start && $("rangeStartEdit") && !$("rangeStartEdit").dataset.dirty) {
-        // préfère fenêtre courante pour l'édition
+        // prefer current window for editing
         $("rangeStartEdit").value = log.current.start;
       }
     } catch (_) {}
@@ -2494,7 +2495,7 @@
   async function applyRangeStart(restart) {
     const start = $("rangeStartEdit")?.value?.trim();
     if (!start || start.length < 1) {
-      toast("Hex de départ requis", "error");
+      toast("Start hex required", "error");
       return;
     }
     try {
@@ -2510,8 +2511,8 @@
       if ($("startKey")) $("startKey").value = r.manual_start || start;
       toast(
         restart
-          ? "Départ appliqué — scan relancé"
-          : "Départ enregistré (prochain démarrage)",
+          ? "Start applied — scan restarted"
+          : "Start saved (next start)",
         "success"
       );
       refreshRangesLog();
@@ -2531,7 +2532,7 @@
         body: JSON.stringify({ action: "set_step", range_step }),
       });
       updateRangeStepHint(range_step);
-      toast(`Pas enregistré : ${formatNumber(range_step)} clés`, "success");
+      toast(`Step saved: ${formatNumber(range_step)} keys`, "success");
       persistScanConfig();
     } catch (e) {
       toast(e.message || String(e), "error");
@@ -2551,7 +2552,7 @@
   });
 
   $("scanForm")?.addEventListener("submit", async (e) => {
-    e.preventDefault();
+    e.preventFromfault();
     const transforms = selectedTransforms();
     renderActiveTransforms(transforms);
     const body = buildScanConfigBody();
@@ -2572,7 +2573,7 @@
         `PID ${r.pid} · CPU ${w} thr (${body.cpu_pct}%) · ${transforms.join(", ")}`,
         "success"
       );
-      toast(`Scan démarré · ${w} workers CPU`, "success");
+      toast(`Scan started · ${w} CPU workers`, "success");
     } catch (err) {
       setMsg("scanMsg", err.message, "error");
       toast(err.message, "error");
@@ -2580,8 +2581,78 @@
   });
   $("btnStop")?.addEventListener("click", async () => {
     await api("/api/scan/stop", { method: "POST", body: "{}" });
-    setMsg("scanMsg", "Arrêt demandé");
+    setMsg("scanMsg", "Stop requested");
   });
+
+  // Scan toggle button — click to start/stop the brute scan
+  let _scanTogglePending = false;
+  $("pillScan")?.addEventListener("click", async () => {
+    const btn = $("pillScan");
+    if (!btn || _scanTogglePending) return;
+    const currentState = btn.className || "";
+
+    if (currentState.includes("is-on")) {
+      // Currently ON → stop
+      _scanTogglePending = true;
+      btn.style.pointerEvents = "none";
+      try {
+        await api("/api/scan/stop", { method: "POST", body: "{}" });
+        setMsg("scanMsg", "Stop requested via toggle");
+        toast("Scan stopped", "");
+      } catch (err) {
+        setMsg("scanMsg", "Stop error: " + err.message, "error");
+        toast(err.message, "error");
+      } finally {
+        btn.style.pointerEvents = "";
+        _scanTogglePending = false;
+      }
+    } else {
+      // Currently OFF or ERROR → start
+      _scanTogglePending = true;
+      btn.style.pointerEvents = "none";
+      setScanPill("off", "STARTING…", "Starting scan…", "");
+      try {
+        const transforms = selectedTransforms();
+        renderActiveTransforms(transforms);
+        const body = buildScanConfigBody();
+        const r = await api("/api/scan/start", {
+          method: "POST",
+          body: JSON.stringify(body),
+        });
+        const cores = logicalCores();
+        const w =
+          body.threads > 0
+            ? body.threads
+            : body.cpu_pct === 0
+              ? 0
+              : Math.max(1, Math.floor((cores * body.cpu_pct) / 100));
+        setMsg(
+          "scanMsg",
+          `PID ${r.pid} · CPU ${w} thr (${body.cpu_pct}%) · ${transforms.join(", ")}`,
+          "success"
+        );
+        toast(`Scan started · ${w} CPU workers`, "success");
+        // Auto-clear error in scan tile
+        const errEl = $("infoScanError");
+        if (errEl) errEl.textContent = "";
+      } catch (err) {
+        setScanPill("error", "SCAN FAILED", "Error: " + err.message, err.message);
+        setMsg("scanMsg", "Failed to start: " + err.message, "error");
+        toast("Scan failed to start: " + err.message, "error");
+        // Auto-clear error state after 15s so user can retry
+        setTimeout(() => {
+          const btn2 = $("pillScan");
+          if (btn2 && btn2.className?.includes("is-error")) {
+            setScanPill("off", "SCAN OFF", "Click to start", "");
+          }
+        }, 15000);
+      } finally {
+        btn.style.pointerEvents = "";
+        _scanTogglePending = false;
+      }
+    }
+  });
+
   loadScanConfig();
 
   // Live transform preview when editing checkboxes (scan stopped)

@@ -4,13 +4,13 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>BTC Solver — Keys</title>
-  <link rel="stylesheet" href="/static/style.css?v=20260717explorer" />
+  <link rel="stylesheet" href="/static/style.css?v=20260717en" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
 </head>
 <body>
-  <!-- Flash plein écran quand un hit (clé avec solde/activité) apparaît -->
+  <!-- Full-screen flash when a hit (key with balance/activity) appears -->
   <div id="hitFlashOverlay" class="hit-flash-overlay" aria-hidden="true"></div>
   <div id="hitFlashBanner" class="hit-flash-banner" aria-live="assertive" role="alert">
     <span class="hit-flash-icon">⚡</span>
@@ -57,7 +57,7 @@
       </div>
     </div>
 
-    <!-- Bandeau clair: hits + UTXO source -->
+    <!-- Clear strip: hits + UTXO source -->
     <div class="info-strip" id="infoStrip">
       <div class="info-tile hit-tile">
         <span class="info-kicker">Keys with balance</span>
@@ -70,7 +70,7 @@
           <span class="status-badge" id="badgeCore" title="Bitcoin Core status">Core · …</span>
           <span class="status-badge" id="badgeUtxo" title="UTXO index freshness vs tip">UTXO · …</span>
         </div>
-        <span class="info-big mono" id="infoUtxoBlock" title="Exact UTXO index height (no K shortcut)">bloc —</span>
+        <span class="info-big mono" id="infoUtxoBlock" title="Exact UTXO index height (no K shortcut)">block —</span>
         <span class="info-sub mono" id="infoUtxoVsCore" title="UTXO index vs Bitcoin Core tip comparison">Core tip: —</span>
         <span class="info-sub mono" id="infoUtxoDate">block date: —</span>
         <span class="info-sub mono" id="infoUtxoBuilt">generated: —</span>
@@ -82,6 +82,7 @@
         <span class="info-sub mono" id="infoScanTested">tested: —</span>
         <span class="info-sub mono" id="infoScanMode">mode: —</span>
         <span class="info-sub mono" id="infoScanError" style="color: #f05252;"></span>
+        <span class="info-sub mono scan-detail" id="infoScanDetail" style="font-size:0.72rem;color:var(--text-dim)"></span>
       </div>
     </div>
 
@@ -156,8 +157,8 @@
                 <label title="Reverses word order (space-separated). Ex. &quot;hello world&quot; → &quot;world hello&quot;."><input type="checkbox" id="optRevWords" checked /> Reverse words</label>
                 <label title="Converts entire phrase to lowercase before hashing. Ex. &quot;Bitcoin&quot; → &quot;bitcoin&quot;."><input type="checkbox" id="optLower" checked /> Lowercase</label>
                 <label title="Converts entire phrase to UPPERCASE before hashing. Ex. &quot;bitcoin&quot; → &quot;BITCOIN&quot;."><input type="checkbox" id="optUpper" checked /> Uppercase</label>
-                <label title="Removes all spaces. Ex. &quot;hello world&quot; → &quot;helloworld&quot; puis hash."><input type="checkbox" id="optNoSpace" checked /> No spaces</label>
-                <label title="Removes punctuation and symbols (. , ; ! ? ' &quot; @ # $ % …). Keeps letters, digits and spaces. Ex. &quot;hi, world!&quot; → &quot;hi world&quot; et aussi &quot;hiworld&quot;."><input type="checkbox" id="optStripSym" checked /> No symbols (.,;!?…)</label>
+                <label title="Removes all spaces. Ex. &quot;hello world&quot; → &quot;helloworld&quot; then hash."><input type="checkbox" id="optNoSpace" checked /> No spaces</label>
+                <label title="Removes punctuation and symbols (. , ; ! ? ' &quot; @ # $ % …). Keeps letters, digits and spaces. Ex. &quot;hi, world!&quot; → &quot;hi world&quot; and also &quot;hiworld&quot;."><input type="checkbox" id="optStripSym" checked /> No symbols (.,;!?…)</label>
                 <label title="Adds suffixes to the phrase (lowercase) then hashes each variant. Suffixes tested: « bitcoin », « btc », « wallet », « private key », « key », « 123 », « 2024 », « 2025 », « 2026 ». Ex. &quot;satoshi&quot; → &quot;satoshi bitcoin&quot;, &quot;satoshi btc&quot;…"><input type="checkbox" id="optSuffix" checked /> Suffixes (bitcoin, key…)</label>
                 <label title="Adds prefixes to the phrase (lowercase) then hashes. Prefixes: « my », « the », « bitcoin », « my bitcoin », « wallet ». Ex. &quot;satoshi&quot; → &quot;my satoshi&quot;, &quot;the satoshi&quot;…"><input type="checkbox" id="optPrefix" checked /> Prefixes (my, the…)</label>
                 <label title="For a BIP39 seed: derives multiple standard BIP44 paths (legacy), BIP49 (P2SH-segwit), BIP84 (native segwit), BIP86 (taproot), not just the first path."><input type="checkbox" id="optBipAll" checked /> BIP39 multi-path (44/49/84/86)</label>
@@ -192,7 +193,7 @@
         <div class="grid two">
           <div class="card">
             <div class="card-header"><h2>Scan a list of phrases</h2></div>
-            <p class="hint">Repo corpus or paste your list. Each line → variantes + hashes → check UTXO.</p>
+            <p class="hint">Repo corpus or paste your list. Each line → variants + hashes → check UTXO.</p>
             <form id="dictForm" class="form">
               <div class="field">
                 <label for="dictCorpus">Ready list (project)</label>
@@ -207,21 +208,21 @@
                 <button type="button" class="btn btn-ghost btn-sm" id="btnDictFast">Quick</button>
               </div>
               <div class="checks method-tooltips">
-                <label title="SHA-256 hash of each phrase → clé privée. Ex. SHA256(&quot;satoshi&quot;)."><input type="checkbox" id="dSha256" checked /> SHA256</label>
-                <label title="Double SHA-256 : SHA256(SHA256(phrase)) → clé privée."><input type="checkbox" id="dDouble" checked /> SHA256d</label>
+                <label title="SHA-256 hash of each phrase → private key. Ex. SHA256(&quot;satoshi&quot;)."><input type="checkbox" id="dSha256" checked /> SHA256</label>
+                <label title="Double SHA-256: SHA256(SHA256(phrase)) → private key."><input type="checkbox" id="dDouble" checked /> SHA256d</label>
                 <label title="MD5(phrase) 16 bytes + 16 zero-padding → 32 bytes (key)."><input type="checkbox" id="dMd5" checked /> MD5</label>
                 <label title="Reverses characters. Ex. &quot;bitcoin&quot; → &quot;nioctib&quot;."><input type="checkbox" id="dRevC" checked /> Reverse chars</label>
                 <label title="Reverses word order. Ex. &quot;hello world&quot; → &quot;world hello&quot;."><input type="checkbox" id="dRevW" checked /> Reverse words</label>
                 <label title="Lowercase before hash. Ex. &quot;Bitcoin&quot; → &quot;bitcoin&quot;."><input type="checkbox" id="dLower" checked /> Lower</label>
-                <label title="Enlève . , ; ! ? ' &quot; @ # $ % … Keeps letters/digits/spaces. Ex. &quot;hi, world!&quot; → &quot;hi world&quot;."><input type="checkbox" id="dStripSym" checked /> Sans symboles (.,;!?…)</label>
-                <label title="Removes spaces. Ex. &quot;hello world&quot; → &quot;helloworld&quot;."><input type="checkbox" id="dNoSpace" /> Sans espaces</label>
+                <label title="Removes . , ; ! ? ' &quot; @ # $ % … Keeps letters/digits/spaces. Ex. &quot;hi, world!&quot; → &quot;hi world&quot;."><input type="checkbox" id="dStripSym" checked /> No symbols (.,;!?…)</label>
+                <label title="Removes spaces. Ex. &quot;hello world&quot; → &quot;helloworld&quot;."><input type="checkbox" id="dNoSpace" /> No spaces</label>
                 <label title="Adds suffixes then hashes. Suffixes: « bitcoin », « btc », « wallet », « private key », « key », « 123 », « 2024 », « 2025 », « 2026 ». Ex. &quot;satoshi&quot; → &quot;satoshi bitcoin&quot;, &quot;satoshi key&quot;…"><input type="checkbox" id="dSuffix" checked /> Suffixes</label>
-                <label title="Adds prefixes then hashes. Prefixes: « my », « the », « bitcoin », « my bitcoin », « wallet ». Ex. &quot;satoshi&quot; → &quot;my satoshi&quot;, &quot;the satoshi&quot;…"><input type="checkbox" id="dPrefix" checked /> Préfixes</label>
+                <label title="Adds prefixes then hashes. Prefixes: « my », « the », « bitcoin », « my bitcoin », « wallet ». Ex. &quot;satoshi&quot; → &quot;my satoshi&quot;, &quot;the satoshi&quot;…"><input type="checkbox" id="dPrefix" checked /> Prefixes</label>
                 <label title="Derivation + lookup on all CUDA cards. CPU threads at 0 = GPU only. Env: BTC_GPU_LAUNCH=8388608 (threads/kernel, max 32M)."><input type="checkbox" id="dUseGpu" checked /> GPU multi (CUDA)</label>
                 <label title="UTXO index in VRAM — on-device lookup (min CPU). Recommended for max GPU."><input type="checkbox" id="dGpuFull" checked /> FULL index in VRAM</label>
               </div>
               <div class="card-header" style="margin-top:0.75rem"><h3 style="font-size:0.95rem;margin:0">Prefix / suffix — all characters</h3></div>
-              <p class="hint">Charset ASCII <code>!&quot;#$…0-9A-Za-z…~</code> (94 chars). Ex. <code>Patate</code> + pref&amp;suf <strong>1</strong> → <code>!Patate!</code>, <code>!Patate?</code>… Longueur <strong>2</strong> = 94² prefixes in <strong>loop</strong> (no artificial limit) : the total is calculated, attempts are generated on-the-fly without storing everything in RAM.</p>
+              <p class="hint">Charset ASCII <code>!&quot;#$…0-9A-Za-z…~</code> (94 chars). Ex. <code>bitcoin</code> + pref&amp;suf <strong>1</strong> → <code>!bitcoin!</code>, <code>!bitcoin?</code>… Length <strong>2</strong> = 94² prefixes in <strong>loop</strong> (no artificial limit): the total is calculated, attempts are generated on-the-fly without storing everything in RAM.</p>
               <div class="field-row">
                 <div class="field">
                   <label for="dCharPrefixLen" title="Adds all strings of N characters from the charset before the phrase. 0 = disabled.">Prefix (all chars)</label>
@@ -235,8 +236,8 @@
                   <label for="dCharSuffixLen" title="Adds all strings of N characters from the charset after the phrase. 0 = disabled.">Suffix (all chars)</label>
                   <select id="dCharSuffixLen">
                     <option value="0" selected>off</option>
-                    <option value="1">1 caractère</option>
-                    <option value="2">2 caractères</option>
+                    <option value="1">1 character</option>
+                    <option value="2">2 characters</option>
                   </select>
                 </div>
               </div>
@@ -244,10 +245,10 @@
               <div class="card-header" style="margin-top:0.75rem"><h3 style="font-size:0.95rem;margin:0">Words → permutations / combinations</h3></div>
               <p class="hint">Tokens from your area (1 word/line or split phrases) form a bag. Ex. <code>alice bob</code> → orderings + subsets, with/without spaces, then hashes.</p>
               <div class="checks method-tooltips">
-                <label title="All possible word orderings (n!). Ex. alice bob → « alice bob » et « bob alice »."><input type="checkbox" id="dPerms" /> Permutations (all orderings)</label>
+                <label title="All possible word orderings (n!). Ex. alice bob → « alice bob » and « bob alice »."><input type="checkbox" id="dPerms" /> Permutations (all orderings)</label>
                 <label title="All non-empty subsets (2^n − 1). Ex. alice bob → alice ; bob ; alice bob."><input type="checkbox" id="dCombos" /> Combinations (all subsets)</label>
                 <label title="Joins words with a space. Ex. alice + bob → « alice bob »."><input type="checkbox" id="dJoinSpace" checked /> With spaces</label>
-                <label title="Joins words without spaces. Ex. alice + bob → « alicebob »."><input type="checkbox" id="dJoinNoSpace" checked /> Sans espaces</label>
+                <label title="Joins words without spaces. Ex. alice + bob → « alicebob »."><input type="checkbox" id="dJoinNoSpace" checked /> No spaces</label>
               </div>
               <div class="field-row">
                 <div class="field">
@@ -305,7 +306,7 @@
               <button type="button" class="btn btn-ghost btn-sm" id="btnClearFound">Clear vault</button>
             </div>
           </div>
-          <p class="hint">Stored in this browser (localStorage). Buttons: <strong class="txt-priv">Copy PRIV</strong> (red, <em>local only</em>) · <strong class="txt-addr">Copy ADDR</strong> (green) · <strong>Check balance ↗</strong> (ouvre <a href="https://www.blockchain.com/explorer/addresses/btc/" target="_blank" rel="noopener noreferrer">blockchain.com</a> with the <strong>public address only</strong>) · <strong>Copy PUB hex</strong>. <strong>Never paste a private key / WIF / seed into a website.</strong></p>
+          <p class="hint">Stored in this browser (localStorage). Buttons: <strong class="txt-priv">Copy PRIV</strong> (red, <em>local only</em>) · <strong class="txt-addr">Copy ADDR</strong> (green) · <strong>Check balance ↗</strong> (opens <a href="https://www.blockchain.com/explorer/addresses/btc/" target="_blank" rel="noopener noreferrer">blockchain.com</a> with the <strong>public address only</strong>) · <strong>Copy PUB hex</strong>. <strong>Never paste a private key / WIF / seed into a website.</strong></p>
           <div id="foundList" class="key-result">No keys saved yet.</div>
         </div>
       </section>
@@ -323,13 +324,13 @@
             <div class="range-block">
               <span class="range-label" id="rangeStartLabel">From (window start — full hex)</span>
               <code class="range-hex mono hex-full" id="rangeStart">—</code>
-              <button type="button" class="btn btn-ghost btn-sm btn-copy-inline" id="btnCopyRangeStart" style="display:none">Copier</button>
+              <button type="button" class="btn btn-ghost btn-sm btn-copy-inline" id="btnCopyRangeStart" style="display:none">Copy</button>
             </div>
             <div class="range-arrow" aria-hidden="true">→</div>
             <div class="range-block">
               <span class="range-label" id="rangeEndLabel">To (window end — full hex)</span>
               <code class="range-hex mono hex-full" id="rangeEnd">—</code>
-              <button type="button" class="btn btn-ghost btn-sm btn-copy-inline" id="btnCopyRangeEnd" style="display:none">Copier</button>
+              <button type="button" class="btn btn-ghost btn-sm btn-copy-inline" id="btnCopyRangeEnd" style="display:none">Copy</button>
             </div>
           </div>
           <div class="field" style="margin-top:0.75rem">
@@ -361,7 +362,7 @@
           <p class="hint mono" id="rangeHint">Sequential = window From→To (step 2^30) · live cursor below · log = no retest</p>
           <div class="stats-grid compact">
             <div class="stat"><span class="stat-label">k/s (live)</span><span class="stat-value mono" id="keysPerSec">—</span></div>
-            <div class="stat"><span class="stat-label">Testées</span><span class="stat-value mono" id="keysTested">—</span></div>
+            <div class="stat"><span class="stat-label">Tested</span><span class="stat-value mono" id="keysTested">—</span></div>
             <div class="stat"><span class="stat-label">Active keys (balance or history)</span><span class="stat-value mono highlight" id="matchesFound">0</span></div>
             <div class="stat"><span class="stat-label">GPU util</span><span class="stat-value mono" id="gpuUtil">—</span></div>
             <div class="stat"><span class="stat-label">Last speed update</span><span class="stat-value mono" id="statsUpdatedAt">—</span></div>
@@ -430,7 +431,7 @@
                   <label><input type="checkbox" id="tfRevBits" /> reverse bits</label>
                   <label><input type="checkbox" id="tfRotl8" /> rotate left 8 bits</label>
                   <label><input type="checkbox" id="tfRotr8" /> rotate right 8 bits</label>
-                  <label><input type="checkbox" id="tfSha256" /> SHA256(clé)</label>
+                  <label><input type="checkbox" id="tfSha256" /> SHA256(key)</label>
                   <label><input type="checkbox" id="tfDouble" /> double SHA256</label>
                 </div>
                 <p class="hint">Multiple checkboxes = N tests per key (slows down proportionally). Requires scan restart.</p>
@@ -556,6 +557,6 @@
     </footer>
   </div>
   <div id="toast" class="toast hidden"></div>
-  <script src="/static/app.js?v=20260717explorer"></script>
+  <script src="/static/app.js?v=20260717en"></script>
 </body>
 </html>
