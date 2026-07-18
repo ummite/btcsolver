@@ -9,9 +9,10 @@ use clap::Parser;
 use futures::{SinkExt, StreamExt};
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use std::io::BufRead;
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tower_http::services::ServeDir;
@@ -89,6 +90,86 @@ struct AppState {
     config: DashboardConfig,
     index: Arc<RwLock<Option<Arc<FlatIndex>>>>,
     dict: DictScanState,
+    corpus: CorpusScanState,
+    benchmark: BenchmarkState,
+    utxo_rebuild: UtxoRebuildState,
+}
+
+/// Background corpus scan state — tracks easy keys scan progress
+#[derive(Clone)]
+struct CorpusScanState {
+    running: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+    keys_tested: Arc<AtomicU64>,
+    keys_total: Arc<AtomicU64>,
+    matches_found: Arc<AtomicU64>,
+    status_text: Arc<Mutex<String>>,
+}
+
+impl CorpusScanState {
+    fn new() -> Self {
+        Self {
+            running: Arc::new(AtomicBool::new(false)),
+            stop: Arc::new(AtomicBool::new(false)),
+            keys_tested: Arc::new(AtomicU64::new(0)),
+            keys_total: Arc::new(AtomicU64::new(0)),
+            matches_found: Arc::new(AtomicU64::new(0)),
+            status_text: Arc::new(Mutex::new(String::new())),
+        }
+    }
+}
+
+/// Benchmark result for a single configuration
+#[derive(serde::Serialize, Clone)]
+struct BenchmarkEntry {
+    /// Label (e.g. "GPU×3 + CPU 8 threads")
+    label: String,
+    /// CPU threads used (0 = GPU only)
+    cpu_threads: usize,
+    /// GPU batch size in millions
+    gpu_batch_m: usize,
+    /// Keys per second achieved
+    keys_per_sec: u64,
+    /// Keys per second per GPU (if GPU used)
+    keys_per_sec_per_gpu: f64,
+    /// Duration of the test in seconds
+    test_duration_secs: u64,
+    /// Total keys tested
+    total_keys: u64,
+}
+
+/// Benchmark runner state
+#[derive(Clone)]
+struct BenchmarkState {
+    running: Arc<AtomicBool>,
+    progress: Arc<Mutex<Option<serde_json::Value>>>,
+    results: Arc<Mutex<Vec<BenchmarkEntry>>>,
+}
+
+impl BenchmarkState {
+    fn new() -> Self {
+        Self {
+            running: Arc::new(AtomicBool::new(false)),
+            progress: Arc::new(Mutex::new(None)),
+            results: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+}
+
+/// Background UTXO rebuild state — tracks long-running rebuild operations
+#[derive(Clone)]
+struct UtxoRebuildState {
+    running: Arc<AtomicBool>,
+    progress: Arc<Mutex<Option<serde_json::Value>>>,
+}
+
+impl UtxoRebuildState {
+    fn new() -> Self {
+        Self {
+            running: Arc::new(AtomicBool::new(false)),
+            progress: Arc::new(Mutex::new(None)),
+        }
+    }
 }
 
 #[tokio::main]
@@ -235,6 +316,9 @@ async fn main() -> Result<()> {
         config,
         index,
         dict: DictScanState::new(),
+        corpus: CorpusScanState::new(),
+        benchmark: BenchmarkState::new(),
+        utxo_rebuild: UtxoRebuildState::new(),
     };
 
     // Scan auto (brute GPU) : tourne dès que le dict n’utilise pas les GPU
@@ -247,6 +331,10 @@ async fn main() -> Result<()> {
             tokio::time::sleep(Duration::from_secs(25)).await;
             let mut last_pos: Option<String> = None;
             let mut stuck_ticks: u32 = 0;
+            // Crash loop detection: track spawn/death times to detect rapid crashes
+            let mut rapid_crash_count: u32 = 0;
+            let mut last_spawn_time: Option<std::time::Instant> = None;
+            let mut last_death_time: Option<std::time::Instant> = None;
             loop {
                 tokio::time::sleep(Duration::from_secs(15)).await;
                 let dict_busy = dict.running.load(Ordering::SeqCst);
@@ -303,8 +391,8 @@ async fn main() -> Result<()> {
                         }
                         last_pos = Some(p.clone());
                     }
-                    // 4 × 15s = 60s sans avancement de curseur → relance
-                    if stuck_ticks >= 4 {
+                    // 8 × 15s = 120s sans avancement → relance (laisse le temps au chargement index + GPU init)
+                    if stuck_ticks >= 8 {
                         tracing::warn!(
                             "auto-scan: brute bloqué (curseur figé) → restart multi-GPU"
                         );
@@ -314,9 +402,34 @@ async fn main() -> Result<()> {
                             .output();
                         stuck_ticks = 0;
                         last_pos = None;
+                        last_death_time = Some(std::time::Instant::now());
                         // retombe dans !brute_on au prochain tick
                     }
                     continue;
+                }
+
+                // Process just died — detect crash (lived < 120s = didn't finish loading+init)
+                if let Some(spawn_t) = last_spawn_time {
+                    let death_t = last_death_time.get_or_insert_with(std::time::Instant::now);
+                    let lifetime = death_t.duration_since(spawn_t).as_secs().max(1);
+                    if lifetime < 120 {
+                        rapid_crash_count += 1;
+                        let backoff_secs = rapid_crash_count.min(8) as u64 * 15;
+                        tracing::warn!(
+                            "auto-scan: crash #{} (process lived {}s) → backoff {}s before retry",
+                            rapid_crash_count, lifetime, backoff_secs
+                        );
+                        tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                        if dict.running.load(Ordering::SeqCst) {
+                            last_spawn_time = None;
+                            last_death_time = None;
+                            continue;
+                        }
+                    } else {
+                        rapid_crash_count = 0;
+                    }
+                    last_spawn_time = None;
+                    last_death_time = None;
                 }
 
                 stuck_ticks = 0;
@@ -366,12 +479,13 @@ async fn main() -> Result<()> {
 
                 let mut cfg = ScanManager::get_config(&dash).await;
                 cfg.use_gpu = true;
-                cfg.gpus = Some("0,1,2".to_string());
+                cfg.gpus = Some("0,1,2".to_string()); // All 3 GPUs
                 cfg.random = false;
                 cfg.use_range_log = true;
-                // threads=0 → utilise cpu_pct (défaut 50 % des cœurs, configurable UI)
+                // GPU-heavy: use all available CPU cores alongside GPU
+                // (threads=0 = auto-detect; cpu_pct=0 means no cap)
                 if cfg.cpu_pct == 0 && cfg.threads == 0 {
-                    cfg.cpu_pct = 50;
+                    cfg.threads = 0; // Auto-detect (uses all cores)
                 }
                 if cfg.range_step == 0 {
                     cfg.range_step = btcsolver::dashboard::range_log::DEFAULT_RANGE_STEP;
@@ -380,11 +494,13 @@ async fn main() -> Result<()> {
                 // (sauf si l'utilisateur a posé un manual_start via l'UI)
                 cfg.start_key = None;
                 cfg.end_key = None;
-                cfg.count = 0; // → range_step
-                cfg.batch_size = cfg.batch_size.max(209_715_200);
+                cfg.count = u64::MAX; // Unlimited — process runs continuously without exiting
+                cfg.batch_size = cfg.batch_size.max(1_048_576).min(16_777_216); // 1M-16M batches
                 let cpu_n = cfg.resolve_cpu_threads();
                 match ScanManager::start(&dash, &cfg).await {
                     Ok(pid) => {
+                        last_spawn_time = Some(std::time::Instant::now());
+                        last_death_time = None;
                         ScanManager::update_config(&dash, cfg.clone()).await;
                         tracing::info!(
                             "auto-scan: brute multi-GPU pid={:?} cpu_workers={} ({}% / threads={}) step={}",
@@ -410,6 +526,12 @@ async fn main() -> Result<()> {
         .route("/api/scan/stats", get(scan_stats_handler))
         .route("/api/scan/start", post(scan_start_handler))
         .route("/api/scan/stop", post(scan_stop_handler))
+        .route("/api/scan/pause", post(scan_pause_handler))
+        .route("/api/scan/resume", post(scan_resume_handler))
+        .route("/api/scan/export", get(scan_export_handler))
+        .route("/api/scan/easy-keys", post(scan_easy_keys_handler))
+        .route("/api/scan/corpus/progress", get(corpus_progress_handler))
+        .route("/api/scan/corpus/stop", post(corpus_stop_handler))
         .route("/api/scan/config", get(scan_config_handler))
         .route("/api/scan/config", post(scan_config_update_handler))
         .route("/api/scan/ranges", get(scan_ranges_handler))
@@ -418,6 +540,7 @@ async fn main() -> Result<()> {
         .route("/api/keys/check", post(check_key_handler))
         .route("/api/keys/batch", post(check_batch_handler))
         .route("/api/keys/archive", get(keys_archive_handler))
+        .route("/api/keys/archive/export", get(keys_archive_export_handler))
         .route("/api/keys/pubkeys", post(keys_pubkeys_handler))
         // Dict
         .route("/api/dict/corpora", get(dict_corpora_handler))
@@ -433,9 +556,19 @@ async fn main() -> Result<()> {
         .route("/api/snapshot/info", get(snapshot_info_handler))
         .route("/api/snapshot/refresh", post(snapshot_refresh_handler))
         .route("/api/snapshot/reload", post(snapshot_reload_handler))
+        .route("/api/snapshot/rebuild-status", get(snapshot_rebuild_status_handler))
         // System
         .route("/api/system/health", get(health_handler))
         .route("/api/system/ideas", get(ideas_handler))
+        // Historical UTXO index (utxo1)
+        .route("/api/utxo1/stats", get(utxo1_stats_handler))
+        .route("/api/utxo1/query", post(utxo1_query_handler))
+        // Scan device toggle (enable/disable GPU or set CPU threads)
+        .route("/api/scan/toggle-device", post(scan_toggle_device_handler))
+        // Performance benchmark
+        .route("/api/benchmark/run", post(benchmark_run_handler))
+        .route("/api/benchmark/status", get(benchmark_status_handler))
+        .route("/api/benchmark/reset", post(benchmark_reset_handler))
         .nest_service("/static", ServeDir::new(&static_dir))
         .with_state(app_state);
 
@@ -682,6 +815,482 @@ async fn scan_ranges_post_handler(
             Json(serde_json::json!({"error": format!("action inconnue: {}", other)})),
         )),
     }
+}
+
+// ── Scan Device Toggle ────────────────────────────────────────────────────
+
+/// POST /api/scan/toggle-device — enable/disable a GPU or set CPU threads
+/// Body: { "device": "gpu0" | "gpu1" | "gpu2" | "cpu", "threads": N }
+/// threads=0 means disable that device
+async fn scan_toggle_device_handler(
+    State(state): State<AppState>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    let device = body.get("device").and_then(|d| d.as_str()).unwrap_or("");
+    let threads = body.get("threads").and_then(|t| t.as_u64()).map(|n| n as usize).unwrap_or(1);
+
+    let mut cfg = ScanManager::get_config(&state.dashboard).await;
+
+    if device.starts_with("gpu") {
+        // Parse GPU ID from device name (e.g., "gpu0" → 0)
+        let gpu_id: u32 = device[3..].parse().unwrap_or(0);
+
+        // Get current GPU list
+        let current_gpus = cfg.gpus.clone().unwrap_or_else(|| "0,1,2".to_string());
+        let mut gpu_list: Vec<u32> = current_gpus.split(',')
+            .filter_map(|s| s.trim().parse().ok())
+            .collect();
+
+        if threads == 0 {
+            // Disable this GPU: remove from list
+            gpu_list.retain(|&g| g != gpu_id);
+            if gpu_list.is_empty() {
+                // No GPUs left, disable GPU scanning entirely
+                cfg.use_gpu = false;
+                cfg.gpus = Some("0,1,2".to_string()); // restore default for re-enable
+            } else {
+                cfg.gpus = Some(gpu_list.iter().map(|g| g.to_string()).collect::<Vec<_>>().join(","));
+            }
+        } else {
+            // Enable this GPU: add to list if not present
+            if !gpu_list.contains(&gpu_id) {
+                gpu_list.push(gpu_id);
+                gpu_list.sort();
+            }
+            cfg.use_gpu = true;
+            cfg.gpus = Some(gpu_list.iter().map(|g| g.to_string()).collect::<Vec<_>>().join(","));
+        }
+    } else if device == "cpu" {
+        // Set CPU threads
+        cfg.threads = threads;
+        if threads == 0 {
+            cfg.cpu_pct = 0; // CPU off
+        }
+    } else {
+        return Json(serde_json::json!({
+            "success": false,
+            "error": format!("Unknown device: {}. Use 'gpu0', 'gpu1', 'gpu2', or 'cpu'", device),
+        }));
+    }
+
+    ScanManager::update_config(&state.dashboard, cfg.clone()).await;
+
+    // Restart scan with new config if scan was running
+    let was_running = state.dashboard.scan_running.load(Ordering::SeqCst);
+    if was_running {
+        let _ = ScanManager::stop(&state.dashboard).await;
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        if let Err(e) = ScanManager::start(&state.dashboard, &cfg).await {
+            tracing::warn!("Auto-restart scan after device toggle failed: {}", e);
+        }
+    }
+
+    let status = if threads == 0 { "disabled" } else { "enabled" };
+    Json(serde_json::json!({
+        "success": true,
+        "device": device,
+        "status": status,
+        "threads": threads,
+        "gpus": cfg.gpus,
+        "cpu_threads": cfg.threads,
+        "use_gpu": cfg.use_gpu,
+        "scan_restarted": was_running,
+    }))
+}
+
+// ── Scan Export ───────────────────────────────────────────────────────────
+
+async fn scan_export_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let stats = match ScanManager::get_stats(&state.dashboard).await {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+    let archive = KeyArchive::new(&state.config.project_dir)
+        .stats()
+        .unwrap_or_else(|_| serde_json::json!({"count": 0}));
+
+    let export_data = serde_json::json!({
+        "exported_at": chrono::Utc::now().to_rfc3339(),
+        "scan": serde_json::to_value(&stats).unwrap_or_default(),
+        "keys_archive": archive,
+        "bitcoind": match tokio::time::timeout(
+            Duration::from_secs(3),
+            BitcoindManager::get_status(&state.config),
+        )
+        .await
+        {
+            Ok(Ok(s)) => serde_json::to_value(s).unwrap_or_default(),
+            _ => serde_json::json!({"error": "unavailable"}),
+        },
+    });
+
+    (
+        StatusCode::OK,
+        [("Content-Type", "application/json"), ("Content-Disposition", "attachment; filename=\"btcsolver-scan-export.json\"")],
+        export_data.to_string(),
+    )
+        .into_response()
+}
+
+// ── Scan Pause / Resume ──────────────────────────────────────────────────
+
+/// Pause the scan by saving current position and stopping the process
+async fn scan_pause_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
+    // Save current position before stopping
+    let stats = ScanManager::get_stats(&state.dashboard).await.ok();
+    let position = stats
+        .as_ref()
+        .and_then(|s| s.current_position.clone())
+        .or_else(|| stats.as_ref().and_then(|s| s.range_end.clone()));
+
+    // Save position to a file for resume
+    if let Some(pos) = &position {
+        let pos_file = format!(
+            "{}/data/scan-paused-position.txt",
+            state.config.project_dir
+        );
+        let _ = std::fs::write(&pos_file, pos.as_bytes());
+    }
+
+    match ScanManager::stop(&state.dashboard).await {
+        Ok(()) => Json(serde_json::json!({
+            "success": true,
+            "paused": true,
+            "position_saved": position.is_some(),
+            "position": position,
+        })),
+        Err(e) => Json(serde_json::json!({
+            "success": false,
+            "error": e.to_string(),
+        })),
+    }
+}
+
+/// Resume the scan from the saved position
+async fn scan_resume_handler(State(state): State<AppState>) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    // Read saved position
+    let pos_file = format!(
+        "{}/data/scan-paused-position.txt",
+        state.config.project_dir
+    );
+    let resume_pos = std::fs::read_to_string(&pos_file).ok();
+
+    let mut cfg = ScanManager::get_config(&state.dashboard).await;
+    let resumed_from = if let Some(ref pos) = resume_pos {
+        let p = pos.trim().to_string();
+        if !p.is_empty() {
+            cfg.start_key = Some(p.clone());
+        }
+        // Clean up pause file
+        let _ = std::fs::remove_file(&pos_file);
+        Some(p)
+    } else {
+        None
+    };
+
+    // Ensure reasonable defaults for resume
+    cfg.use_gpu = true;
+    cfg.gpus = Some("0,1,2".to_string());
+    cfg.count = u64::MAX;
+
+    match ScanManager::start(&state.dashboard, &cfg).await {
+        Ok(pid) => {
+            ScanManager::update_config(&state.dashboard, cfg).await;
+            Ok(Json(serde_json::json!({
+                "success": true,
+                "pid": pid,
+                "resumed_from": resumed_from,
+            })))
+        }
+        Err(e) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "success": false, "error": e.to_string() })),
+        )),
+    }
+}
+
+// ── Easy Keys Corpus Scan (Background) ────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+struct EasyKeysRequest {
+    #[serde(default)]
+    use_gpu: bool,
+    #[serde(default)]
+    threads: Option<usize>,
+    /// Optional: specific corpus file(s) to scan. If omitted, auto-discovers all *-keys*.txt in data/
+    #[serde(default)]
+    corpus_files: Option<Vec<String>>,
+}
+
+async fn scan_easy_keys_handler(
+    State(state): State<AppState>,
+    Json(req): Json<EasyKeysRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    // Check if already running
+    if state.corpus.running.load(Ordering::Relaxed) {
+        return Ok(Json(serde_json::json!({
+            "success": false,
+            "error": "Corpus scan already running — check /api/scan/corpus/progress"
+        })));
+    }
+
+    // Get UTXO index
+    let guard = state.index.read().await;
+    let index = match guard.as_ref() {
+        Some(idx) => idx.clone(),
+        None => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "success": false,
+                    "error": "UTXO index not loaded"
+                })),
+            ));
+        }
+    };
+    drop(guard);
+
+    // Discover corpus files
+    let data_dir = format!("{}/data", state.config.project_dir);
+    let corpus_files = if let Some(files) = req.corpus_files {
+        files
+    } else {
+        // Auto-discover all *-keys*.txt files
+        let mut files = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&data_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if (name.contains("keys") || name.contains("corpus")) && name.ends_with(".txt") {
+                    files.push(entry.path().to_string_lossy().to_string());
+                }
+            }
+        }
+        files.sort();
+        files
+    };
+
+    if corpus_files.is_empty() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "success": false,
+                "error": "No corpus files found in data/ (looking for *keys*.txt or *corpus*.txt)"
+            })),
+        ));
+    }
+
+    // Count total lines (streaming — don't load entire file into memory)
+    let mut total_lines = 0u64;
+    for path in &corpus_files {
+        if let Ok(file) = std::fs::File::open(path) {
+            let reader = std::io::BufReader::new(file);
+            for line in reader.lines() {
+                if let Ok(l) = line {
+                    let l = l.trim();
+                    if !l.is_empty() && !l.starts_with('#') {
+                        total_lines += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    if total_lines == 0 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "success": false,
+                "error": "No valid keys found in corpus files"
+            })),
+        ));
+    }
+
+    // Reset state
+    state.corpus.running.store(true, Ordering::Relaxed);
+    state.corpus.stop.store(false, Ordering::Relaxed);
+    state.corpus.keys_tested.store(0, Ordering::Relaxed);
+    state.corpus.keys_total.store(total_lines, Ordering::Relaxed);
+    state.corpus.matches_found.store(0, Ordering::Relaxed);
+    if let Ok(mut s) = state.corpus.status_text.lock() {
+        *s = format!("Starting corpus scan: {} files, {} keys", corpus_files.len(), total_lines);
+    }
+
+    // Clone for background task
+    let corpus = state.corpus.clone();
+    let index = index.clone();
+    let project_dir = state.config.project_dir.clone();
+    let file_count = corpus_files.len();
+
+    // Spawn background task (blocking — CPU-intensive key checking)
+    tokio::task::spawn_blocking(move || {
+        let start = std::time::Instant::now();
+        let mut scanned = 0u64;
+        let mut matches = 0u64;
+        let mut total_balance = 0u64;
+        let archive = KeyArchive::new(&project_dir);
+        let batch_size = 10000; // Update progress every N keys
+
+        for file_path in &corpus_files {
+            if corpus.stop.load(Ordering::Relaxed) {
+                if let Ok(mut s) = corpus.status_text.lock() {
+                    *s = "Scan stopped by user".to_string();
+                }
+                break;
+            }
+
+            let file = match std::fs::File::open(file_path) {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("Corpus scan: failed to open {}: {}", file_path, e);
+                    continue;
+                }
+            };
+            let reader = std::io::BufReader::new(file);
+
+            let fname = std::path::Path::new(file_path)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| file_path.clone());
+
+            if let Ok(mut s) = corpus.status_text.lock() {
+                *s = format!("Scanning {}...", fname);
+            }
+
+            let mut batch = Vec::new();
+            for line_result in reader.lines() {
+                if corpus.stop.load(Ordering::Relaxed) { break; }
+
+                let line = match line_result {
+                    Ok(l) => l,
+                    Err(_) => continue,
+                };
+                let line = line.trim().to_string();
+                if line.is_empty() || line.starts_with('#') { continue; }
+
+                batch.push(line);
+
+                if batch.len() >= batch_size {
+                    // Process batch
+                    let (m, b) = process_key_batch(&index, &batch, &archive, "corpus_scan");
+                    matches += m;
+                    total_balance += b;
+                    scanned += batch.len() as u64;
+                    corpus.keys_tested.store(scanned, Ordering::Relaxed);
+                    corpus.matches_found.store(matches, Ordering::Relaxed);
+                    batch.clear();
+                }
+            }
+
+            // Process remaining
+            if !batch.is_empty() {
+                let (m, b) = process_key_batch(&index, &batch, &archive, "corpus_scan");
+                matches += m;
+                total_balance += b;
+                scanned += batch.len() as u64;
+                corpus.keys_tested.store(scanned, Ordering::Relaxed);
+                corpus.matches_found.store(matches, Ordering::Relaxed);
+            }
+        }
+
+        let elapsed = start.elapsed();
+        let rate = if elapsed.as_secs_f64() > 0.0 {
+            scanned as f64 / elapsed.as_secs_f64()
+        } else { 0.0 };
+
+        if let Ok(mut s) = corpus.status_text.lock() {
+            if corpus.stop.load(Ordering::Relaxed) {
+                *s = format!("Stopped: {} keys in {:.1}s ({:.0} k/s)", scanned, elapsed.as_secs_f64(), rate);
+            } else {
+                *s = format!("Complete: {} keys, {} matches, {:.1}s ({:.0} k/s), {} BTC",
+                    scanned, matches, elapsed.as_secs_f64(), rate, total_balance as f64 / 1e8);
+            }
+        }
+
+        corpus.running.store(false, Ordering::Relaxed);
+
+        if matches > 0 {
+            eprintln!("CORPUS SCAN: {} matches found! {} BTC total", matches, total_balance as f64 / 1e8);
+        }
+    });
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "message": "Corpus scan started in background",
+        "total_keys": total_lines,
+        "files": file_count,
+    })))
+}
+
+/// Process a batch of keys. Returns (matches, total_balance_sats).
+fn process_key_batch(
+    index: &FlatIndex,
+    keys: &[String],
+    archive: &KeyArchive,
+    source: &str,
+) -> (u64, u64) {
+    let mut matches = 0u64;
+    let mut total_balance = 0u64;
+
+    for key_hex in keys {
+        let bytes_vec = match hex::decode(key_hex.trim()) {
+            Ok(b) if b.len() == 32 => b,
+            _ => continue,
+        };
+        let bytes: [u8; 32] = bytes_vec.try_into().unwrap();
+
+        // Lookup scripts in index (sync version for batch processing)
+        let (addrs, balance) = KeyChecker::lookup_key_sync(index, bytes);
+
+        if balance > 0 {
+            matches += 1;
+            total_balance += balance;
+
+            let addr_vec = vec![
+                addrs.legacy, addrs.segwit, addrs.wrapped, addrs.taproot,
+            ];
+
+            let entry = ArchivedKey::from_utxo_hit(
+                key_hex, None, addr_vec, balance, source,
+                Some("identity".to_string()), Some(key_hex.clone()),
+            );
+            let _ = archive.record(entry);
+            btcsolver::alert_beep::alert_balance_found();
+        }
+    }
+
+    (matches, total_balance)
+}
+
+async fn corpus_progress_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let running = state.corpus.running.load(Ordering::Relaxed);
+    let tested = state.corpus.keys_tested.load(Ordering::Relaxed);
+    let total = state.corpus.keys_total.load(Ordering::Relaxed);
+    let matches = state.corpus.matches_found.load(Ordering::Relaxed);
+    let status = state.corpus.status_text.lock().map(|s| (*s).clone()).unwrap_or_default();
+    let pct = if total > 0 { (tested as f64 / total as f64) * 100.0 } else { 0.0 };
+
+    Json(serde_json::json!({
+        "running": running,
+        "keys_tested": tested,
+        "keys_total": total,
+        "matches_found": matches,
+        "progress_pct": pct,
+        "status": status,
+    }))
+}
+
+async fn corpus_stop_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
+    state.corpus.stop.store(true, Ordering::Relaxed);
+    Json(serde_json::json!({
+        "success": true,
+        "message": "Corpus scan stop requested",
+    }))
 }
 
 // ── Keys ──────────────────────────────────────────────────────────────────
@@ -1001,6 +1610,64 @@ async fn keys_archive_handler(State(state): State<AppState>) -> Json<serde_json:
     }
 }
 
+/// Export keys archive as CSV
+async fn keys_archive_export_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let archive = KeyArchive::new(&state.config.project_dir);
+    let keys = match archive.load_all() {
+        Ok(k) => k,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+
+    let mut csv = String::from("privkey_hex,pubkey_hex,wif,input,method,source,addresses,balance_sats,balance_btc,has_activity,has_balance,reason,first_seen,last_seen,peak_balance_sats,notes\n");
+
+    for k in &keys {
+        let addrs = k.addresses.join(";");
+        csv.push_str(&format!(
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+            csv_escape(&k.privkey_hex),
+            csv_escape(&k.pubkey_hex.as_deref().unwrap_or("")),
+            csv_escape(&k.wif.as_deref().unwrap_or("")),
+            csv_escape(&k.input.as_deref().unwrap_or("")),
+            csv_escape(&k.method.as_deref().unwrap_or("")),
+            csv_escape(&k.source.as_deref().unwrap_or("")),
+            csv_escape(&addrs),
+            k.balance_sats,
+            k.balance_btc,
+            k.has_activity,
+            k.has_balance,
+            k.reason.as_str(),
+            k.first_seen,
+            k.last_seen,
+            k.peak_balance_sats,
+            csv_escape(&k.notes.as_deref().unwrap_or("")),
+        ));
+    }
+
+    (
+        StatusCode::OK,
+        [
+            ("Content-Type", "text/csv; charset=utf-8"),
+            ("Content-Disposition", "attachment; filename=\"btcsolver-keys-archive.csv\""),
+        ],
+        csv,
+    )
+        .into_response()
+}
+
+fn csv_escape(s: &str) -> String {
+    if s.contains(',') || s.contains('"') || s.contains('\n') || s.contains('\r') {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
+}
+
 /// Dérive les clés publiques (compressée + non compressée) depuis des priv hex.
 /// Body: `{ "privkeys": ["…", …] }` ou `{ "privkey_hex": "…" }`
 async fn keys_pubkeys_handler(Json(body): Json<serde_json::Value>) -> Json<serde_json::Value> {
@@ -1298,13 +1965,112 @@ async fn snapshot_info_handler(State(state): State<AppState>) -> Json<serde_json
 async fn snapshot_refresh_handler(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    match BitcoindManager::generate_snapshot(&state.config).await {
-        Ok(msg) => Ok(Json(serde_json::json!({ "success": true, "message": msg }))),
-        Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "success": false, "error": e.to_string() })),
-        )),
+    // Check if already rebuilding
+    if state.utxo_rebuild.running.swap(true, Ordering::SeqCst) {
+        return Ok(Json(serde_json::json!({
+            "success": false,
+            "error": "UTXO rebuild already in progress",
+            "in_progress": true,
+        })));
     }
+
+    let config = state.config.clone();
+    let rebuild = state.utxo_rebuild.clone();
+    let index = state.index.clone();
+    let snapshot_path = config.snapshot_path.clone();
+
+    // Write rebuild marker file
+    let marker_path = format!("{}/.UTXO_REBUILD_IN_PROGRESS", config.project_dir);
+    let _ = std::fs::write(&marker_path, "rebuilding");
+
+    {
+        let mut progress = rebuild.progress.lock().unwrap();
+        *progress = Some(serde_json::json!({
+            "phase": "starting",
+            "percent": 0,
+            "message": "Starting UTXO rebuild from blocks…",
+            "started_at": chrono::Utc::now().to_rfc3339(),
+        }));
+    }
+
+    // Run rebuild in background
+    tokio::spawn(async move {
+        let result = BitcoindManager::generate_snapshot(&config).await;
+
+        match result {
+            Ok(msg) => {
+                // Copy snapshot to local cache for faster access
+                let local_cache = format!(r"C:\btcsolver-cache\utxo-index.snapshot");
+                let copy_result = std::fs::create_dir_all(r"C:\btcsolver-cache")
+                    .and_then(|()| std::fs::copy(&config.snapshot_path, &local_cache));
+
+                let copy_msg = match copy_result {
+                    Ok(n) => format!("\nCopied to local cache: {} ({:.1} MB)", local_cache, n as f64 / 1_048_576.0),
+                    Err(e) => format!("\nCache copy skipped: {}", e),
+                };
+
+                // Reload index into memory automatically
+                let loaded = tokio::task::spawn_blocking(move || load_index(&snapshot_path))
+                    .await
+                    .ok()
+                    .flatten();
+                if loaded.is_some() {
+                    *index.write().await = loaded;
+                }
+
+                // Remove marker
+                let _ = std::fs::remove_file(&marker_path);
+
+                rebuild.running.store(false, Ordering::SeqCst);
+                {
+                    let mut progress = rebuild.progress.lock().unwrap();
+                    *progress = Some(serde_json::json!({
+                        "phase": "complete",
+                        "percent": 100,
+                        "message": format!("{}{}", msg, copy_msg),
+                        "completed_at": chrono::Utc::now().to_rfc3339(),
+                    }));
+                }
+                tracing::info!("UTXO rebuild complete:{}", copy_msg);
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&marker_path);
+                rebuild.running.store(false, Ordering::SeqCst);
+                {
+                    let mut progress = rebuild.progress.lock().unwrap();
+                    *progress = Some(serde_json::json!({
+                        "phase": "error",
+                        "percent": 0,
+                        "error": e.to_string(),
+                    }));
+                }
+                tracing::error!("UTXO rebuild failed: {}", e);
+            }
+        }
+    });
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "message": "UTXO rebuild started in background. Check /api/snapshot/rebuild-status for progress.",
+        "background": true,
+    })))
+}
+
+/// GET /api/snapshot/rebuild-status — check background rebuild progress
+async fn snapshot_rebuild_status_handler(
+    State(state): State<AppState>,
+) -> Json<serde_json::Value> {
+    let running = state.utxo_rebuild.running.load(Ordering::SeqCst);
+    let progress = state.utxo_rebuild.progress.lock().unwrap().clone();
+
+    // Also check marker file for external rebuilds (Keep-Core-And-Utxo.ps1)
+    let marker_exists = std::path::Path::new(&format!("{}/.UTXO_REBUILD_IN_PROGRESS", state.config.project_dir)).exists();
+
+    Json(serde_json::json!({
+        "running": running || marker_exists,
+        "progress": progress,
+        "marker_file": marker_exists,
+    }))
 }
 
 async fn snapshot_reload_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
@@ -1416,6 +2182,84 @@ async fn health_handler(State(state): State<AppState>) -> Json<serde_json::Value
         .stats()
         .unwrap_or_else(|_| serde_json::json!({"count": 0}));
 
+    // GPU stats from nvidia-smi
+    let gpu_stats = std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,power.limit",
+               "--format=csv,noheader,nounits"])
+        .output()
+        .ok()
+        .and_then(|o| {
+            let s = String::from_utf8_lossy(&o.stdout).to_string();
+            let mut list: Vec<serde_json::Value> = Vec::new();
+            for line in s.lines() {
+                let fields: Vec<&str> = line.split(',').map(|f| f.trim()).collect();
+                if fields.len() >= 7 {
+                    list.push(serde_json::json!({
+                        "index": fields[0].parse::<i32>().ok(),
+                        "name": fields[1],
+                        "util_pct": fields[2].parse::<i32>().ok(),
+                        "mem_used_mb": fields[3].parse::<i32>().ok().map(|v| v / 1024),
+                        "mem_total_mb": fields[4].parse::<i32>().ok().map(|v| v / 1024),
+                        "temp_c": fields[5].parse::<i32>().ok(),
+                        "power_w": fields[6].parse::<f64>().ok(),
+                    }));
+                }
+            }
+            if list.is_empty() { None } else { Some(serde_json::Value::Array(list)) }
+        })
+        .unwrap_or_else(|| serde_json::Value::Array(Vec::new()));
+
+    // Historical indexer status
+    let hi_running = std::process::Command::new("tasklist")
+        .args(["/FI", "IMAGENAME eq historical_indexer.exe", "/NH"])
+        .output()
+        .ok()
+        .map(|o| {
+            let s = String::from_utf8_lossy(&o.stdout).to_lowercase();
+            s.contains("historical_indexer") && !s.contains("no tasks")
+        })
+        .unwrap_or(false);
+    let hi_checkpoint = std::fs::read_to_string(
+        format!("{}/data/historical-indexer.checkpoint", state.config.project_dir)
+    ).ok();
+    let hi_status = serde_json::json!({ "running": hi_running, "checkpoint": hi_checkpoint });
+
+    // Process list
+    let proc_names = ["brute_force.exe", "btcsolver_dashboard.exe", "bitcoind.exe",
+                      "historical_indexer.exe", "dump_to_flat.exe", "llama-server.exe"];
+    let mut proc_list: Vec<serde_json::Value> = Vec::new();
+    for pn in &proc_names {
+        let running = std::process::Command::new("tasklist")
+            .args(["/FI", &format!("IMAGENAME eq {}", pn), "/NH"])
+            .output()
+            .ok()
+            .map(|o| {
+                let s = String::from_utf8_lossy(&o.stdout).to_lowercase();
+                s.contains(pn) && !s.contains("no tasks")
+            })
+            .unwrap_or(false);
+        if running {
+            // Get PID and memory
+            let details = std::process::Command::new("tasklist")
+                .args(["/FI", &format!("IMAGENAME eq {}", pn), "/NH", "/FO", "CSV"])
+                .output()
+                .ok();
+            if let Some(ref o) = details {
+                let s = String::from_utf8_lossy(&o.stdout).to_string();
+                if let Some(line) = s.lines().next() {
+                    let fields: Vec<&str> = line.split('"').collect();
+                    let mem_kb = fields.get(8).and_then(|f| f.trim().parse::<u64>().ok()).unwrap_or(0);
+                    let pid = fields.get(4).and_then(|f| f.trim().parse::<u32>().ok()).unwrap_or(0);
+                    proc_list.push(serde_json::json!({ "name": pn, "running": true, "pid": pid, "mem_mb": mem_kb / 1024 }));
+                    continue;
+                }
+            }
+            proc_list.push(serde_json::json!({ "name": pn, "running": true }));
+        } else {
+            proc_list.push(serde_json::json!({ "name": pn, "running": false }));
+        }
+    }
+
     Json(serde_json::json!({
         "status": "ok",
         "version": env!("CARGO_PKG_VERSION"),
@@ -1491,7 +2335,377 @@ async fn health_handler(State(state): State<AppState>) -> Json<serde_json::Value
             Err(e) => serde_json::json!({ "exists": false, "message": e.to_string() })
         },
         "dict": dict,
+        "gpu": gpu_stats,
+        "historical_indexer": hi_status,
+        "processes": serde_json::Value::Array(proc_list),
     }))
+}
+
+/// GET /api/utxo1/stats — returns stats about the historical UTXO index
+async fn utxo1_stats_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let project_dir = &state.config.project_dir;
+    let mut paths = vec![
+        format!("{}/data/historical-scripts-merged.bin", project_dir),
+        format!("{}/data/historical-scripts.bin", project_dir),
+    ];
+
+    for path in paths {
+        if let Ok(metadata) = std::fs::metadata(&path) {
+            let file_size = metadata.len();
+            // Try to read header for script count
+            let mut count = 0u64;
+            let mut version = 0u32;
+            if let Ok(mut file) = std::fs::File::open(&path) {
+                use std::io::Read;
+                let mut header = [0u8; 20]; // magic(8) + version(4) + count(8)
+                if file.read_exact(&mut header).is_ok() {
+                    if &header[..8] == b"BTCSHIST" {
+                        version = u32::from_le_bytes([header[8], header[9], header[10], header[11]]);
+                        count = u64::from_le_bytes([
+                            header[12], header[13], header[14], header[15],
+                            header[16], header[17], header[18], header[19],
+                        ]);
+                    }
+                }
+            }
+
+            return Json(serde_json::json!({
+                "exists": true,
+                "path": path,
+                "file_size": file_size,
+                "file_size_mb": (file_size as f64) / 1_048_576.0,
+                "scripts": count,
+                "version": version,
+                "format": "BTCSHIST",
+            }));
+        }
+    }
+
+    // Check for tmp/intermediate files
+    let tmp_path = format!("{}/data/historical-scripts.bin.tmp", project_dir);
+    let tmp_size = std::fs::metadata(&tmp_path).map(|m| m.len()).unwrap_or(0);
+
+    Json(serde_json::json!({
+        "exists": false,
+        "message": "No historical index found",
+        "tmp_file_size": tmp_size,
+        "tmp_file_size_gb": (tmp_size as f64) / 1_073_741_824.0,
+    }))
+}
+
+/// POST /api/utxo1/query — query if a script hex has ever been active
+async fn utxo1_query_handler(
+    State(state): State<AppState>,
+    axum::Json(body): axum::Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    let script_hex = body.get("script").and_then(|s| s.as_str()).unwrap_or("");
+    if script_hex.is_empty() {
+        return Json(serde_json::json!({"error": "Missing 'script' parameter (hex expected)"}));
+    }
+
+    let script_bytes = match hex::decode(script_hex) {
+        Ok(b) => b,
+        Err(e) => return Json(serde_json::json!({"error": format!("Invalid hex: {}", e)})),
+    };
+
+    let project_dir = &state.config.project_dir;
+    let mut paths = vec![
+        format!("{}/data/historical-scripts-merged.bin", project_dir),
+        format!("{}/data/historical-scripts.bin", project_dir),
+    ];
+
+    for path in paths {
+        if !std::path::Path::new(&path).exists() {
+            continue;
+        }
+
+        // Use the historical_indexer CLI to query
+        let cli_path = format!("{}/target/release/historical_indexer.exe", project_dir);
+        if let Ok(output) = std::process::Command::new(&cli_path)
+            .args(["query", "--script", &script_hex, "--index", &path])
+            .output()
+        {
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+            let stdout_lower = stdout.to_lowercase();
+            if stdout_lower.contains("found") && !stdout_lower.contains("not found") {
+                return Json(serde_json::json!({
+                    "found": true,
+                    "script": script_hex,
+                    "index": path,
+                }));
+            }
+            if stdout_lower.contains("not found") {
+                // Check next index file
+                continue;
+            }
+            // Fallback: return raw output
+            return Json(serde_json::json!({
+                "found": false,
+                "script": script_hex,
+                "index": path,
+                "raw_output": format!("{} {}", stdout.trim(), stderr.trim()),
+            }));
+        }
+    }
+
+    Json(serde_json::json!({
+        "found": false,
+        "script": script_hex,
+        "error": "No historical index available for query",
+    }))
+}
+
+// ── Performance Benchmark ─────────────────────────────────────────────────
+
+/// POST /api/benchmark/run — run CPU thread benchmark
+async fn benchmark_run_handler(
+    State(state): State<AppState>,
+    axum::Json(body): axum::Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    // Check if already running
+    if state.benchmark.running.swap(true, Ordering::SeqCst) {
+        return Json(serde_json::json!({
+            "error": "Benchmark already running",
+        }));
+    }
+
+    // Parse config
+    let test_duration: u64 = body.get("duration_secs")
+        .and_then(|v| v.as_u64()).unwrap_or(15);
+    let gpu_batch_m: usize = body.get("gpu_batch_m")
+        .and_then(|v| v.as_u64()).map(|v| v as usize).unwrap_or(32);
+    let cpu_threads_list: Vec<usize> = body.get("cpu_threads")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_u64().map(|n| n as usize)).collect())
+        .unwrap_or_else(|| vec![0, 2, 4, 8, 12, 16, 24, 32]);
+
+    let project_dir = state.config.project_dir.clone();
+    let snapshot_path = state.config.snapshot_path.clone();
+    let bench = state.benchmark.clone();
+
+    // Clear previous results
+    {
+        let mut results = bench.results.lock().unwrap();
+        results.clear();
+    }
+    {
+        let mut progress = bench.progress.lock().unwrap();
+        *progress = Some(serde_json::json!({
+            "phase": "starting",
+            "current": 0,
+            "total": cpu_threads_list.len(),
+            "message": "Preparing benchmark...",
+        }));
+    }
+
+    let config_count = cpu_threads_list.len();
+
+    tokio::spawn(async move {
+        let bin_path = find_brute_force_bin(&project_dir);
+        let test_keys: u64 = (180_000_000_u64 * test_duration).max(500_000_000); // enough for stable measurement
+
+        for (i, cpu_threads) in cpu_threads_list.iter().enumerate() {
+            let total = cpu_threads_list.len();
+            {
+                let mut progress = bench.progress.lock().unwrap();
+                *progress = Some(serde_json::json!({
+                    "phase": "testing",
+                    "current": i + 1,
+                    "total": total,
+                    "cpu_threads": cpu_threads,
+                    "gpu_batch_m": gpu_batch_m,
+                    "message": format!("Testing CPU={} threads… ({}/{})", cpu_threads, i + 1, total),
+                }));
+            }
+
+            let label = if *cpu_threads == 0 {
+                format!("GPU only")
+            } else {
+                format!("GPU + CPU {} threads", cpu_threads)
+            };
+
+            let kps = run_single_benchmark(&bin_path, &snapshot_path, *cpu_threads, gpu_batch_m, test_keys, test_duration, &project_dir).await;
+
+            // Detect GPU count from nvidia-smi
+            let gpu_count = count_gpus();
+            let kps_per_gpu = if gpu_count > 0 { kps as f64 / gpu_count as f64 } else { 0.0 };
+
+            let entry = BenchmarkEntry {
+                label,
+                cpu_threads: *cpu_threads,
+                gpu_batch_m,
+                keys_per_sec: kps,
+                keys_per_sec_per_gpu: (kps_per_gpu / 1_000_000.0).round() * 1_000_000.0,
+                test_duration_secs: test_duration,
+                total_keys: test_keys,
+            };
+
+            let mut results = bench.results.lock().unwrap();
+            results.push(entry);
+        }
+
+        // Mark complete
+        bench.running.store(false, Ordering::SeqCst);
+        {
+            let mut progress = bench.progress.lock().unwrap();
+            *progress = Some(serde_json::json!({
+                "phase": "complete",
+                "message": "Benchmark complete!",
+            }));
+        }
+
+        tracing::info!("Benchmark complete: {} configs tested", cpu_threads_list.len());
+    });
+
+    Json(serde_json::json!({
+        "success": true,
+        "message": format!("Benchmark started: {} configs, {}s each", config_count, test_duration),
+    }))
+}
+
+/// GET /api/benchmark/status — get benchmark progress and results
+async fn benchmark_status_handler(
+    State(state): State<AppState>,
+) -> Json<serde_json::Value> {
+    let running = state.benchmark.running.load(Ordering::SeqCst);
+    let progress = state.benchmark.progress.lock().unwrap().clone();
+    let results = state.benchmark.results.lock().unwrap().clone();
+
+    // Find best config
+    let best = results.iter().max_by_key(|e| e.keys_per_sec);
+
+    Json(serde_json::json!({
+        "running": running,
+        "progress": progress,
+        "results": results,
+        "best": best,
+    }))
+}
+
+/// POST /api/benchmark/reset — clear benchmark results
+async fn benchmark_reset_handler(
+    State(state): State<AppState>,
+) -> Json<serde_json::Value> {
+    {
+        let mut results = state.benchmark.results.lock().unwrap();
+        results.clear();
+    }
+    {
+        let mut progress = state.benchmark.progress.lock().unwrap();
+        *progress = None;
+    }
+    Json(serde_json::json!({
+        "success": true,
+        "message": "Benchmark results cleared",
+    }))
+}
+
+/// Run a single benchmark test: spawn brute_force, wait, read stats
+async fn run_single_benchmark(
+    bin_path: &str,
+    snapshot_path: &str,
+    cpu_threads: usize,
+    gpu_batch_m: usize,
+    test_keys: u64,
+    test_duration_secs: u64,
+    project_dir: &str,
+) -> u64 {
+    let stats_file = format!("{}/bench-stats-{}.json", project_dir, cpu_threads);
+
+    let mut args = vec![
+        "--snapshot-path".to_string(), snapshot_path.to_string(),
+        "--threads".to_string(), cpu_threads.to_string(),
+        "--batch-size".to_string(), "4194304".to_string(),
+        "--count".to_string(), test_keys.to_string(),
+        "--stats-interval".to_string(), "3".to_string(),
+        "--use-gpu".to_string(),
+        "--addr-types".to_string(), "legacy,segwit,wrapped,taproot".to_string(),
+        "--transforms".to_string(), "identity".to_string(),
+        "--max-snapshot-age".to_string(), "0".to_string(),
+        "--output-file".to_string(), format!("{}/found-keys.json", project_dir),
+        "--stats-file".to_string(), stats_file.clone(),
+    ];
+
+    let gpu_batch = (gpu_batch_m as u64) * 1_000_000;
+
+    let mut cmd = std::process::Command::new(bin_path);
+    cmd.args(&args)
+        .env("BTC_GPU_LAUNCH", gpu_batch.to_string())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    let Ok(mut child) = cmd.spawn() else {
+        tracing::warn!("Benchmark spawn failed for CPU={} threads", cpu_threads);
+        return 0;
+    };
+
+    let pid = child.id();
+
+    // Wait for test duration
+    tokio::time::sleep(Duration::from_secs(test_duration_secs)).await;
+
+    // Kill the process
+    let _ = child.kill();
+    let _ = child.wait();
+
+    // Fallback: ensure process is dead (Windows zombie cleanup)
+    if let Ok(kill_output) = std::process::Command::new("taskkill")
+        .args(["/F", "/IM", "brute_force.exe", "/PID", &pid.to_string()])
+        .output()
+    {
+        let _ = kill_output;
+    }
+
+    // Read stats file
+    let kps = read_benchmark_stats(&stats_file).await;
+    let _ = std::fs::remove_file(&stats_file); // cleanup
+
+    tracing::info!("Benchmark CPU={} threads: {} keys/sec", cpu_threads, kps);
+    kps
+}
+
+async fn read_benchmark_stats(stats_file: &str) -> u64 {
+    for _ in 0..10 {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        if let Ok(content) = std::fs::read_to_string(stats_file) {
+            if let Ok(stats) = serde_json::from_str::<serde_json::Value>(&content) {
+                if let Some(kps) = stats.get("keys_per_sec").and_then(|v| v.as_u64()) {
+                    return kps;
+                }
+                if let Some(kps) = stats.get("keys_per_sec_avg").and_then(|v| v.as_u64()) {
+                    return kps;
+                }
+            }
+        }
+    }
+    0
+}
+
+fn find_brute_force_bin(project_dir: &str) -> String {
+    let candidates = [
+        format!("{}/target/release/brute_force.exe", project_dir),
+        format!("{}/brute_force.exe", project_dir),
+        format!("{}/brute_force_gpu.exe", project_dir),
+        r"C:\btcsolver-bin\brute_force.exe".to_string(),
+    ];
+    for c in &candidates {
+        if std::path::Path::new(c).exists() {
+            return c.clone();
+        }
+    }
+    format!("{}/target/release/brute_force.exe", project_dir)
+}
+
+fn count_gpus() -> usize {
+    let Ok(output) = std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=index", "--format=csv,noheader,nounits"])
+        .output() else {
+        return 0;
+    };
+    let s = String::from_utf8_lossy(&output.stdout);
+    s.lines().filter(|l| !l.trim().is_empty()).count()
 }
 
 async fn ideas_handler() -> Json<serde_json::Value> {

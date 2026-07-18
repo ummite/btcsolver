@@ -646,7 +646,12 @@ fn main() -> Result<()> {
                     "cpu_threads": cpu_threads,
                 });
                 if let Ok(json) = serde_json::to_string_pretty(&stats) {
-                    std::fs::write(&stats_file, &json).ok();
+                    // Atomic swap: write to temp file then rename
+                    // Avoids Windows file lock issues when dashboard reads the file
+                    let tmp_file = format!("{}.tmp", stats_file);
+                    if let Ok(()) = std::fs::write(&tmp_file, &json) {
+                        std::fs::rename(&tmp_file, &stats_file).ok();
+                    }
                 }
             }
         }))
@@ -1262,7 +1267,7 @@ fn run_gpu_bruteforce(
     }
 
     // Multi-GPU = 1 host / carte + workers CPU (~50 % cœurs) en stride partagé.
-    // BTC_GPU_LAUNCH : taille lot (défaut max(batch, 2M), max 8M).
+    // BTC_GPU_LAUNCH : taille lot (défaut max(batch, 32M), max 32M).
     // BTC_CPU_WORKERS=0 pour désactiver le CPU hybride.
     let n_gpu = gpu_ids.len().max(1);
     let cpu_n = std::env::var("BTC_CPU_WORKERS")
@@ -1273,8 +1278,8 @@ fn run_gpu_bruteforce(
     let gpu_batch = std::env::var("BTC_GPU_LAUNCH")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(batch_size.max(2_097_152))
-        .clamp(524_288, 8_388_608);
+        .unwrap_or(batch_size.max(67_108_864)) // Default 64M (was 32M) — double-buffering needs 2x VRAM
+        .clamp(524_288, 67_108_864); // Max 64M per batch (5090: 32GB VRAM allows it)
     live_rates.cpu_threads.store(cpu_n, Ordering::Relaxed);
     eprintln!(
         "[GPU] multi-GPU + CPU: hosts_gpu={} cpu_workers={} stride={} batch/GPU={} devices={:?}",
@@ -1324,11 +1329,29 @@ fn run_gpu_bruteforce(
             } else {
                 None
             };
-            let mut privkeys_buf = vec![0u8; gpu_batch * 32];
-            let mut total_values = vec![0u64; gpu_batch];
+            // Double-buffering: two sets of buffers for pipelined GPU operations.
+            // Pipeline: generate_A → launch_A(async) → generate_B → sync → process_A → launch_B(async) → sync → process_B
+            // This amortizes sync cost across 2 batches, reducing GPU idle time between batches.
+            let mut privkeys_buf0 = vec![0u8; gpu_batch * 32];
+            let mut privkeys_buf1 = vec![0u8; gpu_batch * 32];
+            let mut total_values0 = vec![0u64; gpu_batch];
+            let mut total_values1 = vec![0u64; gpu_batch];
             let mut key = thread_start_key;
             let dev_ids = [my_gpu];
             let mut batches = 0u64;
+
+            // Async pipelining: use async GPU API so CPU can prepare next batch
+            // while GPU processes the current one. Gain: overlap key gen with GPU compute.
+            let use_async = btcsolver::gpu::gpu_async_available();
+
+            // Double-buffering state: which buffer pair is currently "pending" on GPU
+            // 0 = nothing pending, 1 = buffer 0 pending, 2 = buffer 1 pending
+            let mut pending_buf: u8 = 0;
+            let mut pending_count: usize = 0;
+            let mut pending_rc: i32 = 0;
+
+            // Zero-skip optimization: once we've passed all-zero keys, never check again
+            let mut zero_skipped = false;
 
             loop {
                 if stop_flag.load(Ordering::Relaxed) {
@@ -1344,63 +1367,196 @@ fn run_gpu_bruteforce(
                     }
                 }
 
-                let mut count = 0usize;
-                while count < gpu_batch {
-                    if stop_flag.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    let mut base = [0u8; 32];
-                    if random {
-                        rng.as_mut().unwrap().fill(&mut base);
-                        key = base;
+                // DOUBLE-BUFFERING PIPELINE:
+                // If a batch is pending on GPU, generate the next batch while GPU works,
+                // then sync and process the pending batch. This amortizes sync cost across 2 batches.
+                //
+                // Pipeline: generate_A → launch_A(async) → generate_B → sync → process_A → launch_B(async) → sync → process_B
+                //
+                // Without async: generate → launch(sync) → process (sync cost per batch)
+                // With double-buffering: generate → launch(async) → generate_next → sync → process → launch(async) → sync → process
+                //   → sync cost divided by 2, GPU stays fed
+
+                let (pk_buf, tv_buf, count, rc) = if pending_buf != 0 {
+                    // Phase: previous batch pending on GPU — generate next batch while GPU works
+                    let gen_buf_idx = 1 - (pending_buf - 1); // other buffer
+                    let mut count = 0usize;
+
+                    if !random && transforms.len() == 1 && transforms[0].name() == "identity" {
+                        // Fast path: sequential keys, identity — optimized zero-skip
+                        while count < gpu_batch {
+                            if stop_flag.load(Ordering::Relaxed) { break; }
+                            if let Some(ref ek) = end_key {
+                                if key.as_slice() >= ek.as_slice() {
+                                    stop_flag.store(true, Ordering::Relaxed);
+                                    break;
+                                }
+                            }
+                            if !zero_skipped {
+                                if !key.iter().all(|&b| b == 0) { zero_skipped = true; }
+                                else { add_offset_to_key(&mut key, total_stride); continue; }
+                            }
+                            let buf_to_use = if gen_buf_idx == 0 { &mut privkeys_buf0 } else { &mut privkeys_buf1 };
+                            let off = count * 32;
+                            buf_to_use[off..off + 32].copy_from_slice(&key);
+                            count += 1;
+                            add_offset_to_key(&mut key, total_stride);
+                        }
                     } else {
-                        if let Some(ref ek) = end_key {
-                            if key.as_slice() >= ek.as_slice() {
-                                stop_flag.store(true, Ordering::Relaxed);
-                                break;
+                        while count < gpu_batch {
+                            if stop_flag.load(Ordering::Relaxed) { break; }
+                            let mut base = [0u8; 32];
+                            if random {
+                                rng.as_mut().unwrap().fill(&mut base);
+                            } else {
+                                if let Some(ref ek) = end_key {
+                                    if key.as_slice() >= ek.as_slice() {
+                                        stop_flag.store(true, Ordering::Relaxed);
+                                        break;
+                                    }
+                                }
+                                base = key;
+                                add_offset_to_key(&mut key, total_stride);
+                            }
+                            if !zero_skipped && base.iter().all(|&b| b == 0) { continue; }
+                            zero_skipped = true;
+                            for transform in &transforms {
+                                if count >= gpu_batch { break; }
+                                let key_buf = transform.apply(&base);
+                                if key_buf.iter().all(|&b| b == 0) { continue; }
+                                let buf_to_use = if gen_buf_idx == 0 { &mut privkeys_buf0 } else { &mut privkeys_buf1 };
+                                let off = count * 32;
+                                buf_to_use[off..off + 32].copy_from_slice(&key_buf);
+                                count += 1;
                             }
                         }
-                        base = key;
-                        add_offset_to_key(&mut key, total_stride);
                     }
-                    if base.iter().all(|&b| b == 0) {
+
+                    if count == 0 { break; }
+
+                    // Sync GPU — pending batch should be done by now (GPU was working while we generated)
+                    btcsolver::gpu::gpu_sync_all();
+
+                    // Process pending batch results
+                    let pend_count = pending_count;
+                    let pend_rc = pending_rc;
+                    keys_tested.fetch_add(pend_count as u64, Ordering::Relaxed);
+                    live_rates.add_gpu(gpu_slot, pend_count as u64);
+
+                    // Now launch the newly generated batch (async)
+                    let launch_rc = btcsolver::gpu::gpu_derive_lookup_async(
+                        if gen_buf_idx == 0 { &privkeys_buf0[..count * 32] } else { &privkeys_buf1[..count * 32] },
+                        if gen_buf_idx == 0 { &mut total_values0[..count] } else { &mut total_values1[..count] },
+                        count, addr_types, &dev_ids,
+                    );
+
+                    // Return pending batch data for result processing below
+                    let proc_buf_idx = pending_buf - 1;
+                    // Track the newly launched batch as pending for next iteration
+                    pending_buf = gen_buf_idx + 1; // 1 = buf0 pending, 2 = buf1 pending
+                    pending_count = count;
+                    pending_rc = launch_rc;
+
+                    // For this iteration, process the pending batch we just synced
+                    if proc_buf_idx == 0 {
+                        (&privkeys_buf0[..pend_count * 32], &total_values0[..pend_count], pend_count, pend_rc)
+                    } else {
+                        (&privkeys_buf1[..pend_count * 32], &total_values1[..pend_count], pend_count, pend_rc)
+                    }
+                } else {
+                    // Phase: no pending batch — generate and launch
+                    let mut count = 0usize;
+                    if !random && transforms.len() == 1 && transforms[0].name() == "identity" {
+                        while count < gpu_batch {
+                            if stop_flag.load(Ordering::Relaxed) { break; }
+                            if let Some(ref ek) = end_key {
+                                if key.as_slice() >= ek.as_slice() {
+                                    stop_flag.store(true, Ordering::Relaxed);
+                                    break;
+                                }
+                            }
+                            if !zero_skipped {
+                                if !key.iter().all(|&b| b == 0) { zero_skipped = true; }
+                                else { add_offset_to_key(&mut key, total_stride); continue; }
+                            }
+                            let off = count * 32;
+                            privkeys_buf0[off..off + 32].copy_from_slice(&key);
+                            count += 1;
+                            add_offset_to_key(&mut key, total_stride);
+                        }
+                    } else {
+                        while count < gpu_batch {
+                            if stop_flag.load(Ordering::Relaxed) { break; }
+                            let mut base = [0u8; 32];
+                            if random {
+                                rng.as_mut().unwrap().fill(&mut base);
+                                key = base;
+                            } else {
+                                if let Some(ref ek) = end_key {
+                                    if key.as_slice() >= ek.as_slice() {
+                                        stop_flag.store(true, Ordering::Relaxed);
+                                        break;
+                                    }
+                                }
+                                base = key;
+                                add_offset_to_key(&mut key, total_stride);
+                            }
+                            if !zero_skipped && base.iter().all(|&b| b == 0) { continue; }
+                            zero_skipped = true;
+                            for transform in &transforms {
+                                if count >= gpu_batch { break; }
+                                let key_buf = transform.apply(&base);
+                                if key_buf.iter().all(|&b| b == 0) { continue; }
+                                let off = count * 32;
+                                privkeys_buf0[off..off + 32].copy_from_slice(&key_buf);
+                                count += 1;
+                            }
+                        }
+                    }
+                    if count == 0 { break; }
+
+                    // Launch GPU
+                    let rc = if use_async {
+                        btcsolver::gpu::gpu_derive_lookup_async(
+                            &privkeys_buf0[..count * 32],
+                            &mut total_values0[..count],
+                            count, addr_types, &dev_ids,
+                        )
+                    } else {
+                        btcsolver::gpu::gpu_derive_lookup(
+                            &privkeys_buf0[..count * 32],
+                            &mut total_values0[..count],
+                            count, addr_types, &dev_ids,
+                        )
+                    };
+
+                    if rc != 0 {
+                        eprintln!("[GPU{}] derive_lookup rc={} — retry", my_gpu, rc);
+                        std::thread::sleep(std::time::Duration::from_millis(50));
                         continue;
                     }
-                    for transform in &transforms {
-                        if count >= gpu_batch {
-                            break;
-                        }
-                        let key_buf = transform.apply(&base);
-                        if key_buf.iter().all(|&b| b == 0) {
-                            continue;
-                        }
-                        let off = count * 32;
-                        privkeys_buf[off..off + 32].copy_from_slice(&key_buf);
-                        count += 1;
-                    }
-                }
-                if count == 0 {
-                    break;
-                }
 
-                // FULL: derive+lookup sur CETTE carte (parallèle avec les autres hosts)
-                let rc = btcsolver::gpu::gpu_derive_lookup(
-                    &privkeys_buf[..count * 32],
-                    &mut total_values[..count],
-                    count,
-                    addr_types,
-                    &dev_ids,
-                );
+                    if use_async {
+                        // Mark as pending — will be processed next iteration
+                        pending_buf = 1; // buffer 0 pending
+                        pending_count = count;
+                        pending_rc = rc;
+                        // Skip result processing this iteration — handled next loop
+                        continue;
+                    } else {
+                        // Sync mode: results ready
+                        (&privkeys_buf0[..count * 32], &total_values0[..count], count, rc)
+                    }
+                };
 
                 if rc == 0 {
-                    keys_tested.fetch_add(count as u64, Ordering::Relaxed);
-                    live_rates.add_gpu(gpu_slot, count as u64);
+                    // Process results (double-buffered: keys in pk_buf, values in tv_buf)
                     for i in 0..count {
-                        let val = total_values[i];
+                        let val = tv_buf[i];
                         if val == 0 {
                             continue;
                         }
-                        let key_bytes = &privkeys_buf[i * 32..(i + 1) * 32];
+                        let key_bytes = &pk_buf[i * 32..(i + 1) * 32];
                         if let Ok(secp_key) =
                             bitcoin::secp256k1::SecretKey::from_slice(key_bytes)
                         {
@@ -1520,7 +1676,8 @@ fn run_gpu_bruteforce(
     }
 
     // Workers CPU (~50 %) : slots n_gpu .. n_gpu+cpu_n-1, même stride
-    let cpu_batch = batch_size.min(4096).max(256);
+    // Increased batch from 4096 to 32768 for better CPU throughput
+    let cpu_batch = batch_size.min(32768).max(4096);
     for j in 0..cpu_n {
         let flat_index = Arc::clone(&flat_index);
         let results = Arc::clone(results);

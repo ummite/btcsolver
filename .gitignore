@@ -71,3 +71,16 @@ libsecp_gpu.dll
 libsecp_gpu.exp
 libsecp_gpu.lib
 *.cu.backup
+
+# Gros fichiers binaires / corpus generes (> 99 Mo, ne pas committer)
+*.bin.tmp
+historical-scripts*.bin
+merged-corpus.txt
+easy-keys-corpus.txt
+easy-keys-v2.txt
+math-constants-keys.txt
+pop-culture-2009-keys.txt
+corpora/easy-keys-8M.txt
+human-2009-keys.txt
+data/*-keys.txt
+data/*-keys.bin

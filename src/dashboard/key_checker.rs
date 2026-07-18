@@ -50,6 +50,14 @@ pub enum KeyFormat {
     Brainwallet,
 }
 
+impl KeyAddresses {
+    /// Look up all 4 addresses in the FlatIndex and return total balance
+    pub fn total_sats(&self) -> u64 {
+        // This is a placeholder — the actual lookup happens in lookup_key_sync
+        0
+    }
+}
+
 impl std::fmt::Display for KeyFormat {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -707,6 +715,47 @@ impl KeyChecker {
             total_balance_btc: total_balance as f64 / 1e8,
             error: None,
         }
+    }
+
+    /// Sync lookup: derive addresses from private key + check FlatIndex.
+    /// Returns (KeyAddresses, total_balance_sats). No async overhead — for batch processing.
+    pub fn lookup_key_sync(index: &FlatIndex, privkey_bytes: [u8; 32]) -> (KeyAddresses, u64) {
+        let secp = Secp256k1::<All>::new();
+        let network = Network::Bitcoin;
+
+        let secret_key = match bitcoin::secp256k1::SecretKey::from_slice(&privkey_bytes) {
+            Ok(sk) => sk,
+            Err(_) => return (empty_addrs(), 0),
+        };
+
+        let pk = PrivateKey {
+            inner: secret_key,
+            network: network.into(),
+            compressed: true,
+        };
+        let pubkey = pk.public_key(&secp);
+        let compressed = match CompressedPublicKey::from_private_key(&secp, &pk) {
+            Ok(c) => c,
+            Err(_) => return (empty_addrs(), 0),
+        };
+        let xonly: UntweakedPublicKey = compressed.into();
+
+        let legacy_addr = Address::p2pkh(&pubkey, network);
+        let segwit_addr = Address::p2wpkh(&compressed, network);
+        let wrapped_addr = Address::p2shwpkh(&compressed, network);
+        let taproot_addr = Address::p2tr(&secp, xonly, None, network);
+
+        let mut total = 0u64;
+        for addr in [&legacy_addr, &segwit_addr, &wrapped_addr, &taproot_addr] {
+            total += index.lookup(addr.script_pubkey().as_bytes());
+        }
+
+        (KeyAddresses {
+            legacy: legacy_addr.to_string(),
+            segwit: segwit_addr.to_string(),
+            wrapped: wrapped_addr.to_string(),
+            taproot: taproot_addr.to_string(),
+        }, total)
     }
 }
 

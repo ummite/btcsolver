@@ -746,6 +746,15 @@ body {
 .tip-critical.is-tip strong {
   color: var(--green);
 }
+/* YELLOW: 24h – 7 days (acceptable but not ideal) */
+.tip-critical.tip-warning {
+  border-color: rgba(250, 204, 21, 0.45) !important;
+  background: rgba(250, 204, 21, 0.08) !important;
+  color: #fbbf24 !important;
+}
+.tip-critical.tip-warning strong {
+  color: #fbbf24;
+}
 .tip-critical.tip-stale {
   border-color: rgba(248, 81, 73, 0.55) !important;
   background: rgba(248, 81, 73, 0.12) !important;
@@ -1556,6 +1565,214 @@ select {
   text-transform: uppercase;
 }
 
+/* Archive viewer styles */
+.badge {
+  display: inline-block;
+  padding: 0.1rem 0.4rem;
+  border-radius: 4px;
+  font-size: 0.65rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+.badge-active {
+  background: var(--green-dim);
+  color: var(--green);
+}
+.badge-spent {
+  background: var(--red-dim);
+  color: var(--red);
+  opacity: 0.7;
+}
+.match-header {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+  margin-bottom: 0.2rem;
+}
+.match-key {
+  font-size: 0.78rem;
+}
+.match-details {
+  display: flex;
+  gap: 0.8rem;
+  flex-wrap: wrap;
+  font-size: 0.75rem;
+  color: var(--text-muted);
+}
+.match-detail {
+  white-space: nowrap;
+}
+.match-balance {
+  font-weight: 600;
+  color: var(--text);
+}
+.balance-positive {
+  color: var(--green) !important;
+}
+.archive-filters select,
+.archive-filters input[type="text"] {
+  outline: none;
+}
+.archive-filters select:focus,
+.archive-filters input[type="text"]:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-dim);
+}
+
+/* Alert Configuration */
+.alert-config-grid {
+  padding: 0.5rem 0;
+}
+.alert-config-item {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  padding: 0.75rem;
+}
+.alert-config-item input[type="range"] {
+  accent-color: var(--accent);
+  height: 6px;
+  cursor: pointer;
+}
+
+/* ═══ Strategies Tab ═══ */
+.strategy-card {
+  transition: transform 0.15s ease, box-shadow 0.15s ease, border-color 0.15s ease;
+}
+.strategy-card:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+  border-color: var(--accent);
+}
+.strategy-card strong {
+  color: var(--text);
+}
+
+/* Pattern analysis table */
+#patternAnalysis table th {
+  color: var(--text-muted);
+  font-weight: 600;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+#patternAnalysis table td {
+  color: var(--text);
+  padding: 0.4rem 0.5rem;
+}
+#patternAnalysis table code {
+  background: var(--bg-input);
+  padding: 0.1rem 0.3rem;
+  border-radius: 3px;
+  font-size: 0.75rem;
+  color: var(--accent);
+}
+.scan-pattern-btn {
+  transition: background 0.15s ease;
+}
+.scan-pattern-btn:hover {
+  background: var(--accent-dim);
+}
+
+/* Watchlist table */
+#watchlistTable table th {
+  color: var(--text-muted);
+  font-weight: 600;
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  background: var(--card-bg);
+}
+#watchlistTable table td {
+  color: var(--text);
+  padding: 0.3rem 0.5rem;
+}
+#watchlistTable table tr:hover {
+  background: var(--bg-elevated);
+}
+
+/* Brainwallet patterns columns */
+#brainwalletPatterns strong {
+  color: var(--accent);
+  display: block;
+  margin-bottom: 0.2rem;
+}
+#brainwalletPatterns ul {
+  margin: 0.2rem 0 0.8rem 1rem;
+  padding: 0;
+  list-style: disc;
+}
+#brainwalletPatterns li {
+  margin-bottom: 0.15rem;
+}
+
+/* Quick action buttons */
+.quick-action-btn {
+  transition: all 0.15s ease;
+  border: 1px solid var(--border) !important;
+}
+.quick-action-btn:hover {
+  border-color: var(--accent) !important;
+  background: var(--accent-dim) !important;
+  transform: translateY(-1px);
+}
+.quick-action-btn:active {
+  transform: translateY(0);
+}
+.quick-action-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  transform: none;
+}
+
+/* Strategies tab - responsive columns */
+@media (max-width: 768px) {
+  #brainwalletPatterns {
+    columns: 1 !important;
+  }
+  .strategies-grid {
+    grid-template-columns: 1fr !important;
+  }
+}
+
+/* Tab navigation - ensure strategies tab fits */
+.tab[data-tab="strategies"] {
+  white-space: nowrap;
+}
+.alert-config-item input[type="checkbox"] {
+  accent-color: var(--accent);
+  width: 16px;
+  height: 16px;
+  cursor: pointer;
+}
+
+/* Scan Progress */
+.scan-progress-container {
+  padding: 0.5rem 0;
+}
+.scan-progress-stats {
+  padding: 0;
+}
+.scan-progress-stats .stat {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  padding: 0.5rem 0.75rem;
+}
+.scan-progress-stats .stat-label {
+  display: block;
+  font-size: 0.7rem;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-bottom: 0.2rem;
+}
+.scan-progress-stats .stat-value {
+  font-size: 0.9rem;
+}
+
 /* Footer */
 .footer {
   display: flex;
@@ -1610,4 +1827,232 @@ select {
   .header { flex-direction: column; align-items: flex-start; gap: 0.75rem; }
   .stats-grid { grid-template-columns: 1fr 1fr; }
   .stat-value { font-size: 1rem; }
+}
+
+/* Throughput chart */
+.chart-container {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  padding: 0.75rem;
+  margin-top: 0.75rem;
+}
+.chart-container canvas {
+  display: block;
+  background: var(--bg-input);
+  border-radius: 6px;
+}
+#chartLegend {
+  flex-wrap: wrap;
+}
+
+/* GPU temperature row */
+.gpu-temp-row {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-top: 0.5rem;
+  font-size: 0.8rem;
+}
+.gpu-temp-label {
+  color: var(--text-muted);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.72rem;
+}
+.gpu-temp-pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+.gpu-temp-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0.2rem 0.5rem;
+  border-radius: 6px;
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+}
+.gpu-temp-pill.hot {
+  border-color: rgba(248, 81, 73, 0.5);
+  color: var(--red);
+  background: var(--red-dim);
+}
+.gpu-temp-pill.ok {
+  border-color: rgba(61, 214, 140, 0.4);
+  color: var(--green);
+}
+.gpu-temp-pill.warn {
+  border-color: rgba(210, 153, 34, 0.4);
+  color: var(--yellow);
+}
+
+/* Scan controls row */
+.scan-controls-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-top: 0.75rem;
+}
+
+/* Corpus scan progress */
+.corpus-status {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px 16px;
+  margin-top: 12px;
+  font-size: 0.85rem;
+}
+.corpus-status .progress-bar {
+  height: 6px;
+  background: var(--bg-input);
+  border-radius: 3px;
+  overflow: hidden;
+  margin: 8px 0;
+}
+.corpus-status .progress-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #3b82f6, #10b981);
+  transition: width 0.5s ease;
+  border-radius: 3px;
+}
+.corpus-status small {
+  color: var(--text-muted);
+}
+
+/* Spinner for async operations */
+.spinner {
+  display: inline-block;
+  width: 18px;
+  height: 18px;
+  border: 2px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+/* Scan device rows */
+.scan-device-row:hover {
+  background: rgba(255, 255, 255, 0.08) !important;
+}
+.scan-device-row input[type="number"] {
+  -moz-appearance: textfield;
+}
+.scan-device-row input[type="number"]::-webkit-inner-spin-button,
+.scan-device-row input[type="number"]::-webkit-outer-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+.scan-device-row input[type="number"]:focus {
+  outline: 1px solid var(--accent);
+  border-color: var(--accent) !important;
+}
+
+/* Benchmark results table */
+#benchResults table th {
+  font-weight: 600;
+  color: var(--text-muted);
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+#benchResults table td {
+  color: var(--text);
+  vertical-align: middle;
+}
+
+/* Pause panel — scan tile */
+#scanPausePanel {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+#scanPauseSelector {
+  display: flex;
+  flex-direction: column;
+}
+#scanPauseDurations {
+  display: flex;
+}
+.btn-pause {
+  background: rgba(240, 180, 41, 0.15);
+  color: #f0b429;
+  border: 1px solid rgba(240, 180, 41, 0.4);
+  font-weight: 600;
+  transition: all 0.2s ease;
+}
+.btn-pause:hover {
+  background: rgba(240, 180, 41, 0.25);
+  box-shadow: 0 0 10px rgba(240, 180, 41, 0.2);
+}
+.btn-pause-dur {
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--text-muted);
+  border: 1px solid var(--border);
+  font-size: 0.72rem;
+  padding: 0.15rem 0.45rem;
+  font-weight: 600;
+  transition: all 0.15s ease;
+  cursor: pointer;
+}
+.btn-pause-dur:hover {
+  background: rgba(240, 180, 41, 0.2);
+  color: #f0b429;
+  border-color: rgba(240, 180, 41, 0.5);
+}
+.btn-pause-dur:active {
+  transform: scale(0.95);
+}
+/* Pause active state */
+#scanPauseActive {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+.pause-countdown-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.3rem 0.5rem;
+  background: rgba(240, 180, 41, 0.08);
+  border-radius: 6px;
+  border: 1px solid rgba(240, 180, 41, 0.2);
+}
+.pause-countdown-label {
+  font-size: 0.75rem;
+  color: #f0b429;
+  font-weight: 600;
+}
+.pause-countdown-timer {
+  font-size: 0.85rem;
+  color: #f0b429;
+  font-weight: 700;
+  min-width: 60px;
+  text-align: right;
+}
+.btn-resume {
+  background: rgba(61, 214, 140, 0.2);
+  color: #3dd68c;
+  border: 1px solid rgba(61, 214, 140, 0.5);
+  font-weight: 700;
+  transition: all 0.2s ease;
+  animation: pulse-resume 2s ease-in-out infinite;
+}
+.btn-resume:hover {
+  background: rgba(61, 214, 140, 0.35);
+  box-shadow: 0 0 16px rgba(61, 214, 140, 0.3);
+}
+@keyframes pulse-resume {
+  0%, 100% { box-shadow: 0 0 8px rgba(61, 214, 140, 0.15); }
+  50% { box-shadow: 0 0 16px rgba(61, 214, 140, 0.35); }
 }

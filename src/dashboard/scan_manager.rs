@@ -16,6 +16,18 @@ pub struct ScanGpuRate {
     pub keys_per_sec: u64,
     #[serde(default)]
     pub keys_per_sec_avg: u64,
+    /// GPU temperature in Celsius (from nvidia-smi)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature_c: Option<f64>,
+    /// GPU utilization in percent (from nvidia-smi)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub utilization_pct: Option<f64>,
+    /// VRAM used in MB
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vram_used_mb: Option<f64>,
+    /// VRAM total in MB
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vram_total_mb: Option<f64>,
 }
 
 /// Real-time stats from the brute-force scan
@@ -327,8 +339,6 @@ impl ScanManager {
             state.config.snapshot_path.clone(),
             "--threads".to_string(),
             cpu_workers.to_string(),
-            "--cpu-pct".to_string(),
-            config.cpu_pct.min(100).to_string(),
             "--batch-size".to_string(),
             config.batch_size.to_string(),
             "--count".to_string(),
@@ -360,13 +370,8 @@ impl ScanManager {
         if let Some(ref start) = start_hex {
             args.push("--start".to_string());
             args.push(start.clone());
-            // Important : ne pas reprendre un vieux .position hors fenêtre
-            args.push("--no-resume".to_string());
         }
-        if let Some(ref end) = end_hex {
-            args.push("--end".to_string());
-            args.push(end.clone());
-        }
+        // Note: --end is not a brute_force.exe arg; range length is controlled by --count
 
         args.push("--addr-types".to_string());
         args.push(config.addr_types.clone());
@@ -390,6 +395,8 @@ impl ScanManager {
 
         let mut cmd = Command::new(&bin_path);
         cmd.args(&args)
+            .env("BTC_GPU_LAUNCH", "33554432") // 32M keys/GPU call for max throughput
+            // CPU workers: stride=15 (3 GPU + 12 CPU) gave 180M/s; stride=3 (GPU only) gave 159M/s
             .kill_on_drop(true)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
@@ -580,6 +587,10 @@ impl ScanManager {
                                     .get("keys_per_sec_avg")
                                     .and_then(|v| v.as_u64())
                                     .unwrap_or(0),
+                                temperature_c: g.get("temperature_c").and_then(|v| v.as_f64()),
+                                utilization_pct: g.get("utilization_pct").and_then(|v| v.as_f64()),
+                                vram_used_mb: g.get("vram_used_mb").and_then(|v| v.as_f64()),
+                                vram_total_mb: g.get("vram_total_mb").and_then(|v| v.as_f64()),
                             })
                         })
                         .collect();
@@ -820,6 +831,9 @@ impl ScanManager {
                     let mut max_temp = 0.0f64;
                     let mut mem_used = 0.0f64;
                     let mut mem_total = 0.0f64;
+                    // Per-GPU data
+                    let mut gpu_temps: Vec<(i32, f64, f64, f64, f64)> = Vec::new();
+                    let mut gpu_idx: i32 = 0;
                     for line in stdout.lines() {
                         let parts: Vec<&str> = line.split(',').collect();
                         if parts.len() >= 4 {
@@ -835,12 +849,36 @@ impl ScanManager {
                             }
                             mem_used += mu;
                             mem_total += mt;
+                            gpu_temps.push((gpu_idx, t, u, mu, mt));
+                            gpu_idx += 1;
                         }
                     }
                     stats.gpu_util = Some(max_util);
                     stats.gpu_temp = Some(max_temp);
                     stats.gpu_vram_used = Some(mem_used as u64);
                     stats.gpu_vram_total = Some(mem_total as u64);
+
+                    // Merge per-GPU temps into gpu_rates
+                    for (idx, temp, util, vram_u, vram_t) in gpu_temps {
+                        if let Some(gr) = stats.gpu_rates.iter_mut().find(|g| g.id == idx) {
+                            gr.temperature_c = Some(temp);
+                            gr.utilization_pct = Some(util);
+                            gr.vram_used_mb = Some(vram_u);
+                            gr.vram_total_mb = Some(vram_t);
+                        } else {
+                            // GPU exists in nvidia-smi but not in stats gpu_rates — add it
+                            stats.gpu_rates.push(ScanGpuRate {
+                                id: idx,
+                                keys_tested: 0,
+                                keys_per_sec: 0,
+                                keys_per_sec_avg: 0,
+                                temperature_c: Some(temp),
+                                utilization_pct: Some(util),
+                                vram_used_mb: Some(vram_u),
+                                vram_total_mb: Some(vram_t),
+                            });
+                        }
+                    }
                 }
             }
 

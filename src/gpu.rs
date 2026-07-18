@@ -18,6 +18,8 @@ type FnLoadIndex = unsafe extern "C" fn(*const (), *const u8, *const u8, u32, us
 type FnUnloadIndex = unsafe extern "C" fn() -> ();
 type FnDeriveLookup = unsafe extern "C" fn(*const u8, *mut u64, i32, u32, *const i32, i32) -> i32;
 type FnDeriveLookupSingle = unsafe extern "C" fn(*const u8, *mut u64, i32, u32) -> i32;
+type FnDeriveLookupAsync = unsafe extern "C" fn(*const u8, *mut u64, i32, u32, *const i32, i32) -> i32;
+type FnSyncAll = unsafe extern "C" fn();
 
 static GPU_FUNCS: OnceLock<GpuFuncs> = OnceLock::new();
 
@@ -35,6 +37,8 @@ struct GpuFuncs {
     pub unload_index: Option<FnUnloadIndex>,
     pub derive_lookup: Option<FnDeriveLookup>,
     pub derive_lookup_single: Option<FnDeriveLookupSingle>,
+    pub derive_lookup_async: Option<FnDeriveLookupAsync>,
+    pub sync_all: Option<FnSyncAll>,
 }
 
 /// Find the CUDA DLL (exe dir, cwd, project paths, stable bin)
@@ -85,6 +89,8 @@ fn load_gpu() -> Result<(), String> {
         unload_index: unsafe { lib.get::<FnUnloadIndex>(b"secp_gpu_unload_index").ok().map(|p| *p) },
         derive_lookup: unsafe { lib.get::<FnDeriveLookup>(b"secp_gpu_derive_lookup").ok().map(|p| *p) },
         derive_lookup_single: unsafe { lib.get::<FnDeriveLookupSingle>(b"secp_gpu_derive_lookup_single").ok().map(|p| *p) },
+        derive_lookup_async: unsafe { lib.get::<FnDeriveLookupAsync>(b"secp_gpu_derive_lookup_async").ok().map(|p| *p) },
+        sync_all: unsafe { lib.get::<FnSyncAll>(b"secp_gpu_sync_all").ok().map(|p| *p) },
     };
 
     // Keep library alive (function pointers remain valid while lib is loaded)
@@ -248,5 +254,51 @@ pub fn gpu_derive_lookup_single(
             )
         },
         None => -1,
+    }
+}
+
+/// Async version: launch derive+lookup on GPU without blocking.
+/// Call `gpu_sync_all()` before reading `total_values`.
+/// Enables double-buffering: CPU can prepare the next batch while GPU processes the current one.
+pub fn gpu_derive_lookup_async(
+    privkeys: &[u8],
+    total_values: &mut [u64],
+    count: usize,
+    addr_types: u32,
+    device_ids: &[i32],
+) -> i32 {
+    if !ensure_loaded() { return -1; }
+    let funcs = GPU_FUNCS.get().unwrap();
+    match funcs.derive_lookup_async {
+        Some(f) => unsafe {
+            (f)(
+                privkeys.as_ptr(),
+                total_values.as_mut_ptr(),
+                count as i32,
+                addr_types,
+                device_ids.as_ptr(),
+                device_ids.len() as i32,
+            )
+        },
+        None => -1,
+    }
+}
+
+/// Synchronize all GPU devices — wait for pending async operations to complete.
+/// Must be called before reading results from `gpu_derive_lookup_async`.
+pub fn gpu_sync_all() {
+    if let Some(funcs) = GPU_FUNCS.get() {
+        if let Some(sync) = funcs.sync_all {
+            unsafe { (sync)() };
+        }
+    }
+}
+
+/// Check if async GPU API is available (pinned memory + non-blocking transfers).
+pub fn gpu_async_available() -> bool {
+    if let Some(funcs) = GPU_FUNCS.get() {
+        funcs.derive_lookup_async.is_some() && funcs.sync_all.is_some()
+    } else {
+        false
     }
 }

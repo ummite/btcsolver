@@ -1,0 +1,9 @@
+{
+  "base_block_hash": "0000000000000000000103f4585bae0e9f5957f9698f38b0df7ec932357bb8c3",
+  "built_at": "2026-07-18T15:32:18.040396+00:00",
+  "mempool_space": "https://mempool.space/block/0000000000000000000103f4585bae0e9f5957f9698f38b0df7ec932357bb8c3",
+  "min_value_sats": 1,
+  "num_scripts": 59426905,
+  "num_utxos_source": 166127284,
+  "source": "W:\\Temp\\utxo-tip.dat"
+}

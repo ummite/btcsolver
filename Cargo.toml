@@ -28,6 +28,7 @@ getrandom = "0.2"
 ureq = { version = "2.12", features = ["json"] }
 zstd = "0.13"
 libloading = "0.9.0"
+memmap2 = "0.9"
 crossbeam-channel = "0.5"
 crossbeam-queue = "0.3"
 axum = { version = "0.7", features = ["ws"] }
@@ -81,3 +82,39 @@ path = "src/bin/dump_to_flat.rs"
 [[bin]]
 name = "btcsolver_dashboard"
 path = "src/bin/btcsolver_dashboard.rs"
+
+[[bin]]
+name = "easy_key_generator"
+path = "src/bin/easy_key_generator.rs"
+
+[[bin]]
+name = "historical_indexer"
+path = "src/bin/historical_indexer.rs"
+
+[[bin]]
+name = "easy_key_generator_v2"
+path = "src/bin/easy_key_generator_v2.rs"
+
+[[bin]]
+name = "math_constants_keys"
+path = "src/bin/math_constants_keys.rs"
+
+[[bin]]
+name = "human_2009_keys"
+path = "src/bin/human_2009_keys.rs"
+
+[[bin]]
+name = "pop_culture_2009_keys"
+path = "src/bin/pop_culture_2009_keys.rs"
+
+[[bin]]
+name = "merge_corpus"
+path = "src/bin/merge_corpus.rs"
+
+[[bin]]
+name = "merge_historical_index"
+path = "src/bin/merge_historical_index.rs"
+
+[[bin]]
+name = "external_merge_sort"
+path = "src/bin/external_merge_sort.rs"

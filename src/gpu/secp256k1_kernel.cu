@@ -709,8 +709,8 @@ typedef struct {
 
 /* Compare a generated script (gen_script, gen_len) with the stored script at index i.
  * Returns: -1 if stored < gen, 0 if equal, +1 if stored > gen
- * Uses __ldg() for read-only cache to speed up random accesses.
- * Byte-by-byte comparison (scripts are raw bytes, endianness matters). */
+ * Optimized: 4-byte (uint32_t) comparison for fewer memory accesses.
+ * Uses __ldg() for read-only cache. Unaligned loads are efficient on sm_86+. */
 __device__ int cmp_script_with_index(
     const gpu_script_entry_t *script_entries,
     const uint8_t *all_data,
@@ -724,10 +724,27 @@ __device__ int cmp_script_with_index(
 
     int minlen = (stored_len < gen_len) ? stored_len : gen_len;
 
-    /* Byte-by-byte comparison using read-only cache */
-    for (int k = 0; k < minlen; k++) {
-        uint8_t sb = __ldg(stored + k);
-        uint8_t gb = gen_script[k];
+    /* 4-byte comparison (uint32_t) — reduces memory accesses by 4x */
+    int k = 0;
+    const int full_words = minlen / 4;
+    for (int w = 0; w < full_words; w++) {
+        uint32_t sw = __ldg((const uint32_t *)(stored + k));
+        uint32_t gw = *((const uint32_t *)(gen_script + k));
+        if (sw != gw) {
+            /* Byte-level comparison within the differing word (LE) */
+            for (int b = 0; b < 4; b++) {
+                uint8_t sb = (sw >> (8 * b)) & 0xFF;
+                uint8_t gb = (gw >> (8 * b)) & 0xFF;
+                if (sb != gb) return sb < gb ? -1 : 1;
+            }
+        }
+        k += 4;
+    }
+
+    /* Remaining bytes (< 4) */
+    for (int r = k; r < minlen; r++) {
+        uint8_t sb = __ldg(stored + r);
+        uint8_t gb = gen_script[r];
         if (sb != gb) return sb < gb ? -1 : 1;
     }
 
@@ -974,6 +991,7 @@ __global__ void derive_lookup_kernel(
 typedef struct {
     int             id;
     cudaStream_t    stream;
+    cudaStream_t    stream2;            /* second stream for double-buffering */
     uint8_t        *d_privkeys;
     uint8_t        *d_pubkeys;
     point_t         base_table[16];
@@ -990,6 +1008,21 @@ typedef struct {
     size_t            all_data_size;
     size_t            utxo_data_size;
     int               index_loaded;
+
+    /* Double-buffering: persistent output buffers (no malloc/free per batch) */
+    uint64_t         *d_out;            /* slot 0 output */
+    uint64_t         *d_out2;           /* slot 1 output */
+    size_t            out_alloc_size;   /* max output size allocated */
+    int               current_slot;     /* 0 or 1 for ping-pong */
+
+    /* Pinned host memory for truly async transfers (cudaMemcpyAsync with pinned = non-blocking) */
+    uint8_t          *h_privkeys_pinned;  /* pinned input buffer */
+    uint64_t         *h_out_pinned;       /* pinned output buffer */
+    size_t            pinned_alloc_size;  /* max pinned input size */
+    size_t            pinned_out_size;    /* max pinned output size */
+    uint64_t         *h_total_values;     /* host output pointer for async sync */
+    int               pinned_offset;      /* offset in total_values for last async call */
+    int               pinned_count;       /* count for last async call */
 } gpu_device_t;
 
 static gpu_device_t gpu_devs[MAX_DEVICES];
@@ -1020,6 +1053,11 @@ static cudaError_t init_one_device(int dev_id) {
     gpu_devs[num_gpu_devs].id = dev_id;
     gpu_devs[num_gpu_devs].alloc_size = 0;
     gpu_devs[num_gpu_devs].initialized = 1;
+    gpu_devs[num_gpu_devs].d_out = NULL;
+    gpu_devs[num_gpu_devs].d_out2 = NULL;
+    gpu_devs[num_gpu_devs].out_alloc_size = 0;
+    gpu_devs[num_gpu_devs].current_slot = 0;
+    cudaStreamCreate(&gpu_devs[num_gpu_devs].stream2);
     gpu_devs[num_gpu_devs].d_script_entries = NULL;
     gpu_devs[num_gpu_devs].d_all_data = NULL;
     gpu_devs[num_gpu_devs].d_utxo_data = NULL;
@@ -1027,6 +1065,14 @@ static cudaError_t init_one_device(int dev_id) {
     gpu_devs[num_gpu_devs].all_data_size = 0;
     gpu_devs[num_gpu_devs].utxo_data_size = 0;
     gpu_devs[num_gpu_devs].index_loaded = 0;
+    // Pinned memory fields
+    gpu_devs[num_gpu_devs].h_privkeys_pinned = NULL;
+    gpu_devs[num_gpu_devs].h_out_pinned = NULL;
+    gpu_devs[num_gpu_devs].pinned_alloc_size = 0;
+    gpu_devs[num_gpu_devs].pinned_out_size = 0;
+    gpu_devs[num_gpu_devs].h_total_values = NULL;
+    gpu_devs[num_gpu_devs].pinned_offset = 0;
+    gpu_devs[num_gpu_devs].pinned_count = 0;
     gpu_devs[num_gpu_devs].mem_total = prop.totalGlobalMem;
     strncpy(gpu_devs[num_gpu_devs].name, prop.name, 127);
     gpu_devs[num_gpu_devs].name[127] = 0;
@@ -1264,7 +1310,7 @@ GPU_API int secp_gpu_derive_lookup(
 
         cudaSetDevice(dev->id);
 
-        /* Allocate input buffer */
+        /* Allocate input buffer (grow if needed) */
         size_t needed = n * 32;
         if (needed > dev->alloc_size) {
             if (dev->d_privkeys) cudaFree(dev->d_privkeys);
@@ -1272,18 +1318,30 @@ GPU_API int secp_gpu_derive_lookup(
             dev->alloc_size = needed;
         }
 
-        /* Allocate output buffer */
+        /* Persistent output buffer (ping-pong double-buffering) */
         size_t out_size = n * sizeof(uint64_t);
-        uint64_t *d_out;
-        cudaMalloc(&d_out, out_size);
+        int slot = dev->current_slot;
+        uint64_t *d_out = (slot == 0) ? dev->d_out : dev->d_out2;
+        cudaStream_t stream = (slot == 0) ? dev->stream : dev->stream2;
+        if (out_size > dev->out_alloc_size) {
+            if (d_out) cudaFree(d_out);
+            cudaMalloc(&d_out, out_size);
+            if (slot == 0) dev->d_out = d_out; else dev->d_out2 = d_out;
+            dev->out_alloc_size = out_size;
+        }
+        if (!d_out) {
+            cudaMalloc(&d_out, out_size);
+            if (slot == 0) dev->d_out = d_out; else dev->d_out2 = d_out;
+            dev->out_alloc_size = out_size;
+        }
 
         /* Transfer privkeys to device */
         cudaMemcpyAsync(dev->d_privkeys, privkeys + offset * 32, n * 32,
-                        cudaMemcpyHostToDevice, dev->stream);
+                        cudaMemcpyHostToDevice, stream);
 
         /* Launch kernel */
         int blocks = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;
-        derive_lookup_kernel<<<blocks, BLOCK_SIZE, 0, dev->stream>>>(
+        derive_lookup_kernel<<<blocks, BLOCK_SIZE, 0, stream>>>(
             dev->d_privkeys, d_out,
             dev->base_table,
             dev->d_script_entries, dev->d_all_data, dev->d_utxo_data,
@@ -1292,15 +1350,145 @@ GPU_API int secp_gpu_derive_lookup(
 
         /* Transfer results back */
         cudaMemcpyAsync(total_values + offset, d_out, out_size,
-                        cudaMemcpyDeviceToHost, dev->stream);
+                        cudaMemcpyDeviceToHost, stream);
 
-        cudaStreamSynchronize(dev->stream);
-        cudaFree(d_out);
+        cudaStreamSynchronize(stream);
+        dev->current_slot = 1 - slot; // toggle for next call
         offset += n;
     }
 
     cudaSetDevice(0);
     return 0;
+}
+
+/* Async version: launch kernel without waiting. Call secp_gpu_sync_all() before reading results.
+ * Uses pinned host memory for truly async transfers (non-blocking cudaMemcpyAsync).
+ * Pipeline: host→pinned→device (async) → kernel → device→pinned (async) → sync→host */
+GPU_API int secp_gpu_derive_lookup_async(
+    const uint8_t *privkeys,
+    uint64_t *total_values,
+    int count,
+    uint32_t addr_types,
+    const int *device_ids,
+    int num_devs)
+{
+    if (num_gpu_devs == 0) return -1;
+    if (num_devs <= 0) num_devs = num_gpu_devs;
+
+    for (int d = 0; d < num_devs; d++) {
+        int did = device_ids ? device_ids[d % num_gpu_devs] : d;
+        if (did >= num_gpu_devs) continue;
+        if (!gpu_devs[did].index_loaded) return -1;
+    }
+
+    int keys_per_dev = count / num_devs;
+    int remainder = count % num_devs;
+    int offset = 0;
+
+    for (int d = 0; d < num_devs; d++) {
+        int n = keys_per_dev + (d < remainder ? 1 : 0);
+        if (n <= 0) continue;
+
+        int did = device_ids ? device_ids[d % num_gpu_devs] : d;
+        if (did >= num_gpu_devs) continue;
+        gpu_device_t *dev = &gpu_devs[did];
+
+        cudaSetDevice(dev->id);
+
+        size_t needed = n * 32;
+        size_t out_size = n * sizeof(uint64_t);
+
+        /* Allocate device buffers (grow if needed) */
+        if (needed > dev->alloc_size) {
+            if (dev->d_privkeys) cudaFree(dev->d_privkeys);
+            cudaMalloc(&dev->d_privkeys, needed);
+            dev->alloc_size = needed;
+        }
+
+        int slot = dev->current_slot;
+        uint64_t *d_out = (slot == 0) ? dev->d_out : dev->d_out2;
+        cudaStream_t stream = (slot == 0) ? dev->stream : dev->stream2;
+        if (out_size > dev->out_alloc_size) {
+            if (d_out) cudaFree(d_out);
+            cudaMalloc(&d_out, out_size);
+            if (slot == 0) dev->d_out = d_out; else dev->d_out2 = d_out;
+            dev->out_alloc_size = out_size;
+        }
+        if (!d_out) {
+            cudaMalloc(&d_out, out_size);
+            if (slot == 0) dev->d_out = d_out; else dev->d_out2 = d_out;
+            dev->out_alloc_size = out_size;
+        }
+
+        /* Allocate pinned host memory (grow if needed) — enables truly async transfers */
+        if (needed > dev->pinned_alloc_size) {
+            if (dev->h_privkeys_pinned) cudaFreeHost(dev->h_privkeys_pinned);
+            cudaMallocHost(&dev->h_privkeys_pinned, needed);
+            dev->pinned_alloc_size = needed;
+        }
+        if (!dev->h_privkeys_pinned) {
+            cudaMallocHost(&dev->h_privkeys_pinned, needed);
+            dev->pinned_alloc_size = needed;
+        }
+
+        if (out_size > dev->pinned_out_size) {
+            if (dev->h_out_pinned) cudaFreeHost(dev->h_out_pinned);
+            cudaMallocHost(&dev->h_out_pinned, out_size);
+            dev->pinned_out_size = out_size;
+        }
+        if (!dev->h_out_pinned) {
+            cudaMallocHost(&dev->h_out_pinned, out_size);
+            dev->pinned_out_size = out_size;
+        }
+
+        /* Copy host → pinned (fast, both host memory) */
+        memcpy(dev->h_privkeys_pinned, privkeys + offset * 32, needed);
+
+        /* Pinned → device (TRULY async — non-blocking!) */
+        cudaMemcpyAsync(dev->d_privkeys, dev->h_privkeys_pinned, needed,
+                        cudaMemcpyHostToDevice, stream);
+
+        /* Launch kernel */
+        int blocks = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        derive_lookup_kernel<<<blocks, BLOCK_SIZE, 0, stream>>>(
+            dev->d_privkeys, d_out,
+            dev->base_table,
+            dev->d_script_entries, dev->d_all_data, dev->d_utxo_data,
+            dev->num_script_entries,
+            n, addr_types);
+
+        /* Device → pinned output (TRULY async — non-blocking!) */
+        cudaMemcpyAsync(dev->h_out_pinned, d_out, out_size,
+                        cudaMemcpyDeviceToHost, stream);
+
+        /* Store offset/size/pointer for sync_all to copy pinned→host */
+        dev->h_total_values = total_values + offset;
+        dev->pinned_count = n;
+
+        // NO synchronize — caller must call secp_gpu_sync_all() before reading total_values
+        dev->current_slot = 1 - slot;
+        offset += n;
+    }
+
+    cudaSetDevice(0);
+    return 0;
+}
+
+/* Synchronize all GPU devices (wait for pending async operations) + copy pinned→host */
+GPU_API void secp_gpu_sync_all(void) {
+    for (int i = 0; i < num_gpu_devs; i++) {
+        cudaSetDevice(gpu_devs[i].id);
+        cudaStreamSynchronize(gpu_devs[i].stream);
+        cudaStreamSynchronize(gpu_devs[i].stream2);
+
+        /* Copy pinned output → caller's host buffer */
+        gpu_device_t *dev = &gpu_devs[i];
+        if (dev->h_total_values && dev->h_out_pinned && dev->pinned_count > 0) {
+            size_t out_size = dev->pinned_count * sizeof(uint64_t);
+            memcpy(dev->h_total_values, dev->h_out_pinned, out_size);
+        }
+    }
+    cudaSetDevice(0);
 }
 
 /* Simple wrapper for single-GPU derive+lookup */
@@ -1321,7 +1509,13 @@ GPU_API void secp_gpu_cleanup(void) {
         if (gpu_devs[i].d_script_entries) cudaFree(gpu_devs[i].d_script_entries);
         if (gpu_devs[i].d_all_data) cudaFree(gpu_devs[i].d_all_data);
         if (gpu_devs[i].d_utxo_data) cudaFree(gpu_devs[i].d_utxo_data);
+        if (gpu_devs[i].d_out) cudaFree(gpu_devs[i].d_out);
+        if (gpu_devs[i].d_out2) cudaFree(gpu_devs[i].d_out2);
+        // Free pinned host memory
+        if (gpu_devs[i].h_privkeys_pinned) cudaFreeHost(gpu_devs[i].h_privkeys_pinned);
+        if (gpu_devs[i].h_out_pinned) cudaFreeHost(gpu_devs[i].h_out_pinned);
         if (gpu_devs[i].stream) cudaStreamDestroy(gpu_devs[i].stream);
+        if (gpu_devs[i].stream2) cudaStreamDestroy(gpu_devs[i].stream2);
         gpu_devs[i].initialized = 0;
     }
     num_gpu_devs = 0;

@@ -11,6 +11,89 @@
     "https://www.blockchain.com/explorer/addresses/btc/";
   let lastHits = [];
 
+  // ── Alert System ────────────────────────────────────────────────────────
+  const ALERT_STORAGE = "btcsolver_alerts_v1";
+  let alertConfig = loadAlertConfig();
+  let lastAlertState = {};
+
+  function loadAlertConfig() {
+    try {
+      const saved = localStorage.getItem(ALERT_STORAGE);
+      if (saved) return JSON.parse(saved);
+    } catch (_) {}
+    return {
+      on_match: true,
+      on_crash: true,
+      on_gpu_drop: true,
+      gpu_drop_threshold: 30,
+      on_utxo_stale: true,
+      utxo_stale_hours: 18,
+      sound_enabled: true,
+      browser_notification: false,
+    };
+  }
+
+  function saveAlertConfig() {
+    try { localStorage.setItem(ALERT_STORAGE, JSON.stringify(alertConfig)); } catch (_) {}
+  }
+
+  function checkAlerts(scanStats, health) {
+    if (!scanStats) return;
+    if (alertConfig.on_match) {
+      const hits = scanStats.matches_found || 0;
+      const prevHits = lastAlertState.hits || 0;
+      if (hits > prevHits && hits > 0) {
+        triggerAlert("⚡ MATCH FOUND", `Key with balance detected! Total: ${hits}`, "success");
+        lastAlertState.hits = hits;
+      }
+    }
+    if (alertConfig.on_crash) {
+      const wasRunning = lastAlertState.running;
+      const isRunning = scanStats.running;
+      if (wasRunning && !isRunning) {
+        triggerAlert("🛑 SCAN STOPPED", "Brute-force scan has stopped unexpectedly", "error");
+      }
+      lastAlertState.running = isRunning;
+    }
+    if (alertConfig.on_gpu_drop && scanStats.running) {
+      const gpuUtil = scanStats.gpu_util || 0;
+      if (gpuUtil > 0 && gpuUtil < alertConfig.gpu_drop_threshold) {
+        const key = `gpu_drop_${Math.floor(Date.now() / 60000)}`;
+        if (lastAlertState[key]) return;
+        lastAlertState[key] = true;
+        triggerAlert("⚠️ GPU LOW", `GPU utilization dropped to ${gpuUtil}%`, "warning");
+      }
+    }
+    if (alertConfig.on_utxo_stale && health) {
+      const utxoAge = health.utxo_lag_hours || 0;
+      if (utxoAge > alertConfig.utxo_stale_hours) {
+        const key = `utxo_stale_${Math.floor(Date.now() / 300000)}`;
+        if (lastAlertState[key]) return;
+        lastAlertState[key] = true;
+        triggerAlert("⏰ UTXO STALE", `UTXO index is ${utxoAge.toFixed(1)}h behind tip`, "warning");
+      }
+    }
+  }
+
+  function triggerAlert(title, message, type) {
+    if (alertConfig.browser_notification && Notification.permission === "granted") {
+      try { new Notification(title, { body: message }); } catch (_) {}
+    }
+    if (alertConfig.sound_enabled && type === "success") {
+      try {
+        const ac = new (window.AudioContext || window.webkitAudioContext)();
+        const osc = ac.createOscillator();
+        const gain = ac.createGain();
+        osc.connect(gain); gain.connect(ac.destination);
+        osc.frequency.value = 880; gain.gain.value = 0.3;
+        osc.start();
+        gain.gain.exponentialRampToValueAtTime(0.001, ac.currentTime + 0.5);
+        osc.stop(ac.currentTime + 0.5);
+      } catch (_) {}
+    }
+    toast(`${title}: ${message}`, type);
+  }
+
   /** Block lag → human-readable time estimate (10 min/block average) */
   function formatLagTime(blocks) {
     if (!blocks || blocks <= 0) return "";
@@ -448,6 +531,13 @@
       const panel = $("panel-" + btn.dataset.tab);
       if (panel) panel.classList.add("active");
       if (btn.dataset.tab === "found") void renderFound();
+      if (btn.dataset.tab === "strategies") {
+        renderStrategies();
+        renderPatternAnalysis();
+        renderWatchlist();
+        renderBrainwalletPatterns();
+        renderQuickActions();
+      }
     });
   });
 
@@ -807,6 +897,272 @@
     a.download = `btcsolver-found-${Date.now()}.json`;
     a.click();
   });
+
+  // ── Export scan stats (JSON) ────────────────────────────────────────────
+  $("btnExportScanStats")?.addEventListener("click", async () => {
+    try {
+      toast("Downloading scan export…", "");
+      const res = await fetch("/api/scan/export");
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const blob = await res.blob();
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = `btcsolver-scan-export-${Date.now()}.json`;
+      a.click();
+      toast("Scan stats exported", "success");
+    } catch (e) {
+      toast("Export failed: " + e.message, "error");
+    }
+  });
+
+  // ── Export archive (CSV) ───────────────────────────────────────────────
+  const exportArchiveFn = async () => {
+    try {
+      toast("Downloading archive CSV…", "");
+      const res = await fetch("/api/keys/archive/export");
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const blob = await res.blob();
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = `btcsolver-keys-archive-${Date.now()}.csv`;
+      a.click();
+      toast("Archive exported", "success");
+    } catch (e) {
+      toast("Export failed: " + e.message, "error");
+    }
+  };
+  $("btnExportArchive")?.addEventListener("click", exportArchiveFn);
+  $("btnExportArchiveVault")?.addEventListener("click", exportArchiveFn);
+
+  // ── Pause / Resume scan ────────────────────────────────────────────────
+  $("btnScanPause")?.addEventListener("click", async () => {
+    try {
+      const r = await api("/api/scan/pause", { method: "POST", body: "{}" });
+      if (r.success) {
+        window.__scanPaused = true;
+        toast(`Scan paused${r.position_saved ? " (position saved)" : ""}`, "");
+        if ($("btnScanPause")) $("btnScanPause").disabled = true;
+        if ($("btnScanResume")) $("btnScanResume").disabled = false;
+        setScanPill("off", "PAUSED", "Scan paused — click Resume to continue", "");
+        // Also update the tile pause panel
+        if (window.__updatePausePanel) window.__updatePausePanel(false);
+      } else {
+        toast(r.error || "Pause failed", "error");
+      }
+    } catch (e) {
+      toast("Pause error: " + e.message, "error");
+    }
+  });
+
+  $("btnScanResume")?.addEventListener("click", async () => {
+    try {
+      const r = await api("/api/scan/resume", { method: "POST", body: "{}" });
+      if (r.success) {
+        window.__scanPaused = false;
+        const from = r.resumed_from ? ` from ${shortenHex(r.resumed_from, 8, 6)}` : "";
+        toast(`Scan resumed${from}`, "success");
+        if ($("btnScanPause")) $("btnScanPause").disabled = false;
+        if ($("btnScanResume")) $("btnScanResume").disabled = true;
+        // Also update the tile pause panel
+        if (window.__updatePausePanel) window.__updatePausePanel(true);
+      } else {
+        toast(r.error || "Resume failed", "error");
+      }
+    } catch (e) {
+      toast("Resume error: " + e.message, "error");
+    }
+  });
+
+  // ── Pause panel — duration selector + countdown + auto-resume ──────────
+  (function initPausePanel() {
+    const btnPause      = $("btnScanPauseTile");
+    const btnResume     = $("btnScanResumeTile");
+    const durSelector   = $("scanPauseDurations");
+    const pauseSelector = $("scanPauseSelector");
+    const pauseActive   = $("scanPauseActive");
+    const panel         = $("scanPausePanel");
+    const countdownEl   = $("scanPauseCountdown");
+
+    let pauseTimerId    = null;   // setInterval for countdown
+    let autoResumeId    = null;   // setTimeout for auto-resume
+    let pauseDeadline   = null;   // Date when auto-resume should fire
+
+    // Format milliseconds remaining into a readable string
+    function fmtRemaining(ms) {
+      if (!ms || ms < 0) return "∞";
+      const totalSec = Math.floor(ms / 1000);
+      const h  = Math.floor(totalSec / 3600);
+      const m  = Math.floor((totalSec % 3600) / 60);
+      const s  = totalSec % 60;
+      if (h > 0) return `${h}h ${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+      return `${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+    }
+
+    // Show/hide the panel based on scan state
+    function updatePausePanelVisibility(scanRunning) {
+      if (!panel) return;
+      if (scanRunning && !window.__scanPaused) {
+        panel.style.display = "flex";
+        pauseSelector.style.display = "flex";
+        pauseActive.style.display = "none";
+        durSelector.style.display = "none";
+      } else if (window.__scanPaused) {
+        panel.style.display = "flex";
+        pauseSelector.style.display = "none";
+        pauseActive.style.display = "flex";
+      } else {
+        panel.style.display = "none";
+      }
+    }
+
+    // Toggle duration selector visibility
+    btnPause?.addEventListener("click", () => {
+      if (durSelector.style.display === "flex") {
+        durSelector.style.display = "none";
+      } else {
+        durSelector.style.display = "flex";
+      }
+    });
+
+    // Duration button clicks
+    durSelector?.addEventListener("click", async (e) => {
+      const btn = e.target.closest(".btn-pause-dur");
+      if (!btn) return;
+      const hours = parseInt(btn.dataset.hours) || 0;
+
+      // Hide selector
+      durSelector.style.display = "none";
+
+      // Call pause API
+      try {
+        const r = await api("/api/scan/pause", { method: "POST", body: "{}" });
+        if (!r.success) {
+          toast(r.error || "Pause failed", "error");
+          return;
+        }
+
+        window.__scanPaused = true;
+        setScanPill("off", "PAUSED", "Scan paused — click Resume to continue", "");
+
+        // Set auto-resume timer
+        if (hours > 0) {
+          pauseDeadline = new Date(Date.now() + hours * 3600 * 1000);
+          // Auto-resume after duration
+          autoResumeId = setTimeout(async () => {
+            await doResume();
+          }, hours * 3600 * 1000);
+          // Start countdown
+          pauseTimerId = setInterval(() => {
+            const remaining = pauseDeadline ? pauseDeadline.getTime() - Date.now() : 0;
+            countdownEl.textContent = fmtRemaining(remaining);
+            if (remaining <= 0) {
+              clearInterval(pauseTimerId);
+              pauseTimerId = null;
+            }
+          }, 1000);
+        } else {
+          pauseDeadline = null;
+          countdownEl.textContent = "∞";
+        }
+
+        // Show active state
+        updatePausePanelVisibility(false);
+        toast(`Scan paused${hours > 0 ? ` — auto-resume in ${hours}h` : " (indéfini)"}`, "");
+      } catch (err) {
+        toast("Pause error: " + err.message, "error");
+      }
+    });
+
+    // Resume button handler
+    async function doResume() {
+      try {
+        const r = await api("/api/scan/resume", { method: "POST", body: "{}" });
+        if (r.success) {
+          window.__scanPaused = false;
+          const from = r.resumed_from ? ` from ${shortenHex(r.resumed_from, 8, 6)}` : "";
+          toast(`Scan resumed${from}`, "success");
+          // Clear timers
+          if (pauseTimerId) { clearInterval(pauseTimerId); pauseTimerId = null; }
+          if (autoResumeId) { clearTimeout(autoResumeId); autoResumeId = null; }
+          pauseDeadline = null;
+          updatePausePanelVisibility(true);
+        } else {
+          toast(r.error || "Resume failed", "error");
+        }
+      } catch (err) {
+        toast("Resume error: " + err.message, "error");
+      }
+    }
+
+    btnResume?.addEventListener("click", doResume);
+
+    // Expose globally so other code can trigger panel updates
+    window.__updatePausePanel = updatePausePanelVisibility;
+  })();
+
+  // ── Scan Easy Keys (Background Corpus) ─────────────────────────────────
+  let corpusPollInterval = null;
+
+  $("btnScanEasyKeys")?.addEventListener("click", async () => {
+    try {
+      toast("Starting corpus scan in background…", "");
+      const r = await api("/api/scan/easy-keys", {
+        method: "POST",
+        body: JSON.stringify({ use_gpu: false }),
+        timeoutMs: 60000,
+      });
+      if (r.success) {
+        window.__corpusRunning = true;
+        toast(`Corpus scan started: ${r.total_keys?.toLocaleString()} keys in ${r.files} files`, "success");
+        // Start polling progress
+        if (corpusPollInterval) clearInterval(corpusPollInterval);
+        updateCorpusProgress();
+        corpusPollInterval = setInterval(updateCorpusProgress, 3000);
+      } else {
+        toast(r.error || "Corpus scan failed", "error");
+      }
+    } catch (e) {
+      toast("Corpus scan error: " + e.message, "error");
+    }
+  });
+
+  async function updateCorpusProgress() {
+    try {
+      const r = await api("/api/scan/corpus/progress");
+      const el = $("corpusProgress");
+      if (el) {
+        el.style.display = 'block';
+        const pct = (r.progress_pct || 0).toFixed(1);
+        const tested = (r.keys_tested || 0).toLocaleString();
+        const total = (r.keys_total || 0).toLocaleString();
+        const matches = r.matches_found || 0;
+        const statusText = $("corpusStatusText");
+        if (statusText) {
+          statusText.innerHTML = `
+            <strong>Corpus Scan</strong> ${r.running ? '⏳ Running' : '✅ Done'}
+            <div class="progress-bar"><div class="progress-fill" style="width:${pct}%"></div></div>
+            <span>${tested} / ${total} keys (${pct}%) — ${matches} match(es)</span>
+            ${r.status ? `<br><small>${r.status}</small>` : ''}`;
+        }
+      }
+      if (!r.running && corpusPollInterval) {
+        clearInterval(corpusPollInterval);
+        corpusPollInterval = null;
+        window.__corpusRunning = false;
+        toast(`Corpus scan complete: ${r.keys_tested?.toLocaleString()} keys, ${matches} match(es)`, matches > 0 ? "success" : "");
+      }
+    } catch (_) { /* ignore */ }
+  }
+
+  $("btnStopCorpus")?.addEventListener("click", async () => {
+    try {
+      const r = await api("/api/scan/corpus/stop", { method: "POST" });
+      if (r.success) {
+        window.__corpusRunning = false;
+        toast("Corpus scan stopping…", "");
+      }
+    } catch (e) { toast("Stop error: " + e.message, "error"); }
+  });
   $("btnClearFound")?.addEventListener("click", () => {
     if (confirm("Empty the local vault?")) {
       saveFound([]);
@@ -1066,11 +1422,18 @@
     const totalRate = gpuTotal + cpuTotal;
     const totalTested = Math.max(dictData.keys_tested || 0, scanData.keys_tested || 0);
 
-    // Scan toggle button: ON/OFF
-    if (anyScanOn || totalRate > 0) {
+    // Scan toggle button: ON/OFF/PAUSED
+    if (window.__scanPaused) {
+      setScanPill("off", "PAUSED", "Scan paused — click to resume or use Resume button", "");
+    } else if (anyScanOn || totalRate > 0) {
       setScanPill("on", "SCAN ON", `${formatCompact(totalRate)}/s · ${formatNumber(totalTested)} tested`);
     } else {
       setScanPill("off", "SCAN OFF", "Background scan stopped");
+    }
+
+    // Update pause panel visibility
+    if (window.__updatePausePanel) {
+      window.__updatePausePanel(anyScanOn || totalRate > 0);
     }
 
     // Update "Scan en cours" tile with GPU/CPU breakdown
@@ -1082,9 +1445,41 @@
     }
     if ($("infoScanMode")) {
       const modeLabel = [];
-      if (bruteOn) modeLabel.push("brute");
-      if (dictOn) modeLabel.push("dict");
-      $("infoScanMode").textContent = modeLabel.length ? `mode: ${modeLabel.join(" + ")}` : "mode: —";
+      const scanMode = scanData.mode || "sequential";
+      const gpuCount = (scanData.gpu_rates || []).filter(g => (g.keys_per_sec || g.keys_per_sec_avg || 0) > 0).length;
+      const cpuThreads = scanData.cpu_threads || 0;
+
+      // Brute-force scan type
+      if (bruteOn) {
+        let label = "Auto Scan";
+        if (scanMode === "random") label = "Random Scan";
+        const hw = [];
+        if (gpuCount > 0) hw.push(`${gpuCount} GPU`);
+        if (cpuThreads > 0) hw.push(`${cpuThreads} CPU`);
+        if (hw.length) label += ` (${hw.join(" + ")})`;
+        modeLabel.push(label);
+      }
+
+      // Dict scan
+      if (dictOn) {
+        let label = "Dict Scan";
+        const phrases = dictData.phrases_total || 0;
+        const progress = dictData.progress_pct || 0;
+        if (phrases > 0) label += ` (${progress.toFixed(1)}%)`;
+        modeLabel.push(label);
+      }
+
+      // Corpus scan (check via global state)
+      if (window.__corpusRunning) {
+        modeLabel.push("Corpus Scan");
+      }
+
+      // Benchmark
+      if (window.__benchRunning) {
+        modeLabel.push("Benchmark");
+      }
+
+      $("infoScanMode").textContent = modeLabel.length ? `▶ ${modeLabel.join(" + ")}` : "mode: —";
     }
     // GPU/CPU detail line in the scan section
     if ($("scanRateDetail")) {
@@ -1101,12 +1496,8 @@
       $("infoScanError").textContent = errMsg;
     }
 
-    // GPU/CPU detail line in the scan tile (compact)
-    if ($("infoScanDetail")) {
-      const tileParts = [...gpuParts];
-      if (cpuTotal > 0) tileParts.push(`CPU: ${formatCompact(cpuTotal)}/s`);
-      $("infoScanDetail").textContent = tileParts.length ? tileParts.join(" · ") : "";
-    }
+    // GPU/CPU vertical breakdown with thread config
+    renderScanDeviceBreakdown(scanData, dictData, cpuTotal);
 
     if (synced) setPill("pillSync", "Chain OK", "ok", "Chain up to date");
     else if (running) setPill("pillSync", "Chain syncing", "warn", s?.simple_status || "Sync in progress");
@@ -1132,7 +1523,8 @@
   }
 
   /** UTXO valid for tests if within this many hours of tip (user rule). */
-  const UTXO_VALID_HOURS = 24;
+  const UTXO_VALID_HOURS = 24;       // < 24h = vert (OK)
+  const UTXO_WARNING_HOURS = 168;    // 24h–7j = jaune (acceptable), > 7j = rouge
 
   /**
    * Estimate how many hours the UTXO index lags behind "tip".
@@ -1223,6 +1615,11 @@
     // Valid for tests: < 24h behind tip (user rule)
     const validForTests =
       lag.hours != null && lag.hours <= UTXO_VALID_HOURS;
+    // Warning (yellow): 24h – 7 days behind tip (acceptable but not ideal)
+    const warningState =
+      lag.hours != null && lag.hours > UTXO_VALID_HOURS && lag.hours <= UTXO_WARNING_HOURS;
+    // Red: > 7 days behind tip (stale)
+    const staleState = !validForTests && !warningState;
     // Exact tip alignment (bonus / green wording)
     const atExactTip =
       coreSynced &&
@@ -1268,11 +1665,13 @@
           lag.hours < 1
             ? `${Math.round(lag.hours * 60)} min`
             : `${lag.hours.toFixed(1)} h`;
-        parts.push(
-          validForTests
-            ? `lag ≈ ${hLabel} (< ${UTXO_VALID_HOURS}h → tests OK)`
-            : `lag ≈ ${hLabel} (> ${UTXO_VALID_HOURS}h → tests unreliable)`
-        );
+        if (validForTests) {
+          parts.push(`lag ≈ ${hLabel} (< ${UTXO_VALID_HOURS}h → tests OK)`);
+        } else if (warningState) {
+          parts.push(`lag ≈ ${hLabel} (${UTXO_VALID_HOURS}h–${UTXO_WARNING_HOURS}h → acceptable, candidates)`);
+        } else {
+          parts.push(`lag ≈ ${hLabel} (> ${UTXO_WARNING_HOURS}h → stale, unreliable)`);
+        }
       }
       if (lag.blockLag != null && lag.blockLag > 0) {
         parts.push(`${formatHeight(lag.blockLag)} blocks behind tip${formatLagTime(lag.blockLag)}`);
@@ -1285,8 +1684,9 @@
     warn.classList.remove("hidden");
 
     if (validForTests || atExactTip) {
+      // ===== GREEN: < 24h =====
       warn.classList.add("is-tip");
-      warn.classList.remove("tip-stale");
+      warn.classList.remove("tip-stale", "tip-warning");
       if (strong) {
         strong.textContent = atExactTip
           ? "✓ UTXO at tip — balances reliable for tests"
@@ -1325,8 +1725,49 @@
           `Index block ${formatHeight(lag.idxH)} · Core ${formatHeight(tipN)} · valid for tests (<${UTXO_VALID_HOURS}h)`
         );
       }
+    } else if (warningState) {
+      // ===== YELLOW: 24h – 7 days =====
+      warn.classList.add("tip-warning");
+      warn.classList.remove("is-tip", "tip-stale");
+      if (strong) {
+        strong.textContent = `⚡ UTXO acceptable (${UTXO_VALID_HOURS}h–${UTXO_WARNING_HOURS}h lag) — hits = candidates`;
+      }
+      if (body) {
+        const hLabel =
+          lag.hours != null
+            ? lag.hours < 1
+              ? `${Math.round(lag.hours * 60)} min`
+              : `${lag.hours.toFixed(1)} h`
+            : "—";
+        const idxL = lag.idxH != null ? formatHeight(lag.idxH) : "—";
+        const tipL =
+          coreBlocks != null
+            ? formatHeight(coreBlocks)
+            : lag.tipH != null
+              ? formatHeight(lag.tipH)
+              : "—";
+        body.innerHTML =
+          `UTXO index at block <strong>${idxL}</strong> · tip Core <strong>${tipL}</strong>. ` +
+          `Lag ≈ <strong>${hLabel}</strong> (between <strong>${UTXO_VALID_HOURS} h</strong> and <strong>${UTXO_WARNING_HOURS} h</strong>). ` +
+          `Index is <strong>acceptable</strong> — matches are <em>candidates</em> (some balances may have been spent since index was built). ` +
+          `Verify on-chain before any spending. ` +
+          `<br>Auto-refresh at tip via <code>Keep-Core-And-Utxo.ps1</code>.`;
+      }
+      // UTXO pill: yellow when warning
+      if ($("pillUtxo") && lag.idxH != null) {
+        const tipN = coreBlocks != null ? coreBlocks : lag.tipH;
+        setPill(
+          "pillUtxo",
+          tipN != null
+            ? `UTXO ${formatHeight(lag.idxH)} / ${formatHeight(tipN)}`
+            : `UTXO ${formatHeight(lag.idxH)}`,
+          "warn",
+          `Lag ${lag.hours?.toFixed(1) ?? "?"}h (acceptable ${UTXO_VALID_HOURS}–${UTXO_WARNING_HOURS}h) · candidates only`
+        );
+      }
     } else {
-      warn.classList.remove("is-tip");
+      // ===== RED: > 7 days =====
+      warn.classList.remove("is-tip", "tip-warning");
       warn.classList.add("tip-stale");
       const coreBlocksStale = alwaysOn?.blocks ?? btc?.blocks;
       const coreHeadersStale = alwaysOn?.headers ?? btc?.headers;
@@ -1357,7 +1798,7 @@
               : lag.tipH != null
                 ? formatHeight(lag.tipH)
                 : "?";
-          strong.textContent = `⚠ UTXO block ${idxS} / Core ${tipS} — too stale for reliable balances`;
+          strong.textContent = `⚠ UTXO block ${idxS} / Core ${tipS} — stale (> ${UTXO_WARNING_HOURS}h), unreliable`;
         }
       }
       if (body) {
@@ -1406,10 +1847,9 @@
           html =
             `UTXO index at block <strong>${idxFull}</strong> · tip Bitcoin Core <strong>${tipFull}</strong>` +
             ` · lag <strong>${lagFull}</strong> blocks (≈ <strong>${hLabel}</strong>).<br>` +
-            `Rule: UTXO index <strong>valid for tests</strong> only if it has ` +
-            `<strong>&lt; ${UTXO_VALID_HOURS} h</strong> lag behind tip. ` +
-            `Current lag ≈ <strong>${hLabel}</strong>. ` +
-            `Hits remain <em>candidates</em>. ` +
+            `Thresholds: <strong>&lt; ${UTXO_VALID_HOURS}h</strong> = valid · <strong>${UTXO_VALID_HOURS}–${UTXO_WARNING_HOURS}h</strong> = candidates · <strong>> ${UTXO_WARNING_HOURS}h</strong> = stale. ` +
+            `Current lag ≈ <strong>${hLabel}</strong> — index is <strong>stale</strong>. ` +
+            `Hits are <em>candidates only</em> (many balances likely spent since index was built). ` +
             `<br>Auto-refresh at tip via <code>Keep-Core-And-Utxo.ps1</code>.`;
         }
         body.innerHTML = html;
@@ -1716,25 +2156,36 @@
         "Index rebuild in progress (dumptxoutset / dump_to_flat) — not yet red";
     } else if (lagHours != null && Number.isFinite(lagHours)) {
       if (lagHours < UTXO_VALID_HOURS) {
+        // GREEN: < 24h
         utxoCls = "is-green";
         utxoTxt =
           idxH != null
             ? `UTXO OK · ${formatHeight(idxH)}`
             : "UTXO OK (< 24 h)";
         utxoTitle = `Index up to date (< ${UTXO_VALID_HOURS} h of tip) · lag ≈ ${lagHours.toFixed(1)} h`;
+      } else if (lagHours <= UTXO_WARNING_HOURS) {
+        // YELLOW: 24h – 7 days
+        utxoCls = "is-yellow";
+        utxoTxt =
+          idxH != null
+            ? `UTXO ⚡ · ${formatHeight(idxH)}`
+            : `UTXO ⚡ (${lagHours.toFixed(0)}h)`;
+        utxoTitle =
+          `Lag ≈ ${lagHours.toFixed(1)} h (acceptable ${UTXO_VALID_HOURS}–${UTXO_WARNING_HOURS}h) · candidates only` +
+          (blockLag != null ? ` · ${formatHeight(blockLag)} blocks${formatLagTime(blockLag)}` : "");
       } else {
-        // ≥ 24 h et no rebuild → rouge
+        // RED: > 7 days
         utxoCls = "is-red";
         utxoTxt =
           idxH != null
             ? `UTXO stale · ${formatHeight(idxH)}`
-            : "UTXO stale (≥ 24 h)";
+            : `UTXO stale (${lagHours.toFixed(0)}h)`;
         utxoTitle =
-          `Lag ≈ ${lagHours.toFixed(1)} h (≥ ${UTXO_VALID_HOURS} h) and no rebuild in progress` +
+          `Lag ≈ ${lagHours.toFixed(1)} h (> ${UTXO_WARNING_HOURS}h = 7 days) — stale` +
           (blockLag != null ? ` · ${formatHeight(blockLag)} blocks${formatLagTime(blockLag)}` : "");
       }
     } else if (blockLag != null) {
-      // fallback sans heures : ~144 blocks ≈ 24 h
+      // fallback sans heures : ~144 blocks ≈ 24h, ~2016 blocks ≈ 7 days
       if (blockLag < 144) {
         utxoCls = "is-green";
         utxoTxt =
@@ -1742,13 +2193,20 @@
             ? `UTXO OK · ${formatHeight(idxH)}`
             : "UTXO OK";
         utxoTitle = `Lag ${formatHeight(blockLag)} blocks${formatLagTime(blockLag)} (< ~24 h)`;
+      } else if (blockLag < 2016) {
+        utxoCls = "is-yellow";
+        utxoTxt =
+          idxH != null
+            ? `UTXO ⚡ · ${formatHeight(idxH)}`
+            : "UTXO ⚡";
+        utxoTitle = `Lag ${formatHeight(blockLag)} blocks${formatLagTime(blockLag)} (~24h–7d)`;
       } else {
         utxoCls = "is-red";
         utxoTxt =
           idxH != null
             ? `UTXO stale · ${formatHeight(idxH)}`
             : "UTXO stale";
-        utxoTitle = `Lag ${formatHeight(blockLag)} blocks${formatLagTime(blockLag)} (≥ ~24 h), no rebuild`;
+        utxoTitle = `Lag ${formatHeight(blockLag)} blocks${formatLagTime(blockLag)} (> ~7 days), stale`;
       }
     }
 
@@ -1988,7 +2446,14 @@
   function updateScan(s, health) {
     if (!s) return;
     if (s.error) {
-      setScanPill("error", "SCAN FAILED", "Error: " + s.error, s.error);
+      // Only show error on the toggle if dict is NOT running
+      const dictRunning2 = !!(health?.dict?.running);
+      if (!dictRunning2) {
+        setScanPill("error", "SCAN FAILED", "Error: " + s.error, s.error);
+      }
+      // Always show error in the scan tile regardless
+      const errEl2 = $("infoScanError");
+      if (errEl2) errEl2.textContent = s.error;
       return;
     }
     const run = !!s.running;
@@ -2038,6 +2503,16 @@
     updateHitsDisplay(hits, arch);
     setText("gpuUtil", s.gpu_util != null ? Number(s.gpu_util).toFixed(0) + "%" : "—");
     setText("currentPosition", s.current_position || s.range_end || "—");
+
+    // Update GPU temperature pills
+    updateGpuTemps(s.gpu_rates || []);
+
+    // Update pause/resume button states
+    if ($("btnScanPause")) $("btnScanPause").disabled = !run;
+    if ($("btnScanResume")) {
+      const posFileExists = !!(window.__scanPaused || false);
+      $("btnScanResume").disabled = run || !posFileExists;
+    }
 
     // Hex COMPLET (pas de raccourci …) pour From / To / curseur
     const rs = s.range_start || s.start_key || null;
@@ -2158,6 +2633,9 @@
     if ($("btnStop")) $("btnStop").disabled = !run;
 
     // Status bar: fixed short label (range only in tooltip — avoids layout jump)
+    // Only override the toggle button if NO other scan source is running.
+    // updateStatusBar (12s) aggregates brute+dict; we must not overwrite it.
+    const dictRunning = !!(health?.dict?.running);
     if (run) {
       const rate = live;
       const rangeTip =
@@ -2178,7 +2656,7 @@
       if (cpuRate > 0) hwParts.push(`CPU: ${formatCompact(cpuRate)}/s`);
       setScanPill(
         "on",
-        rate != null ? `SCAN ${formatCompact(rate)}/s` : "SCAN ON",
+        "SCAN ON",
         [
           ...hwParts,
           rate != null ? `${formatNumber(rate)} keys/s live` : null,
@@ -2189,9 +2667,39 @@
           .filter(Boolean)
           .join(" · ")
       );
-    } else {
+    } else if (!dictRunning) {
+      // Only set OFF if dict is also not running (updateStatusBar will handle the combined state)
       setScanPill("off", "SCAN OFF", "Background scan stopped");
     }
+  }
+
+  // ── GPU Temperature Display ────────────────────────────────────────────
+  function updateGpuTemps(gpuRates) {
+    const container = $("gpuTempPills");
+    if (!container) return;
+    if (!gpuRates.length) {
+      container.innerHTML = "<span style='color:var(--text-dim)'>—</span>";
+      return;
+    }
+    container.innerHTML = gpuRates
+      .map((g) => {
+        const temp = g.temperature_c != null ? Number(g.temperature_c).toFixed(0) : "—";
+        const util = g.utilization_pct != null ? Number(g.utilization_pct).toFixed(0) : "—";
+        const vram =
+          g.vram_used_mb != null && g.vram_total_mb != null
+            ? `${Math.round(g.vram_used_mb)} / ${Math.round(g.vram_total_mb)} MB`
+            : "—";
+        // Color based on temperature
+        let cls = "ok";
+        if (g.temperature_c != null) {
+          if (g.temperature_c >= 80) cls = "hot";
+          else if (g.temperature_c >= 70) cls = "warn";
+        }
+        return `<span class="gpu-temp-pill ${cls}" title="GPU ${g.id}: ${util}% util, ${vram} VRAM">
+          GPU${g.id}: <strong>${temp}°C</strong> <span style="opacity:0.6">(${util}%)</span>
+        </span>`;
+      })
+      .join("");
   }
 
   async function refreshBtc() {
@@ -2262,6 +2770,30 @@
       } catch (e) {
         console.warn("updateUtxo/tip", e);
       }
+      // GPU monitoring
+      try {
+        if (h.gpu && Array.isArray(h.gpu)) updateGpuPanel(h.gpu);
+      } catch (e) {
+        console.warn("updateGpuPanel", e);
+      }
+      // Process monitor
+      try {
+        if (h.processes && Array.isArray(h.processes)) updateProcessPanel(h.processes);
+      } catch (e) {
+        console.warn("updateProcessPanel", e);
+      }
+      // Historical indexer status
+      try {
+        if (h.historical_indexer) updateHiStatus(h.historical_indexer);
+      } catch (e) {
+        console.warn("updateHiStatus", e);
+      }
+      // Scan optimization panel
+      try {
+        updateScanOptimization(h);
+      } catch (e) {
+        console.warn("updateScanOptimization", e);
+      }
       // Success path always restores index pill if loaded
       if (h.index_loaded) {
         setPill(
@@ -2282,7 +2814,9 @@
 
   async function refreshScan() {
     try {
-      updateScan(await api("/api/scan/stats"));
+      const stats = await api("/api/scan/stats");
+      updateScan(stats, window.__lastHealth || {});
+      checkAlerts(stats, window.__lastHealth || {});
     } catch (_) {}
   }
 
@@ -2591,6 +3125,12 @@
     if (!btn || _scanTogglePending) return;
     const currentState = btn.className || "";
 
+    // If paused, resume
+    if (window.__scanPaused && currentState.includes("is-off")) {
+      if ($("btnScanResume")) $("btnScanResume").click();
+      return;
+    }
+
     if (currentState.includes("is-on")) {
       // Currently ON → stop
       _scanTogglePending = true;
@@ -2681,7 +3221,7 @@
       try {
         const msg = JSON.parse(ev.data);
         if (msg.type === "tick") {
-          if (msg.scan) updateScan(msg.scan);
+          if (msg.scan) updateScan(msg.scan, window.__lastHealth || {});
           if (msg.dict) updateDict(msg.dict);
           if (msg.bitcoind) updateBtc(msg.bitcoind);
         }
@@ -2696,6 +3236,7 @@
   renderActiveTransforms(selectedTransforms());
   loadCorpora();
   renderFound();
+  initBip39Tab();
   refreshBtc();
   refreshSnap();
   refreshHealth();
@@ -2704,10 +3245,1964 @@
   setInterval(refreshScan, 3000);
   refreshRangesLog();
   setInterval(refreshRangesLog, 15000);
+
+  // Watchlist buttons
+  $("btnAddWatchlist")?.addEventListener("click", showAddWatchlistDialog);
+  $("btnExportWatchlist")?.addEventListener("click", () => {
+    const list = loadWatchlist();
+    if (!list.length) return toast("Watchlist vide", "warning");
+    const csv = "key,source,added_at,last_balance_sats\n" + list.map(w => `${w.key},${w.source},${w.added_at},${w.last_balance}`).join("\n");
+    downloadFile(`btcsolver-watchlist-${Date.now()}.csv`, csv, "text/csv");
+    toast("Watchlist exported", "success");
+  });
+  $("btnClearWatchlist")?.addEventListener("click", () => {
+    if (confirm("Vider la watchlist?")) {
+      saveWatchlist([]);
+      renderWatchlist();
+      toast("Watchlist vidée", "");
+    }
+  });
+
+  // Throughput chart — real-time keys/sec over last 30 minutes (5s intervals)
+  (function initThroughputChart() {
+    const canvas = $("throughputChart");
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    // HiDPI support
+    const dpr = window.devicePixelRatio || 1;
+    const rect = canvas.getBoundingClientRect();
+    canvas.width = rect.width * dpr;
+    canvas.height = rect.height * dpr;
+    ctx.scale(dpr, dpr);
+    const W = rect.width;
+    const H = rect.height;
+
+    const MAX_POINTS = 360; // 30 min at 1 sample/5s
+    const data = { total: [], gpu0: [], gpu1: [], gpu2: [], cpu: [] };
+    const COLORS = {
+      total: "#f7931a",
+      gpu0: "#58a6ff",
+      gpu1: "#3dd68c",
+      gpu2: "#d29922",
+      cpu: "#8b9bb0",
+    };
+
+    function pushPoint(stats) {
+      if (!stats || !stats.running) return;
+      const total = (stats.keys_per_sec_live || stats.keys_per_sec || 0) / 1e6;
+      data.total.push(total);
+      if (data.total.length > MAX_POINTS) data.total.shift();
+
+      const gpuRates = stats.gpu_rates || [];
+      for (let i = 0; i < 3; i++) {
+        const arr = [data.gpu0, data.gpu1, data.gpu2][i];
+        const g = gpuRates.find((r) => r.id === i);
+        arr.push(g ? (g.keys_per_sec / 1e6) : 0);
+        if (arr.length > MAX_POINTS) arr.shift();
+      }
+      const cpu = (stats.cpu_keys_per_sec || 0) / 1e6;
+      data.cpu.push(cpu);
+      if (data.cpu.length > MAX_POINTS) data.cpu.shift();
+    }
+
+    function drawChart() {
+      ctx.clearRect(0, 0, W, H);
+      if (data.total.length < 2) {
+        ctx.fillStyle = "#5c6b7f";
+        ctx.font = "12px Inter, sans-serif";
+        ctx.textAlign = "center";
+        ctx.fillText("Waiting for scan data…", W / 2, H / 2);
+        return;
+      }
+
+      const allValues = [...data.total, ...data.gpu0, ...data.gpu1, ...data.gpu2];
+      const maxVal = Math.max(...allValues, 1);
+      const yRange = maxVal * 1.15;
+      const pad = { top: 8, right: 12, bottom: 22, left: 52 };
+      const chartW = W - pad.left - pad.right;
+      const chartH = H - pad.top - pad.bottom;
+
+      // Grid lines
+      ctx.strokeStyle = "rgba(36, 48, 65, 0.6)";
+      ctx.lineWidth = 0.5;
+      const gridLines = 4;
+      for (let i = 0; i <= gridLines; i++) {
+        const y = pad.top + (chartH / gridLines) * i;
+        ctx.beginPath();
+        ctx.moveTo(pad.left, y);
+        ctx.lineTo(W - pad.right, y);
+        ctx.stroke();
+        // Y-axis labels
+        const val = yRange - (yRange / gridLines) * i;
+        ctx.fillStyle = "#5c6b7f";
+        ctx.font = "10px JetBrains Mono, monospace";
+        ctx.textAlign = "right";
+        ctx.fillText(val.toFixed(0) + "M", pad.left - 6, y + 3);
+      }
+
+      // X-axis time labels (30 min span, 5s intervals)
+      ctx.fillStyle = "#5c6b7f";
+      ctx.font = "9px JetBrains Mono, monospace";
+      ctx.textAlign = "center";
+      const timeLabels = [
+        { pos: 0, label: "now" },
+        { pos: MAX_POINTS / 6, label: "-5m" },
+        { pos: MAX_POINTS / 3, label: "-10m" },
+        { pos: MAX_POINTS / 2, label: "-15m" },
+        { pos: (2 * MAX_POINTS) / 3, label: "-20m" },
+        { pos: (5 * MAX_POINTS) / 6, label: "-25m" },
+        { pos: MAX_POINTS - 1, label: "-30m" },
+      ];
+      for (const tl of timeLabels) {
+        const x = pad.left + (tl.pos / (MAX_POINTS - 1)) * chartW;
+        ctx.fillText(tl.label, x, H - 4);
+      }
+
+      // Draw lines
+      function drawLine(values, color, lineWidth) {
+        if (values.length < 2) return;
+        const len = values.length;
+        ctx.strokeStyle = color;
+        ctx.lineWidth = lineWidth || 1.5;
+        ctx.beginPath();
+        for (let i = 0; i < len; i++) {
+          const x = pad.left + (i / (MAX_POINTS - 1)) * chartW;
+          const y = pad.top + chartH - (values[i] / yRange) * chartH;
+          if (i === 0) ctx.moveTo(x, y);
+          else ctx.lineTo(x, y);
+        }
+        ctx.stroke();
+
+        // Fill area under line (subtle)
+        ctx.globalAlpha = 0.08;
+        ctx.fillStyle = color;
+        ctx.lineTo(pad.left + ((len - 1) / (MAX_POINTS - 1)) * chartW, pad.top + chartH);
+        ctx.lineTo(pad.left, pad.top + chartH);
+        ctx.closePath();
+        ctx.fill();
+        ctx.globalAlpha = 1.0;
+      }
+
+      // Draw from back to front
+      drawLine(data.cpu, COLORS.cpu, 1);
+      drawLine(data.gpu2, COLORS.gpu2, 1.2);
+      drawLine(data.gpu1, COLORS.gpu1, 1.2);
+      drawLine(data.gpu0, COLORS.gpu0, 1.2);
+      drawLine(data.total, COLORS.total, 2);
+
+      // Current value labels (right side)
+      ctx.font = "10px JetBrains Mono, monospace";
+      ctx.textAlign = "right";
+      const labels = [
+        { val: data.total, color: COLORS.total, prefix: "Σ " },
+        { val: data.gpu0, color: COLORS.gpu0, prefix: "G0 " },
+        { val: data.gpu1, color: COLORS.gpu1, prefix: "G1 " },
+        { val: data.gpu2, color: COLORS.gpu2, prefix: "G2 " },
+      ];
+      labels.forEach((l, idx) => {
+        if (l.val.length > 0) {
+          const last = l.val[l.val.length - 1];
+          const y = pad.top + 12 + idx * 13;
+          ctx.fillStyle = l.color;
+          ctx.fillText(l.prefix + last.toFixed(1) + "M/s", W - 4, y);
+        }
+      });
+    }
+
+    // Collect data every 5 seconds (independent of refreshScan)
+    setInterval(async () => {
+      try {
+        const stats = await api("/api/scan/stats");
+        pushPoint(stats);
+      } catch (_) {}
+      drawChart();
+    }, 5000);
+
+    // Initial draw
+    drawChart();
+  })();
   // Scan listes: 2 mises à jour / seconde
   setInterval(async () => {
     try {
       updateDict(await api("/api/dict/status"));
     } catch (_) {}
   }, 500);
+
+  // ── Historical Archive Viewer ──────────────────────────────────────────
+  function downloadFile(filename, content, mime) {
+    const blob = new Blob([content], { type: mime || "text/plain" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = filename;
+    document.body.appendChild(a); a.click();
+    document.body.removeChild(a); URL.revokeObjectURL(url);
+  }
+
+  let archiveData = null;
+
+  async function loadArchive() {
+    try {
+      const data = await api("/api/keys/archive");
+      archiveData = data.keys || data.entries || data.archive || [];
+      $("pillArchiveCount").textContent = `Total: ${archiveData.length} keys`;
+      renderArchive();
+    } catch (e) {
+      $("archiveList").innerHTML = `<span class="hint">Failed to load archive: ${esc(String(e))}</span>`;
+    }
+  }
+
+  function renderArchive() {
+    if (!archiveData) return;
+    const search = ($("archiveSearch")?.value || "").toLowerCase();
+    const sort = $("archiveSort")?.value || "peak_desc";
+    const spentOnly = $("archiveSpentOnly")?.checked || false;
+
+    let filtered = archiveData;
+    if (spentOnly) {
+      filtered = filtered.filter(k => (k.current_sats || k.balance_sats || 0) === 0);
+    }
+    if (search) {
+      filtered = filtered.filter(k => {
+        const haystack = [
+          k.key_hex, k.privkey_hex, k.address, k.addresses,
+          k.peak_sats, k.current_sats, k.first_seen_height, k.last_seen_height,
+          k.note, k.transform
+        ].join(" ").toLowerCase();
+        return haystack.includes(search);
+      });
+    }
+
+    // Sort
+    filtered.sort((a, b) => {
+      switch (sort) {
+        case "peak_desc": return (b.peak_sats || 0) - (a.peak_sats || 0);
+        case "peak_asc": return (a.peak_sats || 0) - (b.peak_sats || 0);
+        case "first_desc": return (b.first_seen_height || 0) - (a.first_seen_height || 0);
+        case "last_desc": return (b.last_seen_height || 0) - (a.last_seen_height || 0);
+        case "current_desc": return (b.current_sats || b.balance_sats || 0) - (a.current_sats || a.balance_sats || 0);
+        default: return 0;
+      }
+    });
+
+    const container = $("archiveList");
+    if (!filtered.length) {
+      container.innerHTML = '<span class="hint">No archived keys match your filters.</span>';
+      return;
+    }
+
+    // Show top 200 by default to avoid DOM overload
+    const maxShow = 200;
+    const shown = filtered.slice(0, maxShow);
+
+    let html = `<div style="font-size:0.8rem;opacity:0.7;margin-bottom:0.5rem">Showing ${shown.length} of ${filtered.length} archived keys</div>`;
+    html += '<div style="display:grid;gap:0.5rem">';
+
+    for (const k of shown) {
+      const keyHex = k.key_hex || k.privkey_hex || "unknown";
+      const shortKey = shortDisplay(keyHex, 8, 6);
+      const peak = k.peak_sats || k.max_sats || 0;
+      const current = k.current_sats ?? k.balance_sats ?? 0;
+      const firstH = k.first_seen_height ?? k.first_height ?? "—";
+      const lastH = k.last_seen_height ?? k.last_height ?? "—";
+      const addr = k.address || (k.addresses && k.addresses[0]) || "—";
+      const transform = k.transform || k.variant || "";
+      const isSpent = current === 0;
+
+      html += `<div class="match-item" style="${isSpent ? 'opacity:0.6' : ''}">
+        <div class="match-header">
+          <span class="match-key mono">${shortDisplay(keyHex, 12, 8)}</span>
+          ${isSpent ? '<span class="badge badge-spent">SPENT</span>' : '<span class="badge badge-active">ACTIVE</span>'}
+          ${transform ? `<span class="badge" style="background:var(--blue-dim);color:var(--blue)">${esc(transform)}</span>` : ''}
+        </div>
+        <div class="match-details">
+          <span class="match-balance ${isSpent ? '' : 'balance-positive'}">${formatNumber(current)} sats</span>
+          <span class="match-detail">Peak: <strong>${formatNumber(peak)} sats</strong></span>
+          <span class="match-detail">First: ${formatHeight(firstH)}</span>
+          <span class="match-detail">Last: ${formatHeight(lastH)}</span>
+          <span class="match-detail mono" style="word-break:break-all">${shortDisplay(String(addr), 10, 8)}</span>
+        </div>
+      </div>`;
+    }
+
+    html += '</div>';
+    if (filtered.length > maxShow) {
+      html += `<div class="hint" style="text-align:center;margin-top:0.5rem">Use search/filter to narrow down (${filtered.length - maxShow} more hidden)</div>`;
+    }
+    container.innerHTML = html;
+    wireCopyButtons(container);
+  }
+
+  // Archive event listeners
+  if ($("btnRefreshArchive")) {
+    $("btnRefreshArchive").addEventListener("click", loadArchive);
+  }
+  if ($("archiveSearch")) {
+    $("archiveSearch").addEventListener("input", () => renderArchive());
+  }
+  if ($("archiveSort")) {
+    $("archiveSort").addEventListener("change", () => renderArchive());
+  }
+  if ($("archiveSpentOnly")) {
+    $("archiveSpentOnly").addEventListener("change", () => renderArchive());
+  }
+  if ($("btnExportArchiveCsv")) {
+    $("btnExportArchiveCsv").addEventListener("click", () => {
+      if (!archiveData || !archiveData.length) { toast("No archive data to export"); return; }
+      let csv = "key_hex,address,peak_sats,current_sats,first_seen_height,last_seen_height,transform,status\n";
+      for (const k of archiveData) {
+        const keyHex = k.key_hex || k.privkey_hex || "";
+        const addr = k.address || (k.addresses && k.addresses[0]) || "";
+        const peak = k.peak_sats || k.max_sats || 0;
+        const current = k.current_sats ?? k.balance_sats ?? 0;
+        const firstH = k.first_seen_height ?? "";
+        const lastH = k.last_seen_height ?? "";
+        const transform = k.transform || k.variant || "";
+        const status = current === 0 ? "spent" : "active";
+        csv += `"${keyHex}","${addr}",${peak},${current},${firstH},${lastH},"${transform}",${status}\n`;
+      }
+      downloadFile("btc-archive.csv", csv, "text/csv");
+      toast("Archive exported as CSV");
+    });
+  }
+
+  // Load archive on startup
+  void loadArchive();
+  // Refresh archive every 60 seconds
+  setInterval(loadArchive, 60000);
+
+  // ── Alert Configuration ────────────────────────────────────────────────
+  function loadAlertSettings() {
+    try {
+      const saved = localStorage.getItem("btcsolver_alert_settings_v1");
+      if (saved) return JSON.parse(saved);
+    } catch (_) {}
+    return { gpuThreshold: 20, utxoThreshold: 24, soundEnabled: true, matchEnabled: true };
+  }
+  function saveAlertSettings(s) {
+    try { localStorage.setItem("btcsolver_alert_settings_v1", JSON.stringify(s)); } catch (_) {}
+  }
+  (function initAlertConfig() {
+    const settings = loadAlertSettings();
+    const gpuSlider = $("alertGpuThreshold");
+    const gpuVal = $("alertGpuThresholdVal");
+    const utxoSlider = $("alertUtxoThreshold");
+    const utxoVal = $("alertUtxoThresholdVal");
+    const soundCheck = $("alertSoundEnabled");
+    const matchCheck = $("alertMatchEnabled");
+    const resetBtn = $("btnResetAlerts");
+    if (!gpuSlider || !utxoSlider) return;
+
+    // Load saved settings
+    gpuSlider.value = settings.gpuThreshold;
+    gpuVal.textContent = settings.gpuThreshold + "%";
+    utxoSlider.value = settings.utxoThreshold;
+    utxoVal.textContent = settings.utxoThreshold + "h";
+    soundCheck.checked = settings.soundEnabled;
+    matchCheck.checked = settings.matchEnabled;
+
+    // Update on change
+    const save = () => {
+      const s = {
+        gpuThreshold: parseInt(gpuSlider.value),
+        utxoThreshold: parseInt(utxoSlider.value),
+        soundEnabled: soundCheck.checked,
+        matchEnabled: matchCheck.checked
+      };
+      gpuVal.textContent = s.gpuThreshold + "%";
+      utxoVal.textContent = s.utxoThreshold + "h";
+      saveAlertSettings(s);
+      // Also update alertConfig for the existing alert system
+      alertConfig.gpu_drop_threshold = s.gpuThreshold;
+      alertConfig.utxo_stale_hours = s.utxoThreshold;
+      saveAlertConfig();
+    };
+    gpuSlider.addEventListener("input", save);
+    utxoSlider.addEventListener("input", save);
+    soundCheck.addEventListener("change", save);
+    matchCheck.addEventListener("change", save);
+    if (resetBtn) {
+      resetBtn.addEventListener("click", () => {
+        gpuSlider.value = 20; utxoSlider.value = 24;
+        soundCheck.checked = true; matchCheck.checked = true;
+        save();
+        toast("Alert settings reset to defaults");
+      });
+    }
+    // Initialize alertConfig with loaded settings
+    alertConfig.gpu_drop_threshold = settings.gpuThreshold;
+    alertConfig.utxo_stale_hours = settings.utxoThreshold;
+  })();
+
+  // ── Scan Progress Visualization ────────────────────────────────────────
+  (function initScanProgress() {
+    const updateProgress = (stats) => {
+      if (!stats) return;
+      const keysEl = $("scanProgressKeys");
+      const rangesEl = $("scanProgressRanges");
+      const rangeEl = $("scanProgressRange");
+      const coverageEl = $("scanProgressCoverage");
+      const barEl = $("scanProgressBar");
+      const labelEl = $("scanProgressLabel");
+      if (!keysEl) return;
+
+      const keys = stats.keys_tested || 0;
+      const ranges = stats.ranges_done || 0;
+      const rangeStep = stats.range_step || 0;
+      const rangeStart = stats.range_start || "";
+      const rangeEnd = stats.range_end || "";
+
+      keysEl.textContent = formatNumber(keys);
+      rangesEl.textContent = ranges;
+
+      // Current range display
+      if (rangeStart && rangeEnd) {
+        const shortStart = rangeStart.slice(0, 16) + "...";
+        const shortEnd = rangeEnd.slice(0, 16) + "...";
+        rangeEl.textContent = `${shortStart} → ${shortEnd}`;
+      }
+
+      // Progress within current range
+      let pct = 0;
+      if (rangeStep > 0 && keys > 0) {
+        // Estimate: keys tested within current range / range step
+        const totalRangeKeys = ranges * rangeStep + (keys % rangeStep);
+        const currentRangeProgress = keys % rangeStep;
+        pct = rangeStep > 0 ? (currentRangeProgress / rangeStep) * 100 : 0;
+      }
+      pct = Math.min(100, Math.max(0, pct));
+      if (barEl) barEl.style.width = pct + "%";
+      if (labelEl) labelEl.textContent = pct.toFixed(2) + "%";
+
+      // Key space coverage (for the scanned ranges)
+      if (coverageEl) {
+        // Total keys scanned vs 2^256 (impossible to meaningfully express)
+        // Instead, show the number of ranges and keys in a meaningful way
+        const totalScanned = keys;
+        const rangesCovered = ranges;
+        coverageEl.textContent = `${rangesCovered} ranges (${formatNumber(totalScanned)} keys)`;
+      }
+    };
+
+    // Update progress every 5 seconds from scan stats
+    setInterval(async () => {
+      try {
+        const stats = await api("/api/scan/stats");
+        updateProgress(stats);
+      } catch (_) {}
+    }, 5000);
+
+    // Initial update
+    setTimeout(async () => {
+      try { updateProgress(await api("/api/scan/stats")); } catch (_) {}
+    }, 2000);
+  })();
+
+  // === GPU Monitoring Panel ===
+  function updateGpuPanel(gpus) {
+    const container = $("gpuCards");
+    const timeEl = $("gpuRefreshTime");
+    if (!container) return;
+    if (timeEl) timeEl.textContent = `Updated ${new Date().toLocaleTimeString()}`;
+    let html = '';
+    for (const g of gpus) {
+      const util = g.util_pct ?? 0;
+      const memUsed = g.mem_used_mb ?? 0;
+      const memTotal = g.mem_total_mb ?? 0;
+      const temp = g.temp_c ?? 0;
+      const power = g.power_w ?? 0;
+      const powerLimit = g.power_limit ?? 0;
+      const memPct = memTotal > 0 ? Math.round(memUsed / memTotal * 100) : 0;
+      const utilColor = util > 60 ? 'var(--green)' : util > 20 ? 'var(--accent)' : 'var(--red)';
+      const tempColor = temp > 80 ? 'var(--red)' : temp > 70 ? 'var(--warning)' : 'var(--green)';
+      html += `<div style="border:1px solid var(--border);border-radius:8px;padding:1rem;background:var(--card-bg)">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.5rem">
+          <strong>GPU ${g.index} — ${g.name || 'Unknown'}</strong>
+          <span style="font-size:0.8rem;color:var(--text-muted)">${power.toFixed(0)}W${powerLimit > 0 ? '/' + powerLimit.toFixed(0) + 'W' : ''}</span>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.5rem;font-size:0.8rem">
+          <div>
+            <div style="color:var(--text-muted);margin-bottom:0.2rem">Utilization</div>
+            <div style="font-size:1.2rem;font-weight:700;color:${utilColor}" class="mono">${util}%</div>
+            <div class="progress-bar" style="height:6px;margin-top:0.2rem"><div class="progress-fill" style="width:${util}%;background:${utilColor}"></div></div>
+          </div>
+          <div>
+            <div style="color:var(--text-muted);margin-bottom:0.2rem">VRAM</div>
+            <div style="font-size:1.2rem;font-weight:700" class="mono">${memUsed} / ${memTotal} GB</div>
+            <div class="progress-bar" style="height:6px;margin-top:0.2rem"><div class="progress-fill" style="width:${memPct}%;background:var(--accent)"></div></div>
+          </div>
+          <div>
+            <div style="color:var(--text-muted);margin-bottom:0.2rem">Temperature</div>
+            <div style="font-size:1.2rem;font-weight:700;color:${tempColor}" class="mono">${temp}°C</div>
+          </div>
+          <div>
+            <div style="color:var(--text-muted);margin-bottom:0.2rem">VRAM Usage</div>
+            <div style="font-size:1.2rem;font-weight:700" class="mono">${memPct}%</div>
+          </div>
+        </div>
+      </div>`;
+    }
+    container.innerHTML = html;
+  }
+
+  // === Process Monitor Panel ===
+  function updateProcessPanel(procs) {
+    const container = $("processList");
+    if (!container) return;
+    let html = '';
+    for (const p of procs) {
+      const status = p.running ? '✅' : '⬛';
+      const color = p.running ? 'var(--green)' : 'var(--text-muted)';
+      const mem = p.mem_mb ? `${(p.mem_mb / 1024).toFixed(1)} GB` : '';
+      const pid = p.pid ? `PID ${p.pid}` : '';
+      html += `<div style="border:1px solid var(--border);border-radius:6px;padding:0.75rem;background:var(--card-bg);text-align:center">
+        <div style="font-size:1.3rem;margin-bottom:0.3rem">${status}</div>
+        <div style="font-weight:600;font-size:0.85rem;color:${color}">${p.name}</div>
+        <div style="font-size:0.75rem;color:var(--text-muted);margin-top:0.2rem" class="mono">${pid} ${mem}</div>
+      </div>`;
+    }
+    container.innerHTML = html;
+  }
+
+  // === Historical Indexer Status ===
+  function updateHiStatus(hi) {
+    const runningEl = $("hiRunning");
+    const progressEl = $("hiProgress");
+    const outputEl = $("hiOutput");
+    const badgeEl = $("hiBadge");
+    const badgeTextEl = $("hiBadgeText");
+    if (!runningEl) return;
+    if (hi.running) {
+      runningEl.textContent = '🔄 Running';
+      runningEl.style.color = 'var(--green)';
+      if (badgeEl) badgeEl.className = 'status-badge';
+      if (badgeTextEl) badgeTextEl.textContent = 'Active';
+    } else {
+      runningEl.textContent = '⬛ Stopped';
+      runningEl.style.color = 'var(--text-muted)';
+      if (badgeEl) badgeEl.className = 'status-badge';
+      if (badgeTextEl) badgeTextEl.textContent = 'Idle';
+    }
+    if (hi.checkpoint) {
+      progressEl.textContent = hi.checkpoint.substring(0, 80) + (hi.checkpoint.length > 80 ? '...' : '');
+    } else {
+      progressEl.textContent = 'No checkpoint';
+    }
+    // Check output file size
+    const outputFiles = ['data/historical-scripts.bin', 'data/historical-scripts.bin.tmp'];
+    outputEl.textContent = outputFiles.join(', ');
+  }
+
+  // === Strategies Tab: Key Hunter Intelligence ===
+  const STRATEGIES_DATA = [
+    {
+      title: "🔥 Mots de passe simples (2009-2011)",
+      prob: "Très élevée",
+      probColor: "var(--green)",
+      desc: "Les premiers utilisateurs de Bitcoin utilisaient souvent des mots de passe triviaux: 'password', 'bitcoin', '123456', leur nom, leur email.",
+      transforms: ["SHA256", "double SHA256", "MD5 padded"],
+      tips: ["Testez les noms communs: john, mike, sarah", "Emails complets: user@gmail.com", "Dates: 1985, 20090103"]
+    },
+    {
+      title: "📖 Citations & proverbes",
+      prob: "Élevée",
+      probColor: "#3dd68c",
+      desc: "Beaucoup de brainwallets utilisaient des citations de films, livres, ou proverbes. En anglais surtout (communauté Bitcoin anglophone).",
+      transforms: ["SHA256", "lowercase", "no spaces"],
+      tips: ["Movie quotes: 'May the force be with you'", "Biblical verses: 'In the beginning'", "Proverbs: 'A penny saved is a penny earned'"]
+    },
+    {
+      title: "🎵 Paroles de chansons populaires",
+      prob: "Élevée",
+      probColor: "#3dd68c",
+      desc: "Paroles de chansons des années 60-90 étaient très populaires comme brainwallets. Les utilisateurs prenaient leur refrain préféré.",
+      transforms: ["SHA256", "lowercase", "strip symbols"],
+      tips: ["Beatles, Queen, Led Zeppelin, Nirvana", "Refrains: 'I want to hold your hand'", "Avec années: 'bohemian rhapsody 1975'"]
+    },
+    {
+      title: "🔢 Constantes mathématiques",
+      prob: "Moyenne",
+      probColor: "var(--accent)",
+      desc: "π, e, √2, φ (nombre d'or) — tronqués ou décalés. Les geeks aimaient ces constantes comme source d'entropie.",
+      transforms: ["256 bits de π[offset]", "e[offset]", "√n pour n=2..1000"],
+      tips: ["π à partir du 100ème chiffre", "e × 1000 mod n", "Combinaisons: π + e concaténés"]
+    },
+    {
+      title: "🎮 Culture geek & gaming (2009)",
+      prob: "Moyenne-élevée",
+      probColor: "var(--accent)",
+      desc: "World of Warcraft, chess openings, D&D, Magic: The Gathering — la communauté Bitcoin 2009 était très geek.",
+      transforms: ["SHA256", "lowercase", "suffix year"],
+      tips: ["WoW character names + server", "Chess: 'e4 e5 Nf3'", "MTG card names: 'Black Lotus'"]
+    },
+    {
+      title: "🌍 Noms propres + suffixes",
+      prob: "Moyenne",
+      probColor: "var(--accent)",
+      desc: "Prénom + nom de famille, nom de chien/chat, ville natale — combinés avec des suffixes courants.",
+      transforms: ["SHA256", "prefix 'my'", "suffix 'bitcoin', 'wallet', '2009'"],
+      tips: ["john smith bitcoin", "my dog rex wallet", "paris france btc", "avec années: 1985, 1990, 2009"]
+    },
+    {
+      title: "🃏 Séquences de cartes / dés / pièces",
+      prob: "Basse-moyenne",
+      probColor: "#d29922",
+      desc: "Séquences de jets de dés (1-6), tirages de cartes (A-K), ou piles de pièces (H/T) converties en hex.",
+      transforms: ["binaire → hex 256 bits", "D6 → 2.5 bits par jet"],
+      tips: ["100 jets de D6 → 166 bits", "52 cartes mélangées → 225 bits", "Piles: HHTHTT... → bits"]
+    },
+    {
+      title: "📱 Numéros de téléphone / cartes",
+      prob: "Basse",
+      probColor: "#d29922",
+      desc: "Numéros de téléphone, numéros de carte de crédit (sécursés), codes postaux — utilisés comme seed.",
+      transforms: ["SHA256 du numéro", "padded à 256 bits"],
+      tips: ["Téléphone US: 5551234567", "Code postal + date naissance", "Numéro étudiante / employé"]
+    },
+    {
+      title: "🧮 Opérations mathématiques simples",
+      prob: "Basse-moyenne",
+      probColor: "#d29922",
+      desc: "n², n³, 2^n, n! — résultats convertis en hex 256 bits. Les mathématiciens aimaient cette approche.",
+      transforms: ["n² mod 2^256", "2^n en hex", "factorielle tronquée"],
+      tips: ["123456789² en hex", "2^127 - 1 (Mersenne)", "Fibonacci[100] en hex"]
+    },
+    {
+      title: "🌐 URLs & domaines (2009)",
+      prob: "Basse",
+      probColor: "#d29922",
+      desc: "URLs de sites populaires 2009: forums Bitcoin précoces, blogs crypto, sites de gambling.",
+      transforms: ["SHA256 de l'URL", "sans http://", "domaine seulement"],
+      tips: ["bitcointalk.org", "bitcoin.org", "bitcoinxt.org", "names.bitcoin.nu"]
+    },
+    {
+      title: "🎹 Patterns de clavier",
+      prob: "Moyenne",
+      probColor: "var(--accent)",
+      desc: "Patterns visuels sur le clavier: zigzag, cercle, ligne. Très communs comme mots de passe faibles.",
+      transforms: ["SHA256 du pattern", "qwerty", "1234567890"],
+      tips: ["qwertyuiop", "asdfghjkl", "zxcvbnm", "1qaz2wsx", "pattern en Z"]
+    },
+    {
+      title: "📅 Dates significatives",
+      prob: "Élevée",
+      probColor: "#3dd68c",
+      desc: "Dates de naissance, anniversaires, dates historiques — formatées de différentes manières.",
+      transforms: ["SHA256", "YYYYMMDD", "DD-MM-YYYY", "avec texte"],
+      tips: ["20090103 (genesis block)", "19760509 (Satoshi?)", "01/01/2009", "january 3 2009"]
+    },
+  ];
+
+  // ============================================================
+  // BIP39 Tab
+  // ============================================================
+
+  const BIP39_WORD_COUNT = 2048;
+  const BIP39_SCAN_RATE = 180_000_000; // keys/sec
+
+  const BIP39_PATTERNS = [
+    { name: "All same word", desc: "abandon abandon abandon ...", example: "abandon × 12", difficulty: "2048 (1 word to guess)" },
+    { name: "2-word pattern", desc: "Only 2 distinct words repeated", example: "word1 word2 word1 word2 ...", difficulty: "2048² = 4.2M" },
+    { name: "First/last known", desc: "First and last words remembered", example: "abandon ??? ??? ??? ??? abandon", difficulty: "2048⁴ = 1.7T" },
+    { name: "Common words only", desc: "Everyday vocabulary (≈500 words)", example: "house cat tree mountain ...", difficulty: "500¹² ≈ 2.4×10³²" },
+    { name: "Alphabetical order", desc: "Words in dictionary order", example: "abandon ability able about ...", difficulty: "Very constrained" },
+    { name: "Date-based", desc: "Birth dates, anniversaries as words", example: "january three two zero nine", difficulty: "Limited set" },
+    { name: "Names", desc: "Pet names, family names, celebrities", example: "lucky dog john mary ...", difficulty: "~1000 common names" },
+    { name: "Keyboard patterns", desc: "QWERTY patterns converted to words", example: "qwerty → closest BIP39 words", difficulty: "Very limited" },
+    { name: "Partial phrase (1 unknown)", desc: "11/12 words known", example: "11 known + 1 unknown", difficulty: "2048 — feasible!" },
+    { name: "Partial phrase (2 unknown)", desc: "10/12 words known", example: "10 known + 2 unknown", difficulty: "4.2M — feasible with GPU" },
+    { name: "Partial phrase (3 unknown)", desc: "9/12 words known", example: "9 known + 3 unknown", difficulty: "8.6B — needs time" },
+    { name: "Repeated groups", desc: "Groups of words repeated", example: "abc abc abc abc", difficulty: "2048³ = 8.6B" },
+  ];
+
+  function initBip39Tab() {
+    // Input handler
+    const input = $("bip39Input");
+    if (input) {
+      input.addEventListener("input", updateBip39Calc);
+      input.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" && !e.shiftKey) {
+          e.preventDefault();
+          testBip39Phrase();
+        }
+      });
+    }
+
+    // Buttons
+    $("btnBip39Test")?.addEventListener("click", testBip39Phrase);
+    $("btnBip39Batch")?.addEventListener("click", batchScanBip39);
+    $("btnBip39Clear")?.addEventListener("click", clearBip39);
+    $("btnBip39Export")?.addEventListener("click", exportBip39Results);
+
+    // Render patterns
+    renderBip39Patterns();
+  }
+
+  function updateBip39Calc() {
+    const input = $("bip39Input");
+    if (!input) return;
+
+    const text = input.value.trim().toLowerCase();
+    const words = text ? text.split(/\s+/) : [];
+    const total = words.length;
+    const unknown = words.filter(w => w === "?" || w === "_" || w === "???").length;
+    const known = total - unknown;
+
+    // Update stats
+    setText("bip39TotalWords", total);
+    setText("bip39KnownWords", known);
+    setText("bip39UnknownWords", unknown);
+
+    // Calculate combinations
+    if (unknown === 0) {
+      setText("bip39Combinations", total > 0 ? "1 (complete)" : "—");
+      setText("bip39EstTime", "—");
+    } else if (unknown <= 6) {
+      const combos = Math.pow(BIP39_WORD_COUNT, unknown);
+      setText("bip39Combinations", formatScientific(combos));
+      // Estimate scan time
+      const seconds = combos / BIP39_SCAN_RATE;
+      setText("bip39EstTime", formatBip39Duration(seconds));
+    } else {
+      setText("bip39Combinations", formatScientific(Math.pow(BIP39_WORD_COUNT, unknown)));
+      setText("bip39EstTime", "∞ (impractical)");
+    }
+
+    // Validity check
+    const validityEl = $("bip39Validity");
+    if (total === 0) {
+      setText("bip39Validity", "—");
+      validityEl.style.color = "";
+    } else if ([12, 15, 18, 21, 24].includes(total)) {
+      setText("bip39Validity", "✓ Valid length");
+      validityEl.style.color = "var(--green)";
+    } else {
+      setText("bip39Validity", "⚠ Invalid length (need 12/15/18/21/24)");
+      validityEl.style.color = "var(--yellow)";
+    }
+
+    // Word-by-word analysis
+    renderBip39WordAnalysis(words);
+  }
+
+  function renderBip39WordAnalysis(words) {
+    const container = $("bip39WordAnalysis");
+    if (!container) return;
+
+    if (words.length === 0) {
+      container.innerHTML = "";
+      return;
+    }
+
+    let html = '<div style="display:flex;flex-wrap:wrap;gap:0.3rem;margin-top:0.3rem">';
+    words.forEach((w, i) => {
+      const isUnknown = w === "?" || w === "_" || w === "???";
+      const isValid = !isUnknown && w.length >= 3; // rough check
+      const cls = isUnknown ? "background:var(--red-dim);color:var(--red);border-color:rgba(248,81,73,0.3)"
+        : isValid ? "background:var(--green-dim);color:var(--green);border-color:rgba(61,214,140,0.3)"
+        : "background:var(--yellow-dim);color:var(--yellow);border-color:rgba(210,153,34,0.3)";
+      html += `<span style="display:inline-block;padding:0.15rem 0.4rem;border-radius:4px;font-size:0.72rem;font-family:var(--mono);border:1px solid;${cls}">${i + 1}. ${w}</span>`;
+    });
+    html += '</div>';
+    container.innerHTML = html;
+  }
+
+  function renderBip39Patterns() {
+    const container = $("bip39Patterns");
+    if (!container) return;
+
+    container.innerHTML = BIP39_PATTERNS.map((p, i) => `
+      <div class="strategy-card" style="padding:0.75rem;border:1px solid var(--border);border-radius:8px;background:var(--bg-elevated);cursor:pointer"
+           onclick="document.getElementById('bip39Input').value='${p.example.replace(/'/g, "\\'")}';updateBip39Calc()">
+        <strong style="font-size:0.85rem">${p.name}</strong>
+        <div style="font-size:0.75rem;color:var(--text-muted);margin-top:0.2rem">${p.desc}</div>
+        <div style="font-size:0.7rem;color:var(--accent);margin-top:0.3rem">Difficulty: ${p.difficulty}</div>
+      </div>
+    `).join("");
+  }
+
+  async function testBip39Phrase() {
+    const input = $("bip39Input");
+    if (!input || !input.value.trim()) {
+      toast("Enter a BIP39 phrase", "error");
+      return;
+    }
+
+    const text = input.value.trim();
+    const words = text.split(/\s+/).filter(w => w !== "?" && w !== "_" && w !== "???");
+    const unknown = text.split(/\s+/).filter(w => w === "?" || w === "_" || w === "???").length;
+
+    if (unknown > 0) {
+      const combos = Math.pow(BIP39_WORD_COUNT, unknown);
+      if (combos > 1_000_000_000) {
+        toast(`Too many combinations (${formatScientific(combos)}) — use Batch scan with GPU`, "error");
+        return;
+      }
+    }
+
+    // For complete phrases, test directly
+    if (unknown === 0) {
+      try {
+        const r = await api("/api/keys/check", {
+          method: "POST",
+          body: JSON.stringify({ key: text, format: "bip39" })
+        });
+        displayBip39Results([r]);
+        toast(`Tested: ${r.sats > 0 ? "BALANCE FOUND!" : "No balance"}`, r.sats > 0 ? "success" : "");
+      } catch (e) {
+        toast(`Error: ${e.message}`, "error");
+      }
+    } else {
+      // For partial phrases, suggest batch scan
+      toast(`${formatScientific(Math.pow(BIP39_WORD_COUNT, unknown))} combinations — use Batch scan`, "");
+    }
+  }
+
+  async function batchScanBip39() {
+    const input = $("bip39Input");
+    if (!input || !input.value.trim()) {
+      toast("Enter a BIP39 phrase pattern", "error");
+      return;
+    }
+
+    const text = input.value.trim();
+    const words = text.split(/\s+/);
+    const unknown = words.filter(w => w === "?" || w === "_" || w === "???").length;
+
+    if (unknown === 0) {
+      toast("Phrase is complete — use Test button instead", "");
+      return;
+    }
+
+    if (unknown > 3) {
+      toast(`⚠ ${formatScientific(Math.pow(BIP39_WORD_COUNT, unknown))} combinations — this will take a very long time`, "error");
+      return;
+    }
+
+    // Start the scan via the easy-keys endpoint or dict scan
+    // For now, generate a corpus file and start scanning
+    toast(`Starting BIP39 batch scan: ${formatScientific(Math.pow(BIP39_WORD_COUNT, unknown))} combinations`, "");
+
+    // Use the dict scan with BIP39 transform
+    try {
+      await api("/api/dict/start", {
+        method: "POST",
+        body: JSON.stringify({
+          phrases: text,
+          sha256: false,
+          double: false,
+          md5: false,
+          revChars: false,
+          revWords: false,
+          lower: true,
+          stripSym: false,
+          noSpace: false,
+          upper: false,
+          bip39: true,
+          bip39_all_paths: true,
+          bip39_address_count: 10
+        })
+      });
+      toast("BIP39 batch scan started", "success");
+    } catch (e) {
+      toast(`Error: ${e.message}`, "error");
+    }
+  }
+
+  function clearBip39() {
+    $("bip39Input").value = "";
+    updateBip39Calc();
+    $("bip39ResultsCard").hidden = true;
+  }
+
+  function displayBip39Results(results) {
+    const card = $("bip39ResultsCard");
+    const container = $("bip39Results");
+    if (!card || !container) return;
+
+    card.hidden = false;
+    const hasBalance = results.some(r => r.sats > 0);
+
+    container.innerHTML = results.map(r => `
+      <div class="match-item" style="${r.sats > 0 ? 'border-color:var(--green);background:var(--green-dim)' : ''}">
+        <div class="match-header">
+          <span class="type">${r.sats > 0 ? '🟢 HIT' : '⚪ No balance'}</span>
+          <span class="mono" style="font-size:0.75rem">${(r.addresses || []).join(", ") || "—"}</span>
+        </div>
+        ${r.sats > 0 ? `
+          <div class="match-details">
+            <span class="match-balance balance-positive">${formatSats(r.sats)}</span>
+            <span>${(r.sats / 100_000_000).toFixed(8)} BTC</span>
+          </div>
+        ` : ''}
+      </div>
+    `).join("");
+  }
+
+  function exportBip39Results() {
+    toast("Export not yet implemented", "");
+  }
+
+  // Helper: format number in scientific notation
+  function formatScientific(n) {
+    if (n < 1000) return n.toString();
+    if (n < 1_000_000) return `${(n / 1000).toFixed(0)}K`;
+    if (n < 1_000_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+    if (n < 1_000_000_000_000) return `${(n / 1_000_000_000).toFixed(1)}B`;
+    if (n < 1_000_000_000_000_000) return `${(n / 1_000_000_000_000).toFixed(1)}T`;
+    // Scientific notation for huge numbers
+    const exp = Math.floor(Math.log10(n));
+    const mantissa = (n / Math.pow(10, exp)).toFixed(1);
+    return `${mantissa}×10${toSuperscript(exp)}`;
+  }
+
+  function toSuperscript(n) {
+    const sup = { '0': '⁰', '1': '¹', '2': '²', '3': '³', '4': '⁴', '5': '⁵', '6': '⁶', '7': '⁷', '8': '⁸', '9': '⁹' };
+    return String(n).split('').map(c => sup[c] || c).join('');
+  }
+
+  function formatBip39Duration(seconds) {
+    if (seconds < 60) return `${Math.round(seconds)}s`;
+    if (seconds < 3600) return `${Math.round(seconds / 60)}m`;
+    if (seconds < 86400) return `${Math.round(seconds / 3600)}h`;
+    if (seconds < 31536000) return `${Math.round(seconds / 86400)}d`;
+    return `${(seconds / 31536000).toFixed(1)} years`;
+  }
+
+  function renderStrategies() {
+    const container = $("strategyCards");
+    if (!container) return;
+    const grid = container.querySelector('.strategies-grid') || container;
+    container.innerHTML = STRATEGIES_DATA.map((s, i) => `
+      <div class="strategy-card" style="border:1px solid var(--border);border-radius:8px;padding:1rem;background:var(--card-bg);cursor:pointer" data-strategy="${i}">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.5rem">
+          <strong style="font-size:0.9rem">${s.title}</strong>
+          <span style="font-size:0.75rem;padding:0.2rem 0.5rem;border-radius:4px;background:${s.probColor}22;color:${s.probColor}">Prob: ${s.prob}</span>
+        </div>
+        <p style="font-size:0.8rem;color:var(--text-muted);margin:0.3rem 0">${s.desc}</p>
+        <div style="font-size:0.75rem;margin-top:0.5rem">
+          <div style="color:var(--text-dim);margin-bottom:0.2rem">Transforms: ${s.transforms.join(', ')}</div>
+          <div style="color:var(--accent);margin-top:0.3rem">
+            ${s.tips.map(t => `<div>• ${t}</div>`).join('')}
+          </div>
+        </div>
+      </div>
+    `).join('');
+  }
+
+  // === Pattern Analysis ===
+  function renderPatternAnalysis() {
+    const container = $("patternAnalysis");
+    if (!container) return;
+    const patterns = [
+      { pattern: "SHA256(mot_simple)", coverage: "~50M corpus", scanned: "✅", priority: 1 },
+      { pattern: "SHA256(citation_film)", coverage: "~100K phrases", scanned: "✅", priority: 2 },
+      { pattern: "SHA256(parole_chanson)", coverage: "~200K phrases", scanned: "✅", priority: 2 },
+      { pattern: "SHA256(prenom + nom)", coverage: "~1M combos", scanned: "⏳", priority: 3 },
+      { pattern: "π/e/√n → 256 bits", coverage: "~10K variants", scanned: "✅", priority: 3 },
+      { pattern: "SHA256(date YYYYMMDD)", coverage: "~30K dates", scanned: "✅", priority: 4 },
+      { pattern: "SHA256(URL 2009)", coverage: "~5K URLs", scanned: "⏳", priority: 4 },
+      { pattern: "Keyboard patterns", coverage: "~10K patterns", scanned: "✅", priority: 3 },
+      { pattern: "Dés/cartes/pieces → hex", coverage: "~1M combos", scanned: "⏳", priority: 5 },
+      { pattern: "n²/2^n/n! → hex 256b", coverage: "~100K values", scanned: "✅", priority: 4 },
+      { pattern: "BIP39 phrases courantes", coverage: "~500K phrases", scanned: "✅", priority: 2 },
+      { pattern: "WIF faible (entropie < 64 bits)", coverage: "brute-force", scanned: "🔄", priority: 1 },
+    ];
+    const sorted = patterns.sort((a, b) => a.priority - b.priority);
+    container.innerHTML = `
+      <table style="width:100%;border-collapse:collapse;font-size:0.8rem">
+        <thead><tr style="border-bottom:1px solid var(--border);text-align:left">
+          <th style="padding:0.5rem">Priorité</th>
+          <th>Pattern</th>
+          <th>Couverture</th>
+          <th>Statut</th>
+          <th>Action</th>
+        </tr></thead>
+        <tbody>
+          ${sorted.map((p, i) => `
+            <tr style="border-bottom:1px solid var(--border);opacity:${1 - i * 0.05}">
+              <td style="padding:0.4rem 0.5rem;font-weight:700;color:${p.priority <= 2 ? 'var(--green)' : p.priority <= 3 ? 'var(--accent)' : 'var(--text-muted)'}">${p.priority}</td>
+              <td><code>${p.pattern}</code></td>
+              <td>${p.coverage}</td>
+              <td>${p.scanned}</td>
+              <td><button class="btn btn-ghost btn-sm scan-pattern-btn" data-pattern="${i}">Scan</button></td>
+            </tr>
+          `).join('')}
+        </tbody>
+      </table>
+      <p class="hint" style="margin-top:0.5rem;font-size:0.75rem">
+        💡 Les patterns marqués ✅ ont été scannés via les corpus existants. 🔄 = scan GPU en continu. ⏳ = à planifier.
+      </p>
+    `;
+  }
+
+  // === Watchlist System ===
+  const WATCHLIST_KEY = "btcsolver_watchlist_v1";
+  function loadWatchlist() {
+    try { return JSON.parse(localStorage.getItem(WATCHLIST_KEY) || "[]"); } catch { return []; }
+  }
+  function saveWatchlist(list) {
+    localStorage.setItem(WATCHLIST_KEY, JSON.stringify(list.slice(0, 200)));
+  }
+
+  function renderWatchlist() {
+    const container = $("watchlistTable");
+    const countEl = $("pillWatchlistCount");
+    if (!container) return;
+    const list = loadWatchlist();
+    if (countEl) countEl.textContent = list.length;
+    if (!list.length) {
+      container.innerHTML = '<p class="hint">Watchlist vide. Ajoutez des clés hex (64 chars) pour les surveiller.</p>';
+      return;
+    }
+    container.innerHTML = `
+      <table style="width:100%;border-collapse:collapse;font-size:0.75rem">
+        <thead><tr style="border-bottom:1px solid var(--border);text-align:left;position:sticky;top:0;background:var(--card-bg)">
+          <th style="padding:0.4rem">Clé (hex)</th>
+          <th>Adresse</th>
+          <th>Source</th>
+          <th>Ajoutée le</th>
+          <th>Statut</th>
+          <th>Action</th>
+        </tr></thead>
+        <tbody>
+          ${list.map((w, i) => `
+            <tr style="border-bottom:1px solid var(--border)">
+              <td style="padding:0.3rem;font-family:var(--mono);font-size:0.7rem">${shortDisplay(w.key, 8, 6)}</td>
+              <td style="font-family:var(--mono);font-size:0.7rem">${w.address ? shortDisplay(w.address, 8, 6) : '—'}</td>
+              <td>${esc(w.source || 'manual')}</td>
+              <td>${w.added_at ? new Date(w.added_at).toLocaleDateString() : '—'}</td>
+              <td>${w.last_balance > 0 ? '<span style="color:var(--green)">💰 ' + w.last_balance + ' sats</span>' : w.checked ? '<span style="color:var(--text-muted)">✓ vérifiée</span>' : '<span style="color:var(--text-muted)">⏳</span>'}</td>
+              <td><button class="btn btn-ghost btn-sm" data-wl-rm="${i}" style="padding:0.1rem 0.3rem;font-size:0.7rem">✕</button></td>
+            </tr>
+          `).join('')}
+        </tbody>
+      </table>
+    `;
+    container.querySelectorAll("[data-wl-rm]").forEach((b) => {
+      b.addEventListener("click", () => {
+        const list = loadWatchlist();
+        list.splice(Number(b.dataset.wlRm), 1);
+        saveWatchlist(list);
+        renderWatchlist();
+      });
+    });
+  }
+
+  // === Brainwallet Patterns 2009 ===
+  function renderBrainwalletPatterns() {
+    const container = $("brainwalletPatterns");
+    if (!container) return;
+    const patterns = [
+      { cat: "Constantes mathématiques", examples: [
+        "π → 256 bits (décimales 1-32)",
+        "e → 256 bits",
+        "√2, √3, √5 → 256 bits",
+        "φ (nombre d'or) → 256 bits",
+        "ln(2), ln(10) → 256 bits",
+        "γ (Euler-Mascheroni) → 256 bits",
+      ]},
+      { cat: "Opérations simples", examples: [
+        "n² mod 2^256 pour n=1..10M",
+        "2^n pour n=1..255",
+        "n! (factorielle) tronqué",
+        "Fibonacci[n] pour n=1..200",
+        "Premiers nombres premiers concaténés",
+        "n³, n⁴, n^5 → hex",
+      ]},
+      { cat: "Noms + années", examples: [
+        "'bitcoin 2009', 'bitcoin 2010'",
+        "'satoshi nakamoto 1975'",
+        "'my bitcoin wallet 2009'",
+        "'first bitcoin 2009'",
+        "'genesis block 2009'",
+        "'one bitcoin please'",
+      ]},
+      { cat: "Phrases en anglais", examples: [
+        "'i love bitcoin'",
+        "'to the moon'",
+        "'hodl forever'",
+        "'money of the people'",
+        "'end inflation'",
+        "'free money for all'",
+      ]},
+      { cat: "Patterns clavier", examples: [
+        "'qwertyuiop' (ligne haute)",
+        "'asdfghjkl' (ligne milieu)",
+        "'1234567890' (chiffres)",
+        "'1qaz2wsx3edc' (vertical)",
+        "'zaq1xsw2' (zigzag)",
+        "'!@#$%^&*()' (symboles)",
+      ]},
+      { cat: "Dates significatives", examples: [
+        "'january 3 2009' (genesis)",
+        "'may 22 2010' (pizza day)",
+        "'december 6 2017' (all time high)",
+        "Date naissance: 'march 15 1985'",
+        "Anniversaire: '01/01/1990'",
+        "Événements: '9/11', 'august 9 2009'",
+      ]},
+      { cat: "Citations cultes", examples: [
+        "'May the force be with you'",
+        "'I'll be back'",
+        "'Here's looking at you kid'",
+        "'Elementary my dear Watson'",
+        "'To infinity and beyond'",
+        "'After all tomorrow and tomorrow and tomorrow'",
+      ]},
+      { cat: "Math → hex créatif", examples: [
+        "π × e → 256 bits",
+        "√(π × e) → 256 bits",
+        "2^256 - 1 (max key)",
+        "2^127 - 1 (Mersenne prime)",
+        "0xdeadbeaf... (joke hex)",
+        "0xcafebabe... (joke hex)",
+      ]},
+    ];
+    container.innerHTML = patterns.map(p => `
+      <div style="margin-bottom:1.5rem">
+        <strong style="color:var(--accent)">${p.cat}</strong>
+        <ul style="margin:0.3rem 0;padding-left:1.2rem;font-size:0.8rem;color:var(--text-muted)">
+          ${p.examples.map(e => `<li style="margin-bottom:0.2rem">${e}</li>`).join('')}
+        </ul>
+      </div>
+    `).join('');
+  }
+
+  // === Quick Actions ===
+  function renderQuickActions() {
+    const container = $("quickActions");
+    if (!container) return;
+    const actions = [
+      { label: "🔑 Scan Easy Keys", desc: "Lance le corpus merged (24.4M clés)", action: "easykeys" },
+      { label: "📊 Export Stats", desc: "Export JSON des stats scan", action: "exportstats" },
+      { label: "🔄 Reload Index", desc: "Recharge le FlatIndex en RAM", action: "reloadindex" },
+      { label: "⏸ Pause Scan", desc: "Pause le scan GPU/CPU", action: "pause" },
+      { label: "▶ Resume Scan", desc: "Reprendre le scan", action: "resume" },
+      { label: "🛑 Stop Scan", desc: "Arrêter le scan", action: "stop" },
+      { label: "📋 Export Archive", desc: "Export CSV des clés actives", action: "exportarchive" },
+      { label: "🔍 Check Health", desc: "Refresh complet du système", action: "health" },
+    ];
+    container.innerHTML = actions.map(a => `
+      <button class="btn btn-secondary btn-sm quick-action-btn" data-action="${a.action}" style="text-align:left;padding:0.75rem;font-size:0.8rem;white-space:normal;height:auto">
+        <div style="font-weight:600">${a.label}</div>
+        <div style="font-size:0.7rem;color:var(--text-muted);font-weight:400">${a.desc}</div>
+      </button>
+    `).join('');
+
+    container.querySelectorAll(".quick-action-btn").forEach(btn => {
+      btn.addEventListener("click", async () => {
+        const action = btn.dataset.action;
+        try {
+          switch (action) {
+            case "easykeys":
+              btn.disabled = true;
+              toast("Starting corpus scan…", "");
+              await api("/api/scan/easy-keys", { method: "POST", body: JSON.stringify({ use_gpu: false }) });
+              toast("Corpus scan launched", "success");
+              break;
+            case "exportstats":
+              const res = await fetch("/api/scan/export");
+              const blob = await res.blob();
+              const a = document.createElement("a");
+              a.href = URL.createObjectURL(blob);
+              a.download = `btcsolver-stats-${Date.now()}.json`;
+              a.click();
+              toast("Stats exported", "success");
+              break;
+            case "reloadindex":
+              toast("Reloading index…", "");
+              await api("/api/index/reload", { method: "POST", body: "{}" });
+              toast("Index reloaded", "success");
+              break;
+            case "pause":
+              await api("/api/scan/pause", { method: "POST", body: "{}" });
+              toast("Scan paused", "");
+              break;
+            case "resume":
+              await api("/api/scan/resume", { method: "POST", body: "{}" });
+              toast("Scan resumed", "success");
+              break;
+            case "stop":
+              await api("/api/scan/stop", { method: "POST", body: "{}" });
+              toast("Scan stopped", "error");
+              break;
+            case "exportarchive":
+              const arcRes = await fetch("/api/keys/archive/export");
+              const arcBlob = await arcRes.blob();
+              const arcA = document.createElement("a");
+              arcA.href = URL.createObjectURL(arcBlob);
+              arcA.download = `btcsolver-archive-${Date.now()}.csv`;
+              arcA.click();
+              toast("Archive exported", "success");
+              break;
+            case "health":
+              await refreshHealth();
+              toast("Health refreshed", "success");
+              break;
+          }
+        } catch (e) {
+          toast("Action failed: " + e.message, "error");
+        } finally {
+          btn.disabled = false;
+        }
+      });
+    });
+  }
+
+  // === UTXO1 Historical Index Status ===
+  async function refreshUtxo1Status() {
+    const statsEl = $("utxo1Stats");
+    const pillEl = $("pillUtxo1Status");
+    if (!statsEl) return;
+    try {
+      const data = await api("/api/utxo1/stats");
+      if (data.exists) {
+        if (pillEl) { pillEl.textContent = `✅ ${formatNumber(data.scripts)} scripts`; pillEl.className = "pill ok"; }
+        statsEl.innerHTML = `
+          <div style="padding:0.75rem;border:1px solid var(--border);border-radius:8px;background:var(--card-bg);text-align:center">
+            <div style="font-size:0.75rem;color:var(--text-muted)">Scripts uniques</div>
+            <div style="font-size:1.5rem;font-weight:700;color:var(--green)" class="mono">${formatNumber(data.scripts)}</div>
+          </div>
+          <div style="padding:0.75rem;border:1px solid var(--border);border-radius:8px;background:var(--card-bg);text-align:center">
+            <div style="font-size:0.75rem;color:var(--text-muted)">Taille fichier</div>
+            <div style="font-size:1.5rem;font-weight:700;color:var(--accent)" class="mono">${data.file_size_mb.toFixed(1)} MB</div>
+          </div>
+          <div style="padding:0.75rem;border:1px solid var(--border);border-radius:8px;background:var(--card-bg);text-align:center">
+            <div style="font-size:0.75rem;color:var(--text-muted)">Version</div>
+            <div style="font-size:1.5rem;font-weight:700" class="mono">v${data.version}</div>
+          </div>
+          <div style="padding:0.75rem;border:1px solid var(--border);border-radius:8px;background:var(--card-bg);text-align:center">
+            <div style="font-size:0.75rem;color:var(--text-muted)">Format</div>
+            <div style="font-size:1rem;font-weight:600" class="mono">${data.format}</div>
+          </div>
+        `;
+      } else {
+        if (pillEl) { pillEl.textContent = "⏳ En construction"; pillEl.className = "pill warn"; }
+        const tmpGb = data.tmp_file_size_gb ? data.tmp_file_size_gb.toFixed(1) : '?';
+        statsEl.innerHTML = `
+          <div style="padding:0.75rem;border:1px solid var(--border);border-radius:8px;background:var(--card-bg);text-align:center;grid-column:1/-1">
+            <div style="font-size:0.85rem;color:var(--text-muted)">Index en construction — fichier tmp: ${tmpGb} GB</div>
+            <div style="font-size:0.75rem;color:var(--text-muted);margin-top:0.3rem">${data.message || 'Merge en cours...'}</div>
+          </div>
+        `;
+      }
+    } catch (e) {
+      if (pillEl) pillEl.textContent = "Erreur";
+      statsEl.innerHTML = `<p class="hint">Error: ${e.message}</p>`;
+    }
+  }
+
+  // === UTXO1 Query ===
+  async function queryUtxo1() {
+    const input = $("utxo1QueryInput");
+    const result = $("utxo1QueryResult");
+    if (!input || !result) return;
+    const script = input.value.trim();
+    if (!script) { result.textContent = "Enter script hex"; result.style.color = "var(--warning)"; return; }
+    result.textContent = "Querying..."; result.style.color = "var(--text-muted)";
+    try {
+      const data = await api("/api/utxo1/query", {
+        method: "POST",
+        body: JSON.stringify({ script }),
+      });
+      if (data.found) {
+        result.textContent = "✅ FOUND — script was active!";
+        result.style.color = "var(--green)";
+        toast("Script found in historical index!", "success");
+      } else {
+        result.textContent = "✕ Not found — never active";
+        result.style.color = "var(--text-muted)";
+      }
+    } catch (e) {
+      result.textContent = "Error: " + e.message;
+      result.style.color = "var(--red)";
+    }
+  }
+
+  // === Performance History Tracker ===
+  const PERF_HISTORY_KEY = "btcsolver_perf_history_v1";
+  const perfHistoryData = {
+    timestamps: [],
+    throughput: [],
+    gpuUtil: [],
+    maxPoints: 200, // ~10 min at 3s intervals
+  };
+
+  function loadPerfHistory() {
+    try {
+      const saved = localStorage.getItem(PERF_HISTORY_KEY);
+      if (saved) {
+        const d = JSON.parse(saved);
+        if (d.throughput) perfHistoryData.throughput = d.throughput;
+        if (d.timestamps) perfHistoryData.timestamps = d.timestamps;
+        if (d.gpuUtil) perfHistoryData.gpuUtil = d.gpuUtil;
+      }
+    } catch {}
+  }
+
+  function savePerfHistory() {
+    try {
+      localStorage.setItem(PERF_HISTORY_KEY, JSON.stringify({
+        timestamps: perfHistoryData.timestamps,
+        throughput: perfHistoryData.throughput,
+        gpuUtil: perfHistoryData.gpuUtil,
+      }));
+    } catch {}
+  }
+
+  function updatePerfHistory(scanStats) {
+    if (!scanStats) return;
+    const now = Date.now();
+    const kps = (scanStats.keys_per_sec || scanStats.keys_per_second || 0) / 1e6; // M k/s
+    const gpuUtil = scanStats.gpu_util || 0;
+
+    perfHistoryData.timestamps.push(now);
+    perfHistoryData.throughput.push(kps);
+    perfHistoryData.gpuUtil.push(gpuUtil);
+
+    // Trim to max points
+    while (perfHistoryData.timestamps.length > perfHistoryData.maxPoints) {
+      perfHistoryData.timestamps.shift();
+      perfHistoryData.throughput.shift();
+      perfHistoryData.gpuUtil.shift();
+    }
+
+    savePerfHistory();
+    renderPerfHistory();
+    drawPerfHistoryChart();
+  }
+
+  function renderPerfHistory() {
+    const container = $("perfHistory");
+    if (!container) return;
+    const tp = perfHistoryData.throughput;
+    const gu = perfHistoryData.gpuUtil;
+    const current = tp.length > 0 ? tp[tp.length - 1] : 0;
+    const avg = tp.length > 0 ? tp.reduce((a, b) => a + b, 0) / tp.length : 0;
+    const best = tp.length > 0 ? Math.max(...tp) : 0;
+    const gpuAvg = gu.length > 0 ? gu.reduce((a, b) => a + b, 0) / gu.length : 0;
+
+    container.innerHTML = `
+      <div style="padding:0.75rem;border:1px solid var(--border);border-radius:8px;background:var(--card-bg);text-align:center">
+        <div style="font-size:0.75rem;color:var(--text-muted)">Throughput actuel</div>
+        <div style="font-size:1.3rem;font-weight:700;color:var(--accent)" class="mono">${current.toFixed(1)} M/s</div>
+      </div>
+      <div style="padding:0.75rem;border:1px solid var(--border);border-radius:8px;background:var(--card-bg);text-align:center">
+        <div style="font-size:0.75rem;color:var(--text-muted)">Moyenne</div>
+        <div style="font-size:1.3rem;font-weight:700;color:var(--green)" class="mono">${avg.toFixed(1)} M/s</div>
+      </div>
+      <div style="padding:0.75rem;border:1px solid var(--border);border-radius:8px;background:var(--card-bg);text-align:center">
+        <div style="font-size:0.75rem;color:var(--text-muted)">Meilleur</div>
+        <div style="font-size:1.3rem;font-weight:700;color:var(--green)" class="mono">${best.toFixed(1)} M/s</div>
+      </div>
+      <div style="padding:0.75rem;border:1px solid var(--border);border-radius:8px;background:var(--card-bg);text-align:center">
+        <div style="font-size:0.75rem;color:var(--text-muted)">GPU avg</div>
+        <div style="font-size:1.3rem;font-weight:700;color:${gpuAvg > 50 ? 'var(--green)' : 'var(--accent)'}" class="mono">${gpuAvg.toFixed(0)}%</div>
+      </div>
+    `;
+  }
+
+  function drawPerfHistoryChart() {
+    const canvas = $("perfHistoryChart");
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    const dpr = window.devicePixelRatio || 1;
+    const rect = canvas.getBoundingClientRect();
+    canvas.width = rect.width * dpr;
+    canvas.height = rect.height * dpr;
+    ctx.scale(dpr, dpr);
+    const W = rect.width;
+    const H = rect.height;
+
+    ctx.clearRect(0, 0, W, H);
+    const tp = perfHistoryData.throughput;
+    if (tp.length < 2) {
+      ctx.fillStyle = "#5c6b7f";
+      ctx.font = "12px Inter, sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText("Collecting performance data...", W / 2, H / 2);
+      return;
+    }
+
+    const maxVal = Math.max(...tp, 1) * 1.1;
+    const pad = { top: 8, right: 12, bottom: 18, left: 48 };
+    const chartW = W - pad.left - pad.right;
+    const chartH = H - pad.top - pad.bottom;
+
+    // Grid
+    ctx.strokeStyle = "rgba(36, 48, 65, 0.6)";
+    ctx.lineWidth = 0.5;
+    for (let i = 0; i <= 3; i++) {
+      const y = pad.top + (chartH / 3) * i;
+      ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(W - pad.right, y); ctx.stroke();
+      const val = maxVal - (maxVal / 3) * i;
+      ctx.fillStyle = "#5c6b7f";
+      ctx.font = "10px JetBrains Mono, monospace";
+      ctx.textAlign = "right";
+      ctx.fillText(val.toFixed(0) + "M", pad.left - 6, y + 3);
+    }
+
+    // Throughput line
+    const len = tp.length;
+    ctx.strokeStyle = "#f7931a";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    for (let i = 0; i < len; i++) {
+      const x = pad.left + (i / (perfHistoryData.maxPoints - 1)) * chartW;
+      const y = pad.top + chartH - (tp[i] / maxVal) * chartH;
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+
+    // Fill
+    ctx.globalAlpha = 0.1;
+    ctx.fillStyle = "#f7931a";
+    ctx.lineTo(pad.left + ((len - 1) / (perfHistoryData.maxPoints - 1)) * chartW, pad.top + chartH);
+    ctx.lineTo(pad.left, pad.top + chartH);
+    ctx.closePath();
+    ctx.fill();
+    ctx.globalAlpha = 1.0;
+
+    // Current value label
+    ctx.fillStyle = "#f7931a";
+    ctx.font = "bold 11px JetBrains Mono, monospace";
+    ctx.textAlign = "right";
+    ctx.fillText("▸ " + tp[len - 1].toFixed(1) + "M/s", W - 4, pad.top + 12);
+  }
+
+  // === Watchlist Add Dialog ===
+  function showAddWatchlistDialog() {
+    const key = prompt("Entrez la clé privée hex (64 chars) à ajouter à la watchlist:");
+    if (!key || !/^[0-9a-fA-F]{64}$/.test(key.trim())) {
+      if (key) toast("Clé invalide (doit être 64 chars hex)", "error");
+      return;
+    }
+    const source = prompt("Source (optionnel):") || "manual";
+    const list = loadWatchlist();
+    // Dedup
+    if (list.some(w => w.key.toLowerCase() === key.trim().toLowerCase())) {
+      toast("Clé déjà dans la watchlist", "warning");
+      return;
+    }
+    list.push({
+      key: key.trim().toLowerCase(),
+      source,
+      added_at: new Date().toISOString(),
+      last_balance: 0,
+      checked: false,
+    });
+    saveWatchlist(list);
+    renderWatchlist();
+    toast("Clé ajoutée à la watchlist", "success");
+  }
+
+  // === Scan Optimization Panel ===
+  function updateScanOptimization(h) {
+    const throughputEl = $("optThroughput");
+    const trendEl = $("optThroughputTrend");
+    const gpuEffEl = $("optGpuEfficiency");
+    const gpuDetailEl = $("optGpuDetail");
+    const scoreEl = $("optScore");
+    const scoreLabelEl = $("optScoreLabel");
+    const recEl = $("optRecommendations");
+    const timeEl = $("optRefreshTime");
+    if (!throughputEl) return;
+    if (timeEl) timeEl.textContent = `Updated ${new Date().toLocaleTimeString()}`;
+
+    // Calculate throughput from scan stats
+    const scan = h.scan || {};
+    const keysPerSec = scan.keys_per_second || scan.keysPerSecond || 0;
+    const totalKeys = scan.keys_tested || scan.keysTested || 0;
+    const isRunning = scan.running === true;
+
+    // Throughput display
+    if (keysPerSec > 0) {
+      if (keysPerSec > 1e9) throughputEl.textContent = (keysPerSec / 1e9).toFixed(1) + 'B k/s';
+      else if (keysPerSec > 1e6) throughputEl.textContent = (keysPerSec / 1e6).toFixed(1) + 'M k/s';
+      else if (keysPerSec > 1e3) throughputEl.textContent = (keysPerSec / 1e3).toFixed(1) + 'K k/s';
+      else throughputEl.textContent = keysPerSec.toFixed(0) + ' k/s';
+      throughputEl.style.color = keysPerSec > 100e6 ? 'var(--green)' : keysPerSec > 10e6 ? 'var(--accent)' : 'var(--red)';
+    } else {
+      throughputEl.textContent = isRunning ? 'Calcul...' : 'Arrêté';
+      throughputEl.style.color = isRunning ? 'var(--text-muted)' : 'var(--red)';
+    }
+
+    // Trend
+    const prevKeys = window.__prevScanKeys || 0;
+    const prevTime = window.__prevScanTime || 0;
+    if (totalKeys > 0 && prevTime > 0) {
+      const dt = (Date.now() - prevTime) / 1000;
+      if (dt > 0) {
+        const rate = (totalKeys - prevKeys) / dt;
+        const prevRate = window.__prevKeysPerSec || 0;
+        if (prevRate > 0) {
+          const pctChange = ((rate - prevRate) / prevRate * 100).toFixed(0);
+          if (pctChange > 5) { trendEl.textContent = '📈 +' + pctChange + '%'; trendEl.style.color = 'var(--green)'; }
+          else if (pctChange < -5) { trendEl.textContent = '📉 ' + pctChange + '%'; trendEl.style.color = 'var(--red)'; }
+          else { trendEl.textContent = '➡️ stable'; trendEl.style.color = 'var(--text-muted)'; }
+        } else { trendEl.textContent = '📊 baseline'; trendEl.style.color = 'var(--text-muted)'; }
+        window.__prevKeysPerSec = rate;
+      }
+    }
+    window.__prevScanKeys = totalKeys;
+    window.__prevScanTime = Date.now();
+
+    // GPU efficiency
+    const gpus = h.gpu || [];
+    let avgUtil = 0;
+    let gpuDetails = [];
+    if (gpus.length > 0) {
+      for (const g of gpus) {
+        const util = g.util_pct || 0;
+        avgUtil += util;
+        gpuDetails.push(`GPU${g.index}:${util}%`);
+      }
+      avgUtil = Math.round(avgUtil / gpus.length);
+    }
+    gpuEffEl.textContent = avgUtil + '%';
+    gpuEffEl.style.color = avgUtil > 60 ? 'var(--green)' : avgUtil > 30 ? 'var(--accent)' : 'var(--red)';
+    gpuDetailEl.textContent = gpuDetails.join(' ');
+
+    // Performance score (0-100)
+    let score = 0;
+    let recs = [];
+    // Throughput score (0-40 points)
+    if (keysPerSec > 500e6) score += 40;
+    else if (keysPerSec > 200e6) score += 35;
+    else if (keysPerSec > 100e6) score += 30;
+    else if (keysPerSec > 50e6) score += 20;
+    else if (keysPerSec > 10e6) score += 10;
+    // GPU utilization score (0-30 points)
+    if (avgUtil > 80) score += 30;
+    else if (avgUtil > 60) score += 25;
+    else if (avgUtil > 40) score += 20;
+    else if (avgUtil > 20) score += 10;
+    // GPU count score (0-15 points)
+    if (gpus.length >= 3) score += 15;
+    else if (gpus.length >= 2) score += 10;
+    else if (gpus.length >= 1) score += 5;
+    // Running bonus (0-15 points)
+    if (isRunning) score += 15;
+
+    scoreEl.textContent = score + '/100';
+    scoreEl.style.color = score >= 80 ? 'var(--green)' : score >= 50 ? 'var(--accent)' : 'var(--red)';
+    if (score >= 80) scoreLabelEl.textContent = 'Excellent';
+    else if (score >= 60) scoreLabelEl.textContent = 'Bon';
+    else if (score >= 40) scoreLabelEl.textContent = 'Moyen';
+    else scoreLabelEl.textContent = 'À améliorer';
+
+    // Recommendations
+    if (!isRunning) {
+      recs.push('⚠️ <strong>Scan arrêté</strong> — lancez brute_force pour commencer le scan');
+    }
+    if (avgUtil < 20 && isRunning) {
+      recs.push('🔴 <strong>GPU sous-utilisé (' + avgUtil + '%)</strong> — vérifiez llama-server qui concurrence les GPU');
+      recs.push('💡 <strong>Action:</strong> Redémarrez llama-server avec <code>--ngl 0</code> pour libérer les GPU');
+    }
+    if (avgUtil < 60 && avgUtil >= 20 && isRunning) {
+      recs.push('🟡 <strong>GPU partiellement utilisé (' + avgUtil + '%)</strong> — llama-server occupe partiellement les GPU');
+      recs.push('💡 <strong>Action:</strong> Isoler llama-server sur un GPU dédié ou réduire <code>--tensor-split</code>');
+    }
+    if (keysPerSec < 50e6 && keysPerSec > 0) {
+      recs.push('🐌 <strong>Throughput faible</strong> — vérifiez que le FlatIndex est chargé en VRAM (mode FULL)');
+    }
+    if (gpus.length === 0) {
+      recs.push('📺 <strong>Aucun GPU détecté</strong> — vérifiez les drivers NVIDIA et libsecp_gpu.dll');
+    }
+    const utxoLag = (h.core_utxo || {}).utxo_lag_hours || 0;
+    if (utxoLag > 24) {
+      recs.push('🕐 <strong>UTXO obsolète (' + utxoLag + 'h)</strong> — rebuild nécessaire pour des résultats fiables');
+    } else if (utxoLag > 0) {
+      recs.push('✅ UTXO à jour (' + utxoLag + 'h de retard — acceptable)');
+    }
+    const hi = h.historical_indexer || {};
+    if (hi.running) {
+      recs.push('📊 <strong>Historical indexer actif</strong> — construction utxo1 en cours (consomme RAM CPU)');
+    } else {
+      recs.push('📊 Historical indexer inactif — lancez pour indexer toutes les clés ayant eu de l\'activité');
+    }
+    if (recs.length === 0) {
+      recs.push('✅ Tout fonctionne optimalement — scan en cours, GPU bien utilisés');
+    }
+    recEl.innerHTML = recs.map(r => '<div style="margin-bottom:0.3rem">' + r + '</div>').join('');
+  }
+
+  // === Per-device Scan Breakdown (vertical GPU/CPU rows) ===
+  let scanConfigCache = null;
+  let scanConfigCacheTime = 0;
+
+  async function getScanConfig() {
+    const now = Date.now();
+    if (scanConfigCache && now - scanConfigCacheTime < 10000) return scanConfigCache;
+    try {
+      scanConfigCache = await api("/api/scan/config");
+      scanConfigCacheTime = now;
+      return scanConfigCache;
+    } catch { return scanConfigCache || {}; }
+  }
+
+  async function renderScanDeviceBreakdown(scanData, dictData, cpuTotal) {
+    const container = $("scanDeviceBreakdown");
+    if (!container) return;
+
+    const config = await getScanConfig();
+    const gpusStr = config.gpus || "0,1,2";
+    const gpuIds = gpusStr.split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n));
+    const cpuThreads = config.resolved_cpu_threads || config.threads || 0;
+    const useGpu = config.use_gpu !== false;
+
+    // Build GPU rows from scanData.gpu_rates
+    const gpuRates = Array.isArray(scanData.gpu_rates) ? scanData.gpu_rates : [];
+    const rows = [];
+
+    // GPU rows
+    for (const g of gpuRates) {
+      const gpuId = g.id ?? 0;
+      const rate = Number(g.keys_per_sec || g.keys_per_sec_avg || 0);
+      const isActive = gpuIds.includes(gpuId) && useGpu;
+      rows.push({
+        type: 'gpu',
+        id: gpuId,
+        label: `GPU ${gpuId}`,
+        icon: isActive ? '🟢' : '⚫',
+        rate,
+        threads: 1, // 1 host thread per GPU
+        enabled: isActive,
+      });
+    }
+
+    // Add inactive GPUs from config
+    for (const gid of gpuIds) {
+      if (!gpuRates.find(g => (g.id ?? 0) === gid) && useGpu) {
+        rows.push({
+          type: 'gpu', id: gid, label: `GPU ${gid}`, icon: '⚪',
+          rate: 0, threads: 1, enabled: true,
+        });
+      }
+    }
+
+    // CPU row
+    rows.push({
+      type: 'cpu',
+      id: 'cpu',
+      label: 'CPU',
+      icon: cpuThreads > 0 ? '🟢' : '⚫',
+      rate: cpuTotal,
+      threads: cpuThreads,
+      enabled: cpuThreads > 0,
+    });
+
+    container.innerHTML = rows.map(r => {
+      const rateStr = r.rate > 0 ? formatCompact(r.rate) + '/s' : '—';
+      const opacity = r.enabled ? '1' : '0.4';
+      const threadVal = r.type === 'cpu' ? r.threads : (r.enabled ? 1 : 0);
+      const disabledAttr = !r.enabled ? 'disabled' : '';
+      return `
+        <div class="scan-device-row" style="display:flex;align-items:center;gap:0.5rem;padding:0.2rem 0.4rem;border-radius:6px;background:rgba(255,255,255,0.03);opacity:${opacity};cursor:pointer" onclick="toggleScanDevice('${r.type === 'cpu' ? 'cpu' : 'gpu' + r.id}')" title="Click to ${r.enabled ? 'disable' : 'enable'} ${r.label}">
+          <span style="font-size:0.9rem;min-width:20px;text-align:center">${r.icon}</span>
+          <span style="font-size:0.78rem;font-weight:600;min-width:55px;color:var(--text)">${r.label}</span>
+          <span style="font-size:0.7rem;color:var(--text-muted);flex:1;text-align:right">${rateStr}</span>
+          <input type="number" class="mono" min="0" max="128" value="${threadVal}" style="width:48px;font-size:0.72rem;padding:2px 4px;background:var(--bg-input);border:1px solid var(--border);border-radius:4px;color:var(--text);text-align:center" onclick="event.stopPropagation()" onchange="updateDeviceThreads('${r.type === 'cpu' ? 'cpu' : 'gpu' + r.id}', this.value)" title="${r.type === 'cpu' ? 'CPU threads (0=off)' : 'GPU threads (0=off, 1=on)'}">
+        </div>`;
+    }).join('');
+  }
+
+  // Global functions for onclick handlers
+  window.toggleScanDevice = async function(device) {
+    try {
+      const config = await api("/api/scan/config");
+      const currentThreads = device === 'cpu' ? (config.threads || 0) : 1;
+      const newThreads = currentThreads > 0 ? 0 : (device === 'cpu' ? 16 : 1);
+      const resp = await api("/api/scan/toggle-device", {
+        method: "POST",
+        body: JSON.stringify({ device, threads: newThreads }),
+      });
+      toast(`${device.toUpperCase()} ${newThreads === 0 ? 'disabled' : 'enabled'}${resp.scan_restarted ? ' — scan restarted' : ''}`, newThreads === 0 ? 'warning' : 'success');
+    } catch (e) {
+      toast("Toggle error: " + e.message, "error");
+    }
+  };
+
+  window.updateDeviceThreads = async function(device, value) {
+    const threads = parseInt(value) || 0;
+    try {
+      const resp = await api("/api/scan/toggle-device", {
+        method: "POST",
+        body: JSON.stringify({ device, threads }),
+      });
+      toast(`${device.toUpperCase()} → ${threads} thread${threads > 1 ? 's' : ''}${resp.scan_restarted ? ' (scan restarted)' : ''}`, 'success');
+    } catch (e) {
+      toast("Error: " + e.message, "error");
+    }
+  };
+
+  // === Performance Benchmark ===
+  let benchPollInterval = null;
+
+  function initBenchmarkTab() {
+    // Load current config
+    loadBenchmarkConfig();
+
+    // Buttons
+    $("btnBenchRun")?.addEventListener("click", runBenchmark);
+    $("btnBenchReset")?.addEventListener("click", resetBenchmark);
+    $("btnBenchApplyBest")?.addEventListener("click", applyBestBenchmark);
+
+    // Auto-poll benchmark status
+    benchPollInterval = setInterval(pollBenchmarkStatus, 3000);
+  }
+
+  async function loadBenchmarkConfig() {
+    try {
+      const data = await api("/api/scan/config");
+      if ($("benchLogicalCores")) $("benchLogicalCores").textContent = data.logical_cores || "—";
+      // Compute GPU count from gpus string ("0,1,2" → 3) or default 3
+      const gpuIds = data.gpus ? data.gpus.split(',').filter(s => s.trim()) : [];
+      const gpuCount = gpuIds.length > 0 ? gpuIds.length : 3;
+      if ($("benchGpuCount")) $("benchGpuCount").textContent = gpuCount;
+      if ($("benchCpuThreads")) $("benchCpuThreads").textContent = data.resolved_cpu_threads ?? data.threads ?? "—";
+      if ($("benchGpuBatch")) {
+        // batch_size from config is in keys, convert to M
+        const batchSize = data.batch_size || 33554432;
+        $("benchGpuBatch").textContent = Math.round(batchSize / 1_000_000) + "M";
+      }
+    } catch {}
+  }
+
+  async function runBenchmark() {
+    const cpuThreadsStr = $("benchCpuThreadsInput")?.value || "0,2,4,8,12,16,24,32";
+    const cpuThreads = cpuThreadsStr.split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n) && n >= 0);
+    const gpuBatchM = parseInt($("benchGpuBatchInput")?.value) || 32;
+    const durationSecs = parseInt($("benchDurationInput")?.value) || 15;
+
+    if (cpuThreads.length === 0) {
+      toast("Enter at least one CPU thread count", "warning");
+      return;
+    }
+
+    try {
+      const resp = await api("/api/benchmark/run", {
+        method: "POST",
+        body: JSON.stringify({ cpu_threads: cpuThreads, gpu_batch_m: gpuBatchM, duration_secs: durationSecs }),
+      });
+      window.__benchRunning = true;
+      toast(resp.message || "Benchmark started", "success");
+      $("benchProgress").style.display = "block";
+      $("benchResults").style.display = "none";
+    } catch (e) {
+      toast("Benchmark error: " + e.message, "error");
+    }
+  }
+
+  async function pollBenchmarkStatus() {
+    try {
+      const data = await api("/api/benchmark/status");
+      const progress = data.progress;
+      if (!progress) return;
+
+      if (progress.phase === "testing") {
+        $("benchProgress").style.display = "block";
+        $("benchProgressMsg").textContent = progress.message || "Testing...";
+        const pct = progress.total > 0 ? Math.round((progress.current / progress.total) * 100) : 0;
+        $("benchProgressCount").textContent = `${progress.current}/${progress.total}`;
+        if ($("benchProgressBar")) $("benchProgressBar").style.width = pct + "%";
+      } else if (progress.phase === "complete") {
+        window.__benchRunning = false;
+        $("benchProgress").style.display = "none";
+        $("benchResults").style.display = "block";
+        renderBenchmarkResults(data.results || []);
+        toast("Benchmark complete!", "success");
+      } else if (progress.phase === "error") {
+        window.__benchRunning = false;
+        $("benchProgress").style.display = "none";
+        toast("Benchmark error: " + (progress.error || "unknown"), "error");
+      }
+    } catch {}
+  }
+
+  function renderBenchmarkResults(results) {
+    const tbody = $("benchResultsBody");
+    if (!tbody) return;
+
+    const best = results.reduce((a, b) => a.keys_per_sec > b.keys_per_sec ? a : b, results[0]);
+
+    tbody.innerHTML = results.map((r, i) => {
+      const isBest = r === best;
+      const rowStyle = isBest ? 'background:rgba(34,197,94,0.08);font-weight:600' : '';
+      const kps = formatKps(r.keys_per_sec);
+      const kpsGpu = formatKps(Math.round(r.keys_per_sec_per_gpu));
+      const total = formatNum(r.total_keys);
+      return `<tr style="${rowStyle};border-bottom:1px solid var(--border)">
+        <td style="padding:0.5rem">${isBest ? '🏆 ' : ''}${r.label}</td>
+        <td style="padding:0.5rem" class="mono">${r.cpu_threads}</td>
+        <td style="padding:0.5rem" class="mono">${r.gpu_batch_m}M</td>
+        <td style="padding:0.5rem" class="mono" style="color:${isBest ? 'var(--green)' : 'var(--text)'}">${kps}</td>
+        <td style="padding:0.5rem" class="mono">${kpsGpu}</td>
+        <td style="padding:0.5rem" class="mono">${total}</td>
+        <td style="padding:0.5rem">${isBest ? '<span class="pill" style="background:var(--green);color:#000">BEST</span>' : ''}</td>
+      </tr>`;
+    }).join('');
+
+    // Show best config
+    if (best) {
+      const bestEl = $("benchBestConfig");
+      const bestText = $("benchBestText");
+      if (bestEl && bestText) {
+        bestEl.style.display = "block";
+        bestText.textContent = `${best.label} → ${formatKps(best.keys_per_sec)} keys/sec (${formatKps(Math.round(best.keys_per_sec_per_gpu))}/GPU)`;
+      }
+    }
+  }
+
+  async function resetBenchmark() {
+    try {
+      window.__benchRunning = false;
+      await api("/api/benchmark/reset", { method: "POST" });
+      $("benchResults").style.display = "none";
+      $("benchProgress").style.display = "none";
+      toast("Benchmark results cleared", "");
+    } catch (e) {
+      toast("Reset error: " + e.message, "error");
+    }
+  }
+
+  async function applyBestBenchmark() {
+    try {
+      const data = await api("/api/benchmark/status");
+      const best = data.best;
+      if (!best) {
+        toast("No benchmark results yet", "warning");
+        return;
+      }
+      // Get current config first, then update threads + batch_size
+      const current = await api("/api/scan/config");
+      const updated = {
+        ...current,
+        threads: best.cpu_threads,
+        batch_size: best.gpu_batch_m * 1_000_000,
+      };
+      await api("/api/scan/config", {
+        method: "POST",
+        body: JSON.stringify(updated),
+      });
+      toast(`Applied: ${best.label} (${formatKps(best.keys_per_sec)})`, "success");
+      loadBenchmarkConfig();
+    } catch (e) {
+      toast("Apply error: " + e.message, "error");
+    }
+  }
+
+  function formatKps(n) {
+    if (n >= 1_000_000_000) return (n / 1_000_000_000).toFixed(1) + "B";
+    if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + "M";
+    if (n >= 1_000) return (n / 1_000).toFixed(1) + "K";
+    return n.toString();
+  }
+
+  function formatNum(n) {
+    if (n == null || n === "" || Number.isNaN(Number(n))) return "—";
+    return Math.round(Number(n)).toLocaleString("en-US");
+  }
+
+  // === UTXO Rebuild Progress ===
+  let utxoRebuildPollInterval = null;
+
+  function initUtxoRebuildPoll() {
+    // Override the "Rebuild" button to use background mode
+    const rebuildBtn = document.getElementById("btnSnapRefresh");
+    if (rebuildBtn) {
+      rebuildBtn.textContent = "🔄 Rebuild (background)";
+      rebuildBtn.onclick = async () => {
+        if (!confirm("Start UTXO rebuild in background? This can take hours. The scan continues normally.")) return;
+        try {
+          const resp = await api("/api/snapshot/refresh", { method: "POST" });
+          toast(resp.message || "Rebuild started in background", "success");
+          $("utxoRebuildCard").hidden = false;
+          startUtxoRebuildPoll();
+        } catch (e) {
+          toast("Rebuild error: " + e.message, "error");
+        }
+      };
+    }
+
+    // Check if rebuild is already in progress on load
+    pollUtxoRebuildStatus();
+    utxoRebuildPollInterval = setInterval(pollUtxoRebuildStatus, 10000);
+  }
+
+  async function pollUtxoRebuildStatus() {
+    try {
+      const data = await api("/api/snapshot/rebuild-status");
+      const isRunning = data.running || data.marker_file;
+      const progress = data.progress;
+
+      if (isRunning) {
+        $("utxoRebuildCard").hidden = false;
+        if (progress && progress.message) {
+          $("utxoRebuildMsg").textContent = progress.message;
+        }
+        if (progress && progress.phase === "complete") {
+          $("utxoRebuildPill").textContent = "Complete";
+          $("utxoRebuildPill").className = "pill";
+          $("utxoRebuildPill").style.background = "var(--green)";
+          $("utxoRebuildPill").style.color = "#000";
+          if ($("utxoRebuildBar")) $("utxoRebuildBar").style.width = "100%";
+          setTimeout(() => { $("utxoRebuildCard").hidden = true; }, 30000);
+        } else if (progress && progress.phase === "error") {
+          $("utxoRebuildPill").textContent = "Error";
+          $("utxoRebuildPill").style.background = "var(--red)";
+          if ($("utxoRebuildBar")) $("utxoRebuildBar").style.width = "0%";
+        } else {
+          $("utxoRebuildPill").textContent = "Running";
+          $("utxoRebuildPill").className = "pill warn";
+          // Simulate progress bar (we don't have exact %, but show activity)
+          if ($("utxoRebuildBar")) {
+            const existing = parseFloat($("utxoRebuildBar").style.width) || 5;
+            $("utxoRebuildBar").style.width = Math.min(existing + 2, 95) + "%";
+          }
+        }
+      } else {
+        $("utxoRebuildCard").hidden = true;
+        if ($("utxoRebuildBar")) $("utxoRebuildBar").style.width = "0%";
+      }
+    } catch {}
+  }
+
+  function startUtxoRebuildPoll() {
+    // Poll more frequently after starting
+    pollUtxoRebuildStatus();
+  }
+
+  // Init benchmark + UTXO rebuild on boot
+  initBenchmarkTab();
+  initUtxoRebuildPoll();
+
+  // Initialize global scan state flags
+  window.__corpusRunning = false;
+  window.__benchRunning = false;
+  window.__scanPaused = false;
+
+  // Check for running scans on page load
+  (async () => {
+    try {
+      const [benchData, corpusData, healthData] = await Promise.all([
+        api("/api/benchmark/status").catch(() => ({})),
+        api("/api/scan/corpus/progress").catch(() => ({})),
+        api("/api/health").catch(() => ({})),
+      ]);
+      if (benchData.running) {
+        window.__benchRunning = true;
+        $("benchProgress").style.display = "block";
+      }
+      if (corpusData.running) {
+        window.__corpusRunning = true;
+      }
+      // Check if scan was paused before page reload
+      const posFileExists = healthData.scan?.paused || false;
+      if (posFileExists) {
+        window.__scanPaused = true;
+        setScanPill("off", "PAUSED", "Scan paused — click Resume to continue", "");
+      }
+    } catch {}
+  })();
 })();
