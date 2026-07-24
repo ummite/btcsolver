@@ -4,6 +4,7 @@
   --bg: #0b0f14;
   --bg-elevated: #12181f;
   --bg-card: #151c25;
+  --card-bg: #151c25; /* alias used by inline styles / app.js */
   --bg-input: #0d131a;
   --border: #243041;
   --border-soft: #1a2430;
@@ -19,6 +20,8 @@
   --blue: #58a6ff;
   --blue-dim: rgba(88, 166, 255, 0.12);
   --yellow: #d29922;
+  --yellow-dim: rgba(210, 153, 34, 0.15);
+  --orange: #f0883e;
   --radius: 12px;
   --radius-sm: 8px;
   --shadow: 0 8px 32px rgba(0, 0, 0, 0.35);

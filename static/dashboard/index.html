@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>BTC Solver — Keys</title>
-  <link rel="stylesheet" href="/static/style.css?v=20260718en20" />
+  <link rel="stylesheet" href="/static/style.css?v=20260723ram1" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
@@ -94,7 +94,7 @@
           <div id="scanPauseSelector">
             <button type="button" class="btn btn-sm btn-pause" id="btnScanPauseTile" title="Pause the scan and free GPU resources">⏸ Pause</button>
             <div id="scanPauseDurations" style="display:none;gap:0.25rem;flex-wrap:wrap;margin-top:0.3rem;">
-              <button type="button" class="btn btn-sm btn-pause-dur" data-hours="0">∞ Indéf.</button>
+              <button type="button" class="btn btn-sm btn-pause-dur" data-hours="0">∞ Indef.</button>
               <button type="button" class="btn btn-sm btn-pause-dur" data-hours="1">1h</button>
               <button type="button" class="btn btn-sm btn-pause-dur" data-hours="2">2h</button>
               <button type="button" class="btn btn-sm btn-pause-dur" data-hours="4">4h</button>
@@ -105,10 +105,10 @@
           <!-- Pause active state (shown when paused) -->
           <div id="scanPauseActive" style="display:none;">
             <div class="pause-countdown-row">
-              <span class="pause-countdown-label">⏸ Scan en pause</span>
+              <span class="pause-countdown-label">⏸ Scan paused</span>
               <span class="pause-countdown-timer mono" id="scanPauseCountdown">∞</span>
             </div>
-            <button type="button" class="btn btn-sm btn-resume" id="btnScanResumeTile" title="Resume the scan now">▶ Reprendre maintenant</button>
+            <button type="button" class="btn btn-sm btn-resume" id="btnScanResumeTile" title="Resume the scan now">▶ Resume now</button>
           </div>
         </div>
       </div>
@@ -118,6 +118,14 @@
       <strong>24/7 :</strong> the background scan (brute) runs on its own.
       You can paste other words here <strong>without stopping it</strong> — tab <strong>1. Test a key</strong>.
       Common hits: <code>found-keys.json</code> + vault "Found keys".
+    </div>
+
+    <div id="ramWarn" class="alert-banner warn-banner tip-critical tip-stale" role="alert" style="display:none" hidden>
+      <strong id="ramWarnTitle">RAM: check…</strong>
+      <div class="tip-warn-body" id="ramWarnBody">
+        Free RAM must be at least the UTXO size (dynamic) before loading the index or starting a scan.
+      </div>
+      <div class="tip-warn-meta mono" id="ramWarnMeta">free: — · UTXO: —</div>
     </div>
 
     <div id="spendWarn" class="alert-banner warn-banner tip-critical tip-stale" role="alert">
@@ -953,9 +961,9 @@
             </div>
           </div>
           <div style="margin-top:1rem;padding:1rem;border:1px solid var(--border);border-radius:8px;background:var(--card-bg)">
-            <div style="font-weight:600;margin-bottom:0.5rem">🔧 Recommandations</div>
+            <div style="font-weight:600;margin-bottom:0.5rem">🔧 Recommendations</div>
             <div id="optRecommendations" style="font-size:0.85rem;line-height:1.6">
-              <span class="hint">Analyse en cours...</span>
+              <span class="hint">Analyzing…</span>
             </div>
           </div>
         </div>
@@ -1093,6 +1101,6 @@
     </footer>
   </div>
   <div id="toast" class="toast hidden"></div>
-  <script src="/static/app.js?v=20260718en20"></script>
+  <script src="/static/app.js?v=20260723ram1"></script>
 </body>
 </html>

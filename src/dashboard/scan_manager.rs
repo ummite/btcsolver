@@ -119,7 +119,7 @@ pub struct ScanConfig {
     /// Comma list or array of transforms: identity,reverse_bytes,reverse_bits,rotl8,rotr8,sha256,double_sha256
     #[serde(default = "default_transforms")]
     pub transforms: Vec<String>,
-    /// GPU CUDA IDs (ex. "0,1,2") — même multi-GPU que le scan listes. Vide = toutes.
+    /// GPU CUDA IDs (ex. "0" or "0,1"). `None` / empty = **all present** CUDA devices.
     #[serde(default)]
     pub gpus: Option<String>,
     /// Quand le À (fin de fenêtre) est atteint : taille de la plage suivante (défaut 2^30).
@@ -185,7 +185,8 @@ impl Default for ScanConfig {
             // Séquentiel par défaut : « De → À » lisible (curseur qui avance)
             random: false,
             transforms: default_transforms(),
-            gpus: Some("0,1,2".to_string()),
+            // None = all currently present CUDA GPUs (dynamic, not hard-coded)
+            gpus: None,
             range_step: default_range_step(),
             end_key: None,
             use_range_log: true,
@@ -275,6 +276,21 @@ impl ScanManager {
             }
         }
 
+        // Free RAM must cover UTXO size (brute_force loads its own snapshot copy)
+        let utxo_need = crate::sys_info::utxo_size_from_path(&state.config.snapshot_path);
+        let (ram_ok, ram_msg) = crate::sys_info::ram_gate_message(utxo_need);
+        let pause_flag = format!("{}/data/scan-ram-pause.txt", state.config.project_dir);
+        if !ram_ok {
+            let _ = std::fs::create_dir_all(format!("{}/data", state.config.project_dir));
+            let _ = std::fs::write(
+                &pause_flag,
+                format!("{}\nutxo_bytes={}\n", ram_msg, utxo_need),
+            );
+            return Err(anyhow::anyhow!("{}", ram_msg));
+        } else {
+            let _ = std::fs::remove_file(&pause_flag);
+        }
+
         // threads=0 + cpu_pct → nombre résolu ici (et passé en clair à brute_force)
         let cpu_workers = config.resolve_cpu_threads();
 
@@ -353,14 +369,11 @@ impl ScanManager {
 
         if config.use_gpu {
             args.push("--use-gpu".to_string());
-            // Même multi-GPU que dict (toutes les cartes, ou liste explicite)
-            let gpus = config
-                .gpus
-                .clone()
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or_else(|| "0,1,2".to_string());
-            args.push("--gpus".to_string());
-            args.push(gpus);
+            // Explicit list if set; otherwise resolve to all GPUs present right now
+            if let Some(gpus) = crate::sys_info::resolve_gpus(&config.gpus) {
+                args.push("--gpus".to_string());
+                args.push(gpus);
+            }
         }
 
         if config.random {

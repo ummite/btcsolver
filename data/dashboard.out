@@ -1,0 +1,10 @@
+2026-07-24T03:23:47.446484Z  INFO btcsolver_dashboard: Using UTXO snapshot: C:\Programmation\BTCSolver\data\no-such.snapshot
+2026-07-24T03:23:47.446876Z  INFO btcsolver_dashboard: bitcoind watchdog ON (every 30s)
+2026-07-24T03:23:47.447056Z  INFO btcsolver_dashboard: auto-scan idle: brute GPU when dict not running
+2026-07-24T03:23:47.446969Z  INFO btcsolver_dashboard: Loading UTXO index in background: C:\Programmation\BTCSolver\data\no-such.snapshot
+2026-07-24T03:23:47.447263Z  INFO btcsolver_dashboard: Dashboard http://localhost:3000
+2026-07-24T03:23:47.447405Z  INFO btcsolver_dashboard: Bitcoin datadir default: W:\Bitcoin
+2026-07-24T03:23:47.447480Z  INFO btcsolver_dashboard: Snapshot: C:\Programmation\BTCSolver\data\no-such.snapshot
+2026-07-24T03:23:47.447454Z  WARN btcsolver_dashboard: UTXO index not loaded (C:\Programmation\BTCSolver\data\no-such.snapshot): The system cannot find the file specified. (os error 2)
+2026-07-24T03:23:47.447957Z  WARN btcsolver_dashboard: Background UTXO index failed or missing
+2026-07-24T03:23:54.798097Z ERROR btcsolver_dashboard: boot ensure failed: bitcoind not found at W:\Bitcoin\bin\daemon\bitcoind.exe

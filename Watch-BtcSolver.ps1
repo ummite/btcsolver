@@ -241,12 +241,12 @@ if ($prioritySync) {
             } catch {}
         }
         Write-Log "START brute_force fallback (no dash) step=$step start=$startHex"
+        # Omit --gpus → brute_force uses all CUDA devices detected (1×1080 or multi-GPU)
         $bruteArgs = @(
             "--snapshot-path", $Snap,
             "--threads", "0",
             "--cpu-pct", "50",
             "--use-gpu",
-            "--gpus", "0,1,2",
             "--batch-size", "4194304",
             "--count", "$step",
             "--addr-types", "legacy,segwit,wrapped,taproot",

@@ -41,28 +41,50 @@ struct GpuFuncs {
     pub sync_all: Option<FnSyncAll>,
 }
 
-/// Find the CUDA DLL (exe dir, cwd, project paths, stable bin)
+/// DLL basenames to try (canonical first, then arch-specific builds from older scripts)
+const GPU_DLL_NAMES: &[&str] = &[
+    "libsecp_gpu.dll",
+    "libsecp_gpu_new.dll",
+    "libsecp_gpu_sm86.dll",
+    "libsecp_gpu_dual.dll",
+];
+
+/// Find the CUDA DLL (exe dir, cwd, project paths, env override, stable bin)
 fn find_dll() -> Option<PathBuf> {
-    let mut cands: Vec<PathBuf> = Vec::new();
+    // Explicit override: BTC_GPU_DLL=C:\path\to\libsecp_gpu.dll
+    if let Ok(p) = std::env::var("BTC_GPU_DLL") {
+        let pb = PathBuf::from(p.trim());
+        if pb.exists() {
+            return Some(pb);
+        }
+    }
+
+    let mut dirs: Vec<PathBuf> = Vec::new();
     if let Ok(exe) = std::env::current_exe() {
         if let Some(parent) = exe.parent() {
-            cands.push(parent.join("libsecp_gpu.dll"));
+            dirs.push(parent.to_path_buf());
             // target/release -> repo root
             if let Some(grand) = parent.parent().and_then(|p| p.parent()) {
-                cands.push(grand.join("libsecp_gpu.dll"));
+                dirs.push(grand.to_path_buf());
             }
         }
     }
     if let Ok(cwd) = std::env::current_dir() {
-        cands.push(cwd.join("libsecp_gpu.dll"));
-        cands.push(cwd.join("target").join("release").join("libsecp_gpu.dll"));
+        dirs.push(cwd.clone());
+        dirs.push(cwd.join("target").join("release"));
     }
-    cands.push(PathBuf::from(r"Y:\btcsolver\libsecp_gpu.dll"));
-    cands.push(PathBuf::from(r"Y:\btcsolver\target\release\libsecp_gpu.dll"));
-    cands.push(PathBuf::from(r"C:\btcsolver-bin\libsecp_gpu.dll"));
-    for p in cands {
-        if p.exists() {
-            return Some(p);
+    dirs.push(PathBuf::from(r"Y:\btcsolver"));
+    dirs.push(PathBuf::from(r"Y:\btcsolver\target\release"));
+    dirs.push(PathBuf::from(r"C:\btcsolver-bin"));
+    dirs.push(PathBuf::from(r"C:\Programmation\BTCSolver"));
+    dirs.push(PathBuf::from(r"C:\Programmation\BTCSolver\target\release"));
+
+    for dir in dirs {
+        for name in GPU_DLL_NAMES {
+            let p = dir.join(name);
+            if p.exists() {
+                return Some(p);
+            }
         }
     }
     None

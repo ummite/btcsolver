@@ -462,7 +462,7 @@ impl BitcoindManager {
                                 / 100.0;
                         }
                         s.message = format!(
-                            "RPC occupé — progress log: height {} ({}) cache={}",
+                            "RPC busy — progress log: height {} ({}) cache={}",
                             lp.height, lp.block_date, lp.cache
                         );
                         Self::refresh_simple_status(&mut s, Some(lp));
@@ -471,7 +471,7 @@ impl BitcoindManager {
                             "Process running (PID {:?}) but RPC not ready: {}",
                             pid, e
                         );
-                        s.simple_status = "Core: process OK · RPC en chargement…".into();
+                        s.simple_status = "Core: process OK · RPC loading…".into();
                     }
                 } else {
                     s.running = false;
@@ -482,11 +482,11 @@ impl BitcoindManager {
                     if let Some(ref lp) = log_progress {
                         s.blocks = lp.height;
                         s.simple_status = format!(
-                            "Core: ARRÊTÉ (dernier tip log ~{}) — clique Relancer",
+                            "Core: STOPPED (last tip log ~{}) - click Restart",
                             lp.height
                         );
                     } else {
-                        s.simple_status = "Core: ARRÊTÉ — clique Relancer".into();
+                        s.simple_status = "Core: STOPPED - click Restart".into();
                     }
                     s.auth_method = "none".into();
                 }
@@ -504,7 +504,7 @@ impl BitcoindManager {
 
         if s.is_synced {
             s.simple_status = format!(
-                "Core: À JOUR · bloc {} · {} peers",
+                "Core: UP TO DATE · block {} · {} peers",
                 s.blocks, s.connections
             );
             return;
@@ -514,7 +514,7 @@ impl BitcoindManager {
             if let Some(lp) = log {
                 if lp.height > 0 {
                     s.simple_status = format!(
-                        "Core: SYNC en cours · ~bloc {} ({}) · progress {:.4}% · PAS à jour",
+                        "Core: SYNCING · ~block {} ({}) · progress {:.4}% · NOT at tip",
                         lp.height,
                         if lp.block_date.is_empty() {
                             "?"
@@ -527,7 +527,7 @@ impl BitcoindManager {
                 }
                 if lp.headers_presync > 0 {
                     s.simple_status = format!(
-                        "Core: pré-sync headers ~{} · PAS à jour",
+                        "Core: headers pre-sync ~{} · NOT at tip",
                         lp.headers_presync
                     );
                     return;
@@ -535,18 +535,18 @@ impl BitcoindManager {
             }
             if s.headers == 0 && s.blocks == 0 {
                 s.simple_status = format!(
-                    "Core: SYNC en cours · {} peers · PAS à jour",
+                    "Core: SYNCING · {} peers · NOT at tip",
                     s.connections
                 );
             } else {
                 s.simple_status = format!(
-                    "Core: SYNC {:.2}% · blocs {}/{} · retard {} · PAS à jour",
+                    "Core: SYNC {:.2}% · blocks {}/{} · lag {} · NOT at tip",
                     s.sync_percentage, s.blocks, s.headers, s.blocks_behind
                 );
             }
         } else {
             s.simple_status = format!(
-                "Core: en ligne · blocs {} · retard {} · PAS à jour",
+                "Core: online · blocks {} · lag {} · NOT at tip",
                 s.blocks, s.blocks_behind
             );
         }

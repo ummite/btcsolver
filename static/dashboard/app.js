@@ -21,13 +21,14 @@
       const saved = localStorage.getItem(ALERT_STORAGE);
       if (saved) return JSON.parse(saved);
     } catch (_) {}
+    // Defaults aligned with System → Alert Configuration sliders (20% / 24h)
     return {
       on_match: true,
       on_crash: true,
       on_gpu_drop: true,
-      gpu_drop_threshold: 30,
+      gpu_drop_threshold: 20,
       on_utxo_stale: true,
-      utxo_stale_hours: 18,
+      utxo_stale_hours: 24,
       sound_enabled: true,
       browser_notification: false,
     };
@@ -193,7 +194,7 @@
     if (!root) return;
     root.querySelectorAll("[data-copy]").forEach((b) => {
       b.addEventListener("click", async (e) => {
-        e.preventFromfault();
+        e.preventDefault();
         e.stopPropagation();
         let t = b.getAttribute("data-copy") || "";
         const kind = b.getAttribute("data-copy-kind") || "text";
@@ -295,7 +296,7 @@
         full
       )}" data-copy-kind="${esc(kind)}"${privAttr} title="${esc(full)}">${esc(btnLabel)}</button>`;
     } else if (kind === "pub" && opts.priv) {
-      btn = `<button type="button" class="btn btn-ghost btn-sm btn-copy-inline" data-copy="" data-copy-kind="pub"${privAttr} title="Fromrive then copy compressed pub">Copy pub</button>`;
+      btn = `<button type="button" class="btn btn-ghost btn-sm btn-copy-inline" data-copy="" data-copy-kind="pub"${privAttr} title="Derive then copy compressed pub">Copy pub</button>`;
     }
     // Lien explorateur uniquement pour les addresss publiques (jamais priv / pub hex)
     const explorer =
@@ -832,7 +833,7 @@
   }
 
   $("keyForm")?.addEventListener("submit", async (e) => {
-    e.preventFromfault();
+    e.preventDefault();
     const raw = ($("keyInput")?.value || "").trim();
     if (!raw) return setMsg("keyMsg", "Empty", "error");
     const lines = raw
@@ -1003,13 +1004,13 @@
       if (!panel) return;
       if (scanRunning && !window.__scanPaused) {
         panel.style.display = "flex";
-        pauseSelector.style.display = "flex";
-        pauseActive.style.display = "none";
-        durSelector.style.display = "none";
+        if (pauseSelector) pauseSelector.style.display = "flex";
+        if (pauseActive) pauseActive.style.display = "none";
+        if (durSelector) durSelector.style.display = "none";
       } else if (window.__scanPaused) {
         panel.style.display = "flex";
-        pauseSelector.style.display = "none";
-        pauseActive.style.display = "flex";
+        if (pauseSelector) pauseSelector.style.display = "none";
+        if (pauseActive) pauseActive.style.display = "flex";
       } else {
         panel.style.display = "none";
       }
@@ -1017,6 +1018,7 @@
 
     // Toggle duration selector visibility
     btnPause?.addEventListener("click", () => {
+      if (!durSelector) return;
       if (durSelector.style.display === "flex") {
         durSelector.style.display = "none";
       } else {
@@ -1031,7 +1033,7 @@
       const hours = parseInt(btn.dataset.hours) || 0;
 
       // Hide selector
-      durSelector.style.display = "none";
+      if (durSelector) durSelector.style.display = "none";
 
       // Call pause API
       try {
@@ -1067,7 +1069,7 @@
 
         // Show active state
         updatePausePanelVisibility(false);
-        toast(`Scan paused${hours > 0 ? ` — auto-resume in ${hours}h` : " (indéfini)"}`, "");
+        toast(`Scan paused${hours > 0 ? ` — auto-resume in ${hours}h` : " (indefinite)"}`, "");
       } catch (err) {
         toast("Pause error: " + err.message, "error");
       }
@@ -1336,7 +1338,7 @@
   estimateAffix();
 
   $("dictForm")?.addEventListener("submit", async (e) => {
-    e.preventFromfault();
+    e.preventDefault();
     const body = {
       phrases: $("dictPhrases")?.value || "",
       corpus_path: $("dictCorpus")?.value || null,
@@ -2731,15 +2733,72 @@
     } catch (_) {}
   }
 
+  function updateRamWarning(h) {
+    const el = $("ramWarn");
+    if (!el) return;
+    const ram = h?.ram || null;
+    const paused = !!(h?.ram_paused || (ram && ram.ok === false));
+    window.__ramPaused = paused;
+    window.__ramInfo = ram;
+    if (!ram) {
+      el.hidden = true;
+      el.style.display = "none";
+      return;
+    }
+    const freeGb = Number(ram.free_gb);
+    const utxoGb = Number(ram.utxo_gb);
+    const totalGb = Number(ram.total_gb);
+    const title = $("ramWarnTitle");
+    const body = $("ramWarnBody");
+    const meta = $("ramWarnMeta");
+    if (paused) {
+      el.hidden = false;
+      el.style.display = "";
+      el.classList.add("tip-stale");
+      el.classList.remove("tip-ok");
+      if (title) title.textContent = "RAM PAUSE - scan blocked";
+      if (body) {
+        body.innerHTML =
+          `Free RAM is below the UTXO size. Required: <strong>${utxoGb.toFixed(2)} GB</strong> ` +
+          `(dynamic from snapshot). Free now: <strong>${freeGb.toFixed(2)} GB</strong> / ` +
+          `total ${totalGb.toFixed(1)} GB.<br/>` +
+          `Close heavy apps or free memory, then use <strong>Load index</strong> / start scan again.`;
+      }
+      if (meta) {
+        meta.textContent = ram.message || `free ${freeGb.toFixed(2)} GB · UTXO ${utxoGb.toFixed(2)} GB`;
+      }
+      // Reflect pause on scan pill
+      if (!window.__scanPaused) {
+        setScanPill(
+          "off",
+          "RAM PAUSE",
+          ram.message || "Insufficient free RAM for UTXO",
+          ram.message || ""
+        );
+      }
+    } else {
+      el.hidden = true;
+      el.style.display = "none";
+      if (meta) {
+        meta.textContent = `free ${freeGb.toFixed(2)} GB · UTXO ${utxoGb.toFixed(2)} GB · OK`;
+      }
+    }
+  }
+
   async function refreshHealth() {
     try {
       const h = await api("/api/system/health", { timeoutMs: 25000 });
       window.__lastHealth = h;
       if (h.core_utxo) window.__coreUtxo = h.core_utxo;
       window.__utxoRebuildInProgress = !!h.utxo_rebuild_in_progress;
+      if (Array.isArray(h.gpus_present)) window.__gpusPresent = h.gpus_present;
+      try { updateRamWarning(h); } catch (e) { console.warn("updateRamWarning", e); }
+      const ramShort = h.ram
+        ? ` · RAM ${Number(h.ram.free_gb).toFixed(1)}/${Number(h.ram.utxo_gb).toFixed(1)}G UTXO`
+        : "";
       setText(
         "footerHealth",
-        `v${h.version || "?"} · index=${h.index_loaded ? "OK" : "off"} · status=${h.status || "?"}`
+        `v${h.version || "?"} · index=${h.index_loaded ? "OK" : "off"} · status=${h.status || "?"}${ramShort}`
       );
       try {
         if ($("healthBox")) {
@@ -2980,7 +3039,10 @@
       progress_interval: 15,
       random: $("scanRandom")?.checked ?? false,
       transforms,
-      gpus: "0,1,2",
+      // null → all CUDA GPUs present at start (resolved dynamically server-side)
+      gpus: window.__scanGpus != null && String(window.__scanGpus).trim() !== ""
+        ? window.__scanGpus
+        : null,
       range_step,
       use_range_log: true,
     };
@@ -2997,6 +3059,10 @@
     try {
       const c = await api("/api/scan/config");
       if (c.logical_cores) window.__scanLogicalCores = c.logical_cores;
+      // null/empty = all present CUDA devices (resolved server-side as gpus_effective)
+      window.__scanGpus = c.gpus != null && String(c.gpus).trim() !== "" ? c.gpus : null;
+      if (Array.isArray(c.gpus_present)) window.__gpusPresent = c.gpus_present;
+      if (c.gpus_effective) window.__gpusEffective = c.gpus_effective;
       if (c.cpu_pct != null) updateCpuPctUi(c.cpu_pct);
       else updateCpuPctUi(50);
       if (c.threads != null && $("threads")) $("threads").value = String(c.threads);
@@ -3086,7 +3152,14 @@
   });
 
   $("scanForm")?.addEventListener("submit", async (e) => {
-    e.preventFromfault();
+    e.preventDefault();
+    if (window.__ramPaused) {
+      const msg = window.__ramInfo?.message || "Insufficient free RAM for UTXO size";
+      setMsg("scanMsg", msg, "error");
+      toast(msg, "error");
+      updateRamWarning(window.__lastHealth || { ram: window.__ramInfo, ram_paused: true });
+      return;
+    }
     const transforms = selectedTransforms();
     renderActiveTransforms(transforms);
     const body = buildScanConfigBody();
@@ -3148,6 +3221,12 @@
       }
     } else {
       // Currently OFF or ERROR → start
+      if (window.__ramPaused) {
+        const msg = window.__ramInfo?.message || "Insufficient free RAM for UTXO size";
+        setScanPill("off", "RAM PAUSE", msg, msg);
+        toast(msg, "error");
+        return;
+      }
       _scanTogglePending = true;
       btn.style.pointerEvents = "none";
       setScanPill("off", "STARTING…", "Starting scan…", "");
@@ -3592,13 +3671,19 @@
     const resetBtn = $("btnResetAlerts");
     if (!gpuSlider || !utxoSlider) return;
 
-    // Load saved settings
+    // Load saved settings + sync into live alertConfig immediately
     gpuSlider.value = settings.gpuThreshold;
-    gpuVal.textContent = settings.gpuThreshold + "%";
+    if (gpuVal) gpuVal.textContent = settings.gpuThreshold + "%";
     utxoSlider.value = settings.utxoThreshold;
-    utxoVal.textContent = settings.utxoThreshold + "h";
-    soundCheck.checked = settings.soundEnabled;
-    matchCheck.checked = settings.matchEnabled;
+    if (utxoVal) utxoVal.textContent = settings.utxoThreshold + "h";
+    if (soundCheck) soundCheck.checked = settings.soundEnabled;
+    if (matchCheck) matchCheck.checked = settings.matchEnabled;
+    alertConfig.gpu_drop_threshold = settings.gpuThreshold;
+    alertConfig.utxo_stale_hours = settings.utxoThreshold;
+    alertConfig.sound_enabled = settings.soundEnabled !== false;
+    alertConfig.on_match = settings.matchEnabled !== false;
+    alertConfig.on_gpu_drop = true;
+    alertConfig.on_utxo_stale = true;
 
     // Update on change
     const save = () => {
@@ -4000,7 +4085,7 @@
       const cls = isUnknown ? "background:var(--red-dim);color:var(--red);border-color:rgba(248,81,73,0.3)"
         : isValid ? "background:var(--green-dim);color:var(--green);border-color:rgba(61,214,140,0.3)"
         : "background:var(--yellow-dim);color:var(--yellow);border-color:rgba(210,153,34,0.3)";
-      html += `<span style="display:inline-block;padding:0.15rem 0.4rem;border-radius:4px;font-size:0.72rem;font-family:var(--mono);border:1px solid;${cls}">${i + 1}. ${w}</span>`;
+      html += `<span style="display:inline-block;padding:0.15rem 0.4rem;border-radius:4px;font-size:0.72rem;font-family:var(--mono);border:1px solid;${cls}">${i + 1}. ${esc(w)}</span>`;
     });
     html += '</div>';
     container.innerHTML = html;
@@ -4011,13 +4096,28 @@
     if (!container) return;
 
     container.innerHTML = BIP39_PATTERNS.map((p, i) => `
-      <div class="strategy-card" style="padding:0.75rem;border:1px solid var(--border);border-radius:8px;background:var(--bg-elevated);cursor:pointer"
-           onclick="document.getElementById('bip39Input').value='${p.example.replace(/'/g, "\\'")}';updateBip39Calc()">
-        <strong style="font-size:0.85rem">${p.name}</strong>
-        <div style="font-size:0.75rem;color:var(--text-muted);margin-top:0.2rem">${p.desc}</div>
-        <div style="font-size:0.7rem;color:var(--accent);margin-top:0.3rem">Difficulty: ${p.difficulty}</div>
+      <div class="strategy-card bip39-pattern-card" style="padding:0.75rem;border:1px solid var(--border);border-radius:8px;background:var(--bg-elevated);cursor:pointer"
+           data-bip39-example="${esc(p.example)}" role="button" tabindex="0">
+        <strong style="font-size:0.85rem">${esc(p.name)}</strong>
+        <div style="font-size:0.75rem;color:var(--text-muted);margin-top:0.2rem">${esc(p.desc)}</div>
+        <div style="font-size:0.7rem;color:var(--accent);margin-top:0.3rem">Difficulty: ${esc(p.difficulty)}</div>
       </div>
     `).join("");
+    container.querySelectorAll(".bip39-pattern-card").forEach((card) => {
+      const apply = () => {
+        const input = $("bip39Input");
+        if (!input) return;
+        input.value = card.getAttribute("data-bip39-example") || "";
+        updateBip39Calc();
+      };
+      card.addEventListener("click", apply);
+      card.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          apply();
+        }
+      });
+    });
   }
 
   async function testBip39Phrase() {
@@ -4377,7 +4477,7 @@
       { label: "📊 Export Stats", desc: "Export JSON des stats scan", action: "exportstats" },
       { label: "🔄 Reload Index", desc: "Recharge le FlatIndex en RAM", action: "reloadindex" },
       { label: "⏸ Pause Scan", desc: "Pause le scan GPU/CPU", action: "pause" },
-      { label: "▶ Resume Scan", desc: "Reprendre le scan", action: "resume" },
+      { label: "▶ Resume Scan", desc: "Resume the background scan", action: "resume" },
       { label: "🛑 Stop Scan", desc: "Arrêter le scan", action: "stop" },
       { label: "📋 Export Archive", desc: "Export CSV des clés actives", action: "exportarchive" },
       { label: "🔍 Check Health", desc: "Refresh complet du système", action: "health" },
@@ -4477,18 +4577,18 @@
           </div>
         `;
       } else {
-        if (pillEl) { pillEl.textContent = "⏳ En construction"; pillEl.className = "pill warn"; }
+        if (pillEl) { pillEl.textContent = "⏳ Building"; pillEl.className = "pill warn"; }
         const tmpGb = data.tmp_file_size_gb ? data.tmp_file_size_gb.toFixed(1) : '?';
         statsEl.innerHTML = `
           <div style="padding:0.75rem;border:1px solid var(--border);border-radius:8px;background:var(--card-bg);text-align:center;grid-column:1/-1">
-            <div style="font-size:0.85rem;color:var(--text-muted)">Index en construction — fichier tmp: ${tmpGb} GB</div>
-            <div style="font-size:0.75rem;color:var(--text-muted);margin-top:0.3rem">${data.message || 'Merge en cours...'}</div>
+            <div style="font-size:0.85rem;color:var(--text-muted)">Index building — tmp file: ${tmpGb} GB</div>
+            <div style="font-size:0.75rem;color:var(--text-muted);margin-top:0.3rem">${esc(data.message || 'Merge in progress…')}</div>
           </div>
         `;
       }
     } catch (e) {
-      if (pillEl) pillEl.textContent = "Erreur";
-      statsEl.innerHTML = `<p class="hint">Error: ${e.message}</p>`;
+      if (pillEl) pillEl.textContent = "Error";
+      statsEl.innerHTML = `<p class="hint">Error: ${esc(e.message)}</p>`;
     }
   }
 
@@ -4787,27 +4887,27 @@
     scoreEl.textContent = score + '/100';
     scoreEl.style.color = score >= 80 ? 'var(--green)' : score >= 50 ? 'var(--accent)' : 'var(--red)';
     if (score >= 80) scoreLabelEl.textContent = 'Excellent';
-    else if (score >= 60) scoreLabelEl.textContent = 'Bon';
-    else if (score >= 40) scoreLabelEl.textContent = 'Moyen';
-    else scoreLabelEl.textContent = 'À améliorer';
+    else if (score >= 60) scoreLabelEl.textContent = 'Good';
+    else if (score >= 40) scoreLabelEl.textContent = 'Fair';
+    else scoreLabelEl.textContent = 'Needs work';
 
     // Recommendations
     if (!isRunning) {
-      recs.push('⚠️ <strong>Scan arrêté</strong> — lancez brute_force pour commencer le scan');
+      recs.push('⚠️ <strong>Scan stopped</strong> — start brute_force to begin scanning');
     }
     if (avgUtil < 20 && isRunning) {
-      recs.push('🔴 <strong>GPU sous-utilisé (' + avgUtil + '%)</strong> — vérifiez llama-server qui concurrence les GPU');
-      recs.push('💡 <strong>Action:</strong> Redémarrez llama-server avec <code>--ngl 0</code> pour libérer les GPU');
+      recs.push('🔴 <strong>GPU under-used (' + avgUtil + '%)</strong> — another process may be competing for the GPU');
+      recs.push('💡 <strong>Action:</strong> free VRAM (stop other CUDA apps) and confirm <code>libsecp_gpu.dll</code> matches this GPU');
     }
     if (avgUtil < 60 && avgUtil >= 20 && isRunning) {
-      recs.push('🟡 <strong>GPU partiellement utilisé (' + avgUtil + '%)</strong> — llama-server occupe partiellement les GPU');
-      recs.push('💡 <strong>Action:</strong> Isoler llama-server sur un GPU dédié ou réduire <code>--tensor-split</code>');
+      recs.push('🟡 <strong>GPU partially used (' + avgUtil + '%)</strong> — batch size or CPU hybrid may be limiting');
+      recs.push('💡 <strong>Action:</strong> try a larger <code>BTC_GPU_LAUNCH</code> or raise GPU batch in Auto scan');
     }
     if (keysPerSec < 50e6 && keysPerSec > 0) {
-      recs.push('🐌 <strong>Throughput faible</strong> — vérifiez que le FlatIndex est chargé en VRAM (mode FULL)');
+      recs.push('🐌 <strong>Low throughput</strong> — check FlatIndex is loaded (FULL VRAM mode when VRAM allows)');
     }
     if (gpus.length === 0) {
-      recs.push('📺 <strong>Aucun GPU détecté</strong> — vérifiez les drivers NVIDIA et libsecp_gpu.dll');
+      recs.push('📺 <strong>No GPU detected</strong> — check NVIDIA drivers and <code>libsecp_gpu.dll</code>');
     }
     const utxoLag = (h.core_utxo || {}).utxo_lag_hours || 0;
     if (utxoLag > 24) {
@@ -4846,8 +4946,22 @@
     if (!container) return;
 
     const config = await getScanConfig();
-    const gpusStr = config.gpus || "0,1,2";
-    const gpuIds = gpusStr.split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n));
+    // Default = all GPUs present (from server), never hard-code 0,1,2
+    let gpuIds = [];
+    if (config.gpus != null && String(config.gpus).trim() !== "") {
+      gpuIds = String(config.gpus).split(",").map((s) => parseInt(s.trim(), 10)).filter((n) => !isNaN(n));
+    } else if (config.gpus_effective) {
+      gpuIds = String(config.gpus_effective).split(",").map((s) => parseInt(s.trim(), 10)).filter((n) => !isNaN(n));
+    } else if (Array.isArray(config.gpus_present) && config.gpus_present.length) {
+      gpuIds = config.gpus_present.map((n) => parseInt(n, 10)).filter((n) => !isNaN(n));
+    } else if (Array.isArray(window.__gpusPresent) && window.__gpusPresent.length) {
+      gpuIds = window.__gpusPresent.map((n) => parseInt(n, 10)).filter((n) => !isNaN(n));
+    } else {
+      // Last resort: rates from live scan / nvidia-smi rows
+      const rates = Array.isArray(scanData.gpu_rates) ? scanData.gpu_rates : [];
+      gpuIds = rates.map((g) => g.id ?? 0);
+      if (!gpuIds.length) gpuIds = [0];
+    }
     const cpuThreads = config.resolved_cpu_threads || config.threads || 0;
     const useGpu = config.use_gpu !== false;
 
@@ -4956,10 +5070,11 @@
     try {
       const data = await api("/api/scan/config");
       if ($("benchLogicalCores")) $("benchLogicalCores").textContent = data.logical_cores || "—";
-      // Compute GPU count from gpus string ("0,1,2" → 3) or default 3
+      // Explicit list length, else nvidia-smi / rates length, else "auto"
       const gpuIds = data.gpus ? data.gpus.split(',').filter(s => s.trim()) : [];
-      const gpuCount = gpuIds.length > 0 ? gpuIds.length : 3;
-      if ($("benchGpuCount")) $("benchGpuCount").textContent = gpuCount;
+      let gpuCount = gpuIds.length > 0 ? gpuIds.length : null;
+      if (gpuCount == null && Array.isArray(data.gpu_rates)) gpuCount = data.gpu_rates.length;
+      if ($("benchGpuCount")) $("benchGpuCount").textContent = gpuCount != null ? gpuCount : "auto";
       if ($("benchCpuThreads")) $("benchCpuThreads").textContent = data.resolved_cpu_threads ?? data.threads ?? "—";
       if ($("benchGpuBatch")) {
         // batch_size from config is in keys, convert to M

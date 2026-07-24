@@ -73,8 +73,9 @@ struct Cli {
     #[arg(long, default_value = "0")]
     snapshot_interval_hours: u64,
 
-    /// Auto-restart bitcoind when process dies (watchdog)
-    #[arg(long, default_value_t = true)]
+    /// Auto-restart bitcoind when process dies (watchdog).
+    /// Pass `--auto-restart-bitcoind false` on machines without Bitcoin Core.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     auto_restart_bitcoind: bool,
 
     #[arg(long, default_value = "30")]
@@ -281,8 +282,20 @@ async fn main() -> Result<()> {
     let index: Arc<RwLock<Option<Arc<FlatIndex>>>> = Arc::new(RwLock::new(None));
     {
         let path = config.snapshot_path.clone();
+        let project_dir = config.project_dir.clone();
         let index_bg = index.clone();
         tokio::spawn(async move {
+            let need = btcsolver::sys_info::utxo_size_from_path(&path);
+            let (ok, msg) = btcsolver::sys_info::ram_gate_message(need);
+            if !ok {
+                tracing::warn!("UTXO index load deferred: {}", msg);
+                let _ = std::fs::create_dir_all(format!("{}/data", project_dir));
+                let _ = std::fs::write(
+                    format!("{}/data/scan-ram-pause.txt", project_dir),
+                    format!("{}\nutxo_bytes={}\n", msg, need),
+                );
+                return;
+            }
             tracing::info!("Loading UTXO index in background: {}", path);
             let loaded = tokio::task::spawn_blocking(move || load_index(&path))
                 .await
@@ -290,6 +303,7 @@ async fn main() -> Result<()> {
                 .flatten();
             if loaded.is_some() {
                 tracing::info!("Background UTXO index ready");
+                let _ = std::fs::remove_file(format!("{}/data/scan-ram-pause.txt", project_dir));
             } else {
                 tracing::warn!("Background UTXO index failed or missing");
             }
@@ -479,7 +493,10 @@ async fn main() -> Result<()> {
 
                 let mut cfg = ScanManager::get_config(&dash).await;
                 cfg.use_gpu = true;
-                cfg.gpus = Some("0,1,2".to_string()); // All 3 GPUs
+                // None = all CUDA devices present at start time (resolved in ScanManager)
+                if cfg.gpus.as_ref().map(|s| s.trim().is_empty()).unwrap_or(true) {
+                    cfg.gpus = None;
+                }
                 cfg.random = false;
                 cfg.use_range_log = true;
                 // GPU-heavy: use all available CPU cores alongside GPU
@@ -512,7 +529,12 @@ async fn main() -> Result<()> {
                         );
                     }
                     Err(e) => {
-                        tracing::debug!("auto-scan: start deferred: {}", e);
+                        let es = e.to_string();
+                        if es.contains("Insufficient free RAM") || es.contains("UTXO required") {
+                            tracing::warn!("auto-scan: RAM pause - {}", es);
+                        } else {
+                            tracing::debug!("auto-scan: start deferred: {}", e);
+                        }
                     }
                 }
             }
@@ -696,11 +718,19 @@ async fn scan_config_handler(State(state): State<AppState>) -> Json<serde_json::
     let cfg = ScanManager::get_config(&state.dashboard).await;
     let cores = ScanConfig::logical_cores();
     let resolved = cfg.resolve_cpu_threads();
-    // Enrichir pour l’UI (cœurs + threads calculés)
+    let present = btcsolver::sys_info::present_gpu_ids();
+    let gpus_effective = btcsolver::sys_info::resolve_gpus(&cfg.gpus);
+    // Enrichir pour l’UI (cœurs + threads + GPUs présentes)
     let mut v = serde_json::to_value(&cfg).unwrap_or_default();
     if let Some(obj) = v.as_object_mut() {
         obj.insert("logical_cores".into(), serde_json::json!(cores));
         obj.insert("resolved_cpu_threads".into(), serde_json::json!(resolved));
+        obj.insert("gpus_present".into(), serde_json::json!(present));
+        obj.insert("gpus_effective".into(), serde_json::json!(gpus_effective));
+        // Convenience: if config.gpus is null, UI should treat effective as default
+        if cfg.gpus.as_ref().map(|s| s.trim().is_empty()).unwrap_or(true) {
+            obj.insert("gpus".into(), serde_json::Value::Null);
+        }
     }
     Json(v)
 }
@@ -835,11 +865,19 @@ async fn scan_toggle_device_handler(
         // Parse GPU ID from device name (e.g., "gpu0" → 0)
         let gpu_id: u32 = device[3..].parse().unwrap_or(0);
 
-        // Get current GPU list
-        let current_gpus = cfg.gpus.clone().unwrap_or_else(|| "0,1,2".to_string());
-        let mut gpu_list: Vec<u32> = current_gpus.split(',')
+        // Current GPU list; empty/None means "all detected" until user toggles
+        let current_gpus = cfg.gpus.clone().unwrap_or_default();
+        let mut gpu_list: Vec<u32> = current_gpus
+            .split(',')
             .filter_map(|s| s.trim().parse().ok())
             .collect();
+        // First explicit toggle when list was "all": seed with the device being toggled
+        if gpu_list.is_empty() && threads == 0 {
+            // Disabling one GPU while on "all" → keep others would need enumeration;
+            // fall back to single-GPU mode excluding this id is not possible without count.
+            // Seed with just this id then remove it → empty → CPU-only until re-enable.
+            gpu_list.push(gpu_id);
+        }
 
         if threads == 0 {
             // Disable this GPU: remove from list
@@ -847,9 +885,15 @@ async fn scan_toggle_device_handler(
             if gpu_list.is_empty() {
                 // No GPUs left, disable GPU scanning entirely
                 cfg.use_gpu = false;
-                cfg.gpus = Some("0,1,2".to_string()); // restore default for re-enable
+                cfg.gpus = None; // re-enable will mean all detected devices
             } else {
-                cfg.gpus = Some(gpu_list.iter().map(|g| g.to_string()).collect::<Vec<_>>().join(","));
+                cfg.gpus = Some(
+                    gpu_list
+                        .iter()
+                        .map(|g| g.to_string())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                );
             }
         } else {
             // Enable this GPU: add to list if not present
@@ -858,7 +902,13 @@ async fn scan_toggle_device_handler(
                 gpu_list.sort();
             }
             cfg.use_gpu = true;
-            cfg.gpus = Some(gpu_list.iter().map(|g| g.to_string()).collect::<Vec<_>>().join(","));
+            cfg.gpus = Some(
+                gpu_list
+                    .iter()
+                    .map(|g| g.to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
         }
     } else if device == "cpu" {
         // Set CPU threads
@@ -994,9 +1044,8 @@ async fn scan_resume_handler(State(state): State<AppState>) -> Result<Json<serde
         None
     };
 
-    // Ensure reasonable defaults for resume
+    // Ensure reasonable defaults for resume (keep gpus selection; None = all CUDA)
     cfg.use_gpu = true;
-    cfg.gpus = Some("0,1,2".to_string());
     cfg.count = u64::MAX;
 
     match ScanManager::start(&state.dashboard, &cfg).await {
@@ -2075,17 +2124,42 @@ async fn snapshot_rebuild_status_handler(
 
 async fn snapshot_reload_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
     let path = state.config.snapshot_path.clone();
+    let need = btcsolver::sys_info::utxo_size_from_path(&path);
+    let (ram_ok, ram_msg) = btcsolver::sys_info::ram_gate_message(need);
+    if !ram_ok {
+        let _ = std::fs::create_dir_all(format!("{}/data", state.config.project_dir));
+        let _ = std::fs::write(
+            format!("{}/data/scan-ram-pause.txt", state.config.project_dir),
+            format!("{}\nutxo_bytes={}\n", ram_msg, need),
+        );
+        return Json(serde_json::json!({
+            "success": false,
+            "index_loaded": false,
+            "index_scripts": 0,
+            "path": state.config.snapshot_path,
+            "error": ram_msg,
+            "ram_paused": true,
+            "ram": btcsolver::sys_info::ram_status_json(&state.config.snapshot_path, None),
+        }));
+    }
     let loaded = tokio::task::spawn_blocking(move || load_index(&path))
         .await
         .unwrap_or(None);
     let scripts = loaded.as_ref().map(|i| i.num_scripts).unwrap_or(0);
     let ok = loaded.is_some();
     *state.index.write().await = loaded;
+    if ok {
+        let _ = std::fs::remove_file(format!(
+            "{}/data/scan-ram-pause.txt",
+            state.config.project_dir
+        ));
+    }
     Json(serde_json::json!({
         "success": ok,
         "index_loaded": ok,
         "index_scripts": scripts,
         "path": state.config.snapshot_path,
+        "ram_paused": false,
     }))
 }
 
@@ -2097,14 +2171,21 @@ async fn health_handler(State(state): State<AppState>) -> Json<serde_json::Value
         .await;
     let mut snap = BitcoindManager::get_snapshot_info(&state.config).await;
     let dict = DictScanManager::status(&state.dict);
-    let index_loaded = state.index.read().await.is_some();
-    let scripts = state
-        .index
-        .read()
-        .await
-        .as_ref()
-        .map(|i| i.num_scripts)
-        .unwrap_or(0);
+    let idx_guard = state.index.read().await;
+    let index_loaded = idx_guard.is_some();
+    let scripts = idx_guard.as_ref().map(|i| i.num_scripts).unwrap_or(0);
+    let ram = btcsolver::sys_info::ram_status_json(
+        &state.config.snapshot_path,
+        idx_guard.as_ref().map(|a| a.as_ref()),
+    );
+    let ram_paused = ram.get("paused").and_then(|v| v.as_bool()).unwrap_or(false)
+        || std::path::Path::new(&format!(
+            "{}/data/scan-ram-pause.txt",
+            state.config.project_dir
+        ))
+        .exists();
+    let gpus_present = btcsolver::sys_info::present_gpu_ids();
+    drop(idx_guard);
     // Enrich snapshot payload with live index_scripts for the UI strip
     if let Ok(ref mut v) = snap {
         if let Some(obj) = v.as_object_mut() {
@@ -2267,6 +2348,9 @@ async fn health_handler(State(state): State<AppState>) -> Json<serde_json::Value
         "index_loaded": index_loaded,
         "index_scripts": scripts,
         "auto_restart_bitcoind": state.config.auto_restart_bitcoind,
+        "ram": ram,
+        "ram_paused": ram_paused,
+        "gpus_present": gpus_present,
         "core_utxo": core_utxo_status,
         "utxo_rebuild_in_progress": utxo_rebuild_in_progress,
         "keys_archive": keys_archive,
@@ -2311,7 +2395,7 @@ async fn health_handler(State(state): State<AppState>) -> Json<serde_json::Value
                 "running": false,
                 "is_synced": false,
                 "rpc_ok": false,
-                "simple_status": format!("Core: erreur ({})", e),
+                "simple_status": format!("Core: error ({})", e),
                 "message": e.to_string()
             }),
             Err(_) => {
@@ -2323,9 +2407,9 @@ async fn health_handler(State(state): State<AppState>) -> Json<serde_json::Value
                     "is_synced": false,
                     "pid": pid,
                     "simple_status": if proc {
-                        "Core: process OK · RPC occupé"
+                        "Core: process OK · RPC busy"
                     } else {
-                        "Core: ARRÊTÉ — clique Relancer"
+                        "Core: STOPPED - click Restart"
                     },
                 })
             },
